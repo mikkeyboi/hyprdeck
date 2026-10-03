@@ -1,0 +1,68 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+adw = { package = "libadwaita", version = "0.9", features = ["v1_8"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_20"] }
+anyhow = "1"
+async-channel = "2"
+bluer = { version = "0.17", features = ["bluetoothd"] }
+dirs = "7"
+futures-util = "0.3"
+ksni = "0.3"
+mlua = { version = "0.12", features = ["lua55", "vendored"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "fs", "io-util"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+hyprdeck-core = { path = "crates/core" }
+hd-startup = { path = "crates/startup" }
+hd-display = { path = "crates/display" }
+hd-input = { path = "crates/input" }
+hd-audio = { path = "crates/audio" }
+hd-bluetooth = { path = "crates/bluetooth" }
+hd-updates = { path = "crates/updates" }
+hd-system = { path = "crates/system" }
+hd-defaults = { path = "crates/defaults" }
+
+[package]
+name = "hyprdeck"
+description = "Desktop control center for Hyprland + Noctalia: startup apps, displays, input, audio, Bluetooth, updates, sleep/wake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+adw.workspace = true
+gtk.workspace = true
+anyhow.workspace = true
+ksni.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hyprdeck-core.workspace = true
+hd-startup.workspace = true
+hd-display.workspace = true
+hd-input.workspace = true
+hd-audio.workspace = true
+hd-bluetooth.workspace = true
+hd-updates.workspace = true
+hd-system.workspace = true
+hd-defaults.workspace = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

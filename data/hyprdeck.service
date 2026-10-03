@@ -1,0 +1,18 @@
+[Unit]
+Description=Hyprdeck desktop control center (tray, audio routing, wake guard, update checks)
+PartOf=graphical-session.target
+After=graphical-session.target
+# Audio routing needs PipeWire answering before the first snapshot.
+Wants=pipewire.service pipewire-pulse.service
+After=pipewire.service pipewire-pulse.service
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/hyprdeck --background
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+Slice=app-graphical.slice
+
+[Install]
+WantedBy=graphical-session.target

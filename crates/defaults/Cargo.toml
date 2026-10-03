@@ -1,0 +1,13 @@
+[package]
+name = "hd-defaults"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hyprdeck-core.workspace = true
+adw.workspace = true
+gtk.workspace = true
+anyhow.workspace = true
+dirs.workspace = true

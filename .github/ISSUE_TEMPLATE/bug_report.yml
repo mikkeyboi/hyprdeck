@@ -1,0 +1,42 @@
+name: Bug report
+description: Something in Hyprdeck doesn't work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: page
+    attributes:
+      label: Area
+      options: [Startup Apps, Displays, Input Devices, Keybinds, Audio, Bluetooth, Default Apps, Updates, Sleep & Wake, Tweaks, Tray, Installation / service, Other]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Hyprdeck version
+      description: Output of `hyprdeck --version`
+    validations:
+      required: true
+  - type: input
+    id: install
+    attributes:
+      label: Install method
+      placeholder: AppImage / built from source
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Output of `hyprctl version | head -1`, your distro, GPU vendor, and shell (Noctalia, Waybar, …).
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "`journalctl --user -u hyprdeck -n 100` (remove anything private before posting)."
+      render: text

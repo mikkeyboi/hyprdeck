@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.mikkeyboi.Hyprdeck</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Hyprdeck</name>
+  <summary>Desktop control center for Hyprland</summary>
+  <developer id="io.github.mikkeyboi">
+    <name>mikkeyboi</name>
+  </developer>
+  <description>
+    <p>
+      Hyprdeck manages a Hyprland desktop from one place: startup apps, displays,
+      input devices and keybinds, simultaneous audio output and per-app routing,
+      Bluetooth, default apps, package updates, and sleep/wake recovery. It reads
+      the Lua configuration of Hyprland 0.56+ and writes its own settings to a
+      separate generated file.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.mikkeyboi.Hyprdeck.desktop</launchable>
+  <url type="homepage">https://github.com/mikkeyboi/hyprdeck</url>
+  <url type="bugtracker">https://github.com/mikkeyboi/hyprdeck/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-03"/>
+  </releases>
+</component>

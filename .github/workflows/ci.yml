@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    # GTK 4.20+/libadwaita 1.8+ and Hyprland's Lua API stubs come from Arch.
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain and libraries
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus hyprland
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: arch-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: arch-cargo-
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+
+  appimage:
+    name: AppImage (smoke build)
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    needs: check
+    steps:
+      - name: Install toolchain and packaging tools
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus librsvg gdk-pixbuf2 \
+            glib2 file desktop-file-utils appstream squashfs-tools zsync
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: arch-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: arch-cargo-release-
+      - name: Build AppImage
+        run: packaging/appimage/build-appimage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Hyprdeck-x86_64.AppImage
+          path: dist/*
+          retention-days: 7

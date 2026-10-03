@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  appimage:
+    name: Build and publish AppImage
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain and packaging tools
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus hyprland librsvg gdk-pixbuf2 \
+            glib2 file desktop-file-utils appstream squashfs-tools zsync github-cli
+      - uses: actions/checkout@v4
+      - name: Verify tag matches crate version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Build AppImage
+        run: packaging/appimage/build-appimage.sh
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          gh release create "$GITHUB_REF_NAME" dist/Hyprdeck-x86_64.AppImage dist/Hyprdeck-x86_64.AppImage.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title "Hyprdeck $GITHUB_REF_NAME" --generate-notes --verify-tag
