@@ -919,6 +919,7 @@ dependencies = [
  "hyprdeck-core",
  "ksni",
  "libadwaita",
+ "libc",
  "serde",
  "tokio",
  "tracing",

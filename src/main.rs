@@ -57,6 +57,12 @@ fn main() -> ExitCode {
         hd_system::cli,
     ];
     if args.first().is_some_and(|a| !a.starts_with('-')) {
+        // Headless commands are often piped (`hyprdeck display list | head`):
+        // exit quietly on a closed pipe like other CLI tools instead of panicking.
+        // SAFETY: called before any other thread exists; SIG_DFL is always valid.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
         for cli in clis {
             if let Some(result) = cli(&args) {
                 return match result {
