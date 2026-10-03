@@ -28,39 +28,30 @@ fetch() { # url dest
 }
 fetch https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
     "$tools/linuxdeploy-x86_64.AppImage"
-# Pinned plugin revision. Distros whose GTK4 ships no module dir (e.g. Arch has
-# no /usr/lib/gtk-4.0) make its unconditional copy fail, so skip that copy then.
-gtk_plugin_rev=7a3fbc31a9e5075073ff8790f26effbac5f84453
-if [[ ! -s "$tools/linuxdeploy-plugin-gtk.sh" ]]; then
-    fetch "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/$gtk_plugin_rev/linuxdeploy-plugin-gtk.sh" \
-        "$tools/linuxdeploy-plugin-gtk.sh"
-    sed -i 's|^\( *\)copy_lib_tree "\$gtk4_libdir" "\$APPDIR/"$|\1[ ! -d "$gtk4_libdir" ] \|\| copy_lib_tree "$gtk4_libdir" "$APPDIR/"|' \
-        "$tools/linuxdeploy-plugin-gtk.sh"
-    grep -q '\[ ! -d "\$gtk4_libdir" \]' "$tools/linuxdeploy-plugin-gtk.sh" \
-        || { echo "linuxdeploy-plugin-gtk patch did not apply" >&2; exit 1; }
-fi
 
 rm -rf "$appdir"
 install -Dm755 target/release/hyprdeck "$appdir/usr/bin/hyprdeck"
 install -Dm644 "data/$app_id.desktop" "$appdir/usr/share/applications/$app_id.desktop"
 install -Dm644 "data/icons/$app_id.svg" "$appdir/usr/share/icons/hicolor/scalable/apps/$app_id.svg"
 install -Dm644 "data/$app_id.metainfo.xml" "$appdir/usr/share/metainfo/$app_id.metainfo.xml"
-# Runs after the gtk plugin's hook (hooks are sourced in name order). The plugin
-# forces X11, GTK_THEME=Adwaita and an AppDir-only GTK data prefix, which break
-# libadwaita's stylesheet and the user's ~/.config/gtk-4.0 theme. Hyprdeck is a
-# native Wayland app: keep only the bundled libraries, schemas and loaders.
-install -Dm644 /dev/stdin "$appdir/apprun-hooks/zz-hyprdeck.sh" <<'EOF'
-unset GDK_BACKEND GTK_DATA_PREFIX GTK_EXE_PREFIX GTK_PATH
-if [ -z "${APPIMAGE_GTK_THEME:-}" ]; then
-    unset GTK_THEME
-fi
+
+# GTK4 needs its own GSettings schemas (file chooser, settings); bundle them so
+# the AppImage works on hosts without GTK4. Image loading uses the host's
+# gdk-pixbuf/glycin loaders, and themes come from the host, so no GTK/pixbuf
+# environment overrides (linuxdeploy-plugin-gtk's X11/GTK_THEME forcing breaks
+# libadwaita and native Wayland).
+schemas="$appdir/usr/share/glib-2.0/schemas"
+install -d "$schemas"
+cp /usr/share/glib-2.0/schemas/org.gtk.gtk4.*.xml "$schemas/"
+glib-compile-schemas "$schemas"
+install -Dm644 /dev/stdin "$appdir/apprun-hooks/hyprdeck.sh" <<'EOF'
+# Bundled data (GTK4 schemas, icon) first; host data dirs keep themes and apps visible.
+export XDG_DATA_DIRS="$APPDIR/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 EOF
 
 export APPIMAGE_EXTRACT_AND_RUN=1
-export DEPLOY_GTK_VERSION=4
 export VERSION="$version"
 export LDAI_OUTPUT="$dist/Hyprdeck-x86_64.AppImage"
-export PATH="$tools:$PATH"
 rm -f "$LDAI_OUTPUT"
 
 "$tools/linuxdeploy-x86_64.AppImage" \
@@ -68,7 +59,6 @@ rm -f "$LDAI_OUTPUT"
     --executable "$appdir/usr/bin/hyprdeck" \
     --desktop-file "$appdir/usr/share/applications/$app_id.desktop" \
     --icon-file "$appdir/usr/share/icons/hicolor/scalable/apps/$app_id.svg" \
-    --plugin gtk \
     --output appimage
 
 (cd "$dist" && sha256sum Hyprdeck-x86_64.AppImage > Hyprdeck-x86_64.AppImage.sha256)

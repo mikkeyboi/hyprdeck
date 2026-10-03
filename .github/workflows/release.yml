@@ -18,7 +18,7 @@ jobs:
     steps:
       - name: Install toolchain and packaging tools
         run: |
-          pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus hyprland librsvg gdk-pixbuf2 \
+          pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus hyprland \
             glib2 file desktop-file-utils appstream squashfs-tools zsync github-cli
       - uses: actions/checkout@v4
       - name: Verify tag matches crate version

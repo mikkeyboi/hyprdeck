@@ -47,7 +47,7 @@ jobs:
     steps:
       - name: Install toolchain and packaging tools
         run: |
-          pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus librsvg gdk-pixbuf2 \
+          pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus \
             glib2 file desktop-file-utils appstream squashfs-tools zsync
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
