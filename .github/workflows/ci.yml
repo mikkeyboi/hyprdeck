@@ -23,7 +23,7 @@ jobs:
       - name: Install toolchain and libraries
         run: |
           pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus hyprland
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/cache@v6
         with:
           path: |
@@ -49,7 +49,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus \
             glib2 file desktop-file-utils appstream squashfs-tools zsync
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/cache@v6
         with:
           path: |
