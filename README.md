@@ -27,7 +27,7 @@ loads last. Your hand-written config is never rewritten behind your back.
 | **Audio** | Play through several outputs at once (a PipeWire combine sink) and route specific apps to specific outputs. Includes volumes, default output, a "what's playing where" overview, and a tray submenu. |
 | **Bluetooth** | Scan, pair (PIN/passkey dialogs), trust, connect, rename, block and forget devices, with battery levels. Tray submenu. |
 | **Default Apps** | Default browser, mail, files, editor, image/video/music players, documents, archives and terminal (`xdg-terminal-exec`). Detects and fixes "mixed" handlers. Can sync Hyprland launcher variables such as `$BROWSER`. Advanced per-MIME-type and URL-scheme editor. |
-| **Updates** | Repo and AUR updates (`checkupdates`, `paru`/`yay`) with background checks and notifications. Compares detected components (Hyprland, Noctalia, Quickshell, Waybar, hyprlock, …) to their upstream GitHub releases, and switches to or from `-git` packages. Updates Hyprdeck itself (AppImage self-update or source rebuild). |
+| **Updates** | Repo and AUR updates in-app: a review screen (unread Arch news, and for every AUR package a PKGBUILD diff plus a security scan you approve), then one password prompt and a progress bar with a live log. AUR packages are built as your user, never as root. Background checks with notifications. Compares detected components (Hyprland, Noctalia, Quickshell, Waybar, hyprlock, …) to their upstream releases, and can switch to or from `-git` packages. Updates Hyprdeck itself (see below). |
 | **Sleep & Wake** | A resume guard saves diagnostics after every wake. If a display comes back dark (for example after an HDMI FRL link-training failure), it resets the display with a DPMS cycle and reload. Also: a "fix black screen" button and optional keybind, journal-based wake history, and GPU power-management checks. |
 | **Tweaks** | Game mode (runtime only), config health (errors, overridden options and binds), Hyprland log viewer. Corsair/OpenLinkHub resume tuning when present. |
 
@@ -42,7 +42,8 @@ uwsm, Noctalia or an NVIDIA driver hides or explains the related features instea
   - PipeWire + `pipewire-pulse` (`pactl`) for audio
   - BlueZ for Bluetooth
   - `ddcutil` with i2c access for monitor brightness
-  - Arch Linux or an Arch-based distro with `pacman-contrib` (plus `paru` or `yay` for the AUR) for the Updates page
+  - For the Updates page: Arch Linux or an Arch-based distro with `pacman-contrib`, a polkit agent (most shells
+    include one), and `base-devel` + `git` for AUR packages. No AUR helper is needed.
 - Building from source: Rust 1.88+, GTK ≥ 4.20, libadwaita ≥ 1.8
 
 ## Install
@@ -59,8 +60,7 @@ sha256sum -c Hyprdeck-x86_64.AppImage.sha256 && chmod +x Hyprdeck-x86_64.AppImag
 ln -sf "$PWD/Hyprdeck-x86_64.AppImage" ~/.local/bin/hyprdeck
 ```
 
-The AppImage is built on Arch Linux and needs a similarly recent glibc. The Updates page can update it in
-place.
+The AppImage is built on Arch Linux and needs a similarly recent glibc.
 
 ### From source
 
@@ -69,7 +69,19 @@ git clone https://github.com/mikkeyboi/hyprdeck && cd hyprdeck
 ./install.sh --enable   # release build, installs binary, desktop file, icon and user service
 ```
 
-Run `./install.sh` again to update. The Updates page has a "Rebuild…" button for this.
+### Staying up to date
+
+Hyprdeck checks for new versions of itself in the background. Under **Updates → Hyprdeck** you choose
+what happens: *Off*, *Notify me* (the default: a notification with an **Update now** button), or
+*Install automatically*. Either way, it restarts into the new version once the window is closed.
+
+| Install | Channel | You get |
+| --- | --- | --- |
+| AppImage | **Stable** (default) | Weekly releases, cut automatically when `main` changed that week |
+| AppImage | **Nightly** | A build of every change merged to `main`, once CI has passed |
+| Source checkout | your branch's upstream | Every new commit; Hyprdeck pulls and rebuilds it with `install.sh` |
+
+`hyprdeck updates self [check | install [--channel stable|nightly]]` does the same from a terminal.
 
 ### Start at login
 
@@ -127,8 +139,15 @@ cargo run -p hd-display --example display_preview   # one feature's pages, stand
 packaging/appimage/build-appimage.sh                # build dist/Hyprdeck-x86_64.AppImage
 ```
 
-CI runs fmt, clippy, tests and an AppImage build in an Arch Linux container. Pushing a `v*` tag that
-matches the crate version publishes a release with the AppImage and its checksum.
+CI runs fmt, clippy, tests and an AppImage build in an Arch Linux container. Releases are automated:
+
+- **Nightly**: every push to `main` whose CI passes republishes the `nightly` prerelease.
+- **Weekly stable** (`weekly.yml`, Mondays): merges any Dependabot PRs that have passed, refreshes
+  `Cargo.lock` with `cargo update` (fully tested in the same run), then tags the next patch version
+  and publishes it if `main` changed since the last release. Run the workflow by hand to release now
+  or to bump the minor/major version.
+- Dependabot PRs are set to auto-merge as soon as their checks pass.
+- Versions come from `vX.Y.Z` tags. Builds between tags report e.g. `0.1.2+5 (abc1234)`.
 
 Issues and pull requests are welcome. Include `hyprdeck --version`, `hyprctl version | head -1` and
 relevant `journalctl --user -u hyprdeck` output in bug reports.

@@ -1,8 +1,17 @@
 name: Release
 
+# Builds and publishes a stable release for a `vX.Y.Z` tag. Runs when a
+# maintainer pushes a tag, and is called by the weekly workflow (tags pushed with
+# GITHUB_TOKEN don't trigger workflows, so it calls this one directly).
 on:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]*"]
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag (vX.Y.Z) that already exists on the remote
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -15,16 +24,22 @@ jobs:
     name: Build and publish AppImage
     runs-on: ubuntu-latest
     container: archlinux:latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - name: Install toolchain and packaging tools
         run: |
           pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus hyprland \
             glib2 file desktop-file-utils appstream squashfs-tools zsync github-cli
       - uses: actions/checkout@v7
-      - name: Verify tag matches crate version
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          fetch-depth: 0
+      - name: Prepare
         run: |
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != v$version"; exit 1; }
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "invalid release tag $TAG"; exit 1; }
+          echo "HYPRDECK_VERSION=${TAG#v}" >> "$GITHUB_ENV"
       - name: Test
         run: cargo test --workspace --locked
       - name: Build AppImage
@@ -33,6 +48,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          gh release create "$GITHUB_REF_NAME" dist/Hyprdeck-x86_64.AppImage dist/Hyprdeck-x86_64.AppImage.sha256 \
-            --repo "$GITHUB_REPOSITORY" --title "Hyprdeck $GITHUB_REF_NAME" --generate-notes --verify-tag
+          gh release create "$TAG" dist/Hyprdeck-x86_64.AppImage dist/Hyprdeck-x86_64.AppImage.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title "Hyprdeck $TAG" --generate-notes --verify-tag --latest

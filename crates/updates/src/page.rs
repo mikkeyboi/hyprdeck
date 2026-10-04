@@ -14,6 +14,7 @@ use crate::parse::{CrateUpdate, Update};
 use crate::selfstate::{self, Checked, Job, Origin, SelfState};
 use crate::selfupdate::{self, Blocker, Channel, Mode, Policy, SelfCheck, SourceCheck};
 use crate::state::{self, State};
+use crate::{apply, dialog};
 
 /// The page re-checks on show when the last check is older than this.
 const STALE_ON_SHOW: i64 = 15 * 60;
@@ -25,9 +26,12 @@ const CSS: &str = "
             background: alpha(currentColor, 0.1); }
 .hd-badge.important { background: alpha(var(--accent-bg-color), 0.25); color: var(--accent-color); }
 .hd-badge.aur { background: alpha(var(--warning-bg-color), 0.2); color: var(--warning-color); }
+.hd-badge.warning { background: alpha(var(--warning-bg-color), 0.25); color: var(--warning-color); }
+.hd-badge.critical { background: alpha(var(--error-bg-color), 0.25); color: var(--error-color); }
+.hd-badge.ok { background: alpha(var(--success-bg-color), 0.2); color: var(--success-color); }
 ";
 
-fn load_css() {
+pub(crate) fn load_css() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let Some(display) = gtk::gdk::Display::default() else {
@@ -102,6 +106,35 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
             let Some(page) = weak.upgrade() else { break };
             let st = rx.borrow_and_update().clone();
             page.render_hyprdeck(&st);
+        }
+    });
+    // Re-render when an in-app update starts or ends ("Update everything" ↔ "Show progress").
+    let weak = Rc::downgrade(&page);
+    let mut rx = apply::subscribe();
+    glib::spawn_future_local(async move {
+        let mut active = rx.borrow().active;
+        while rx.changed().await.is_ok() {
+            let Some(page) = weak.upgrade() else { break };
+            let now_active = rx.borrow_and_update().active;
+            if now_active != active {
+                active = now_active;
+                page.render(&state::current());
+            }
+        }
+    });
+    // Tray entry / notification action: open the update dialog.
+    let ctx2 = ctx.clone();
+    let mut rx = state::review_requests();
+    glib::spawn_future_local(async move {
+        loop {
+            // Let the window present itself before the dialog attaches to it.
+            glib::timeout_future(std::time::Duration::from_millis(100)).await;
+            if state::take_review_request() {
+                dialog::open(&ctx2);
+            }
+            if rx.changed().await.is_err() {
+                break;
+            }
         }
     });
 
@@ -213,23 +246,12 @@ impl Page {
             row.add_prefix(&icon("dialog-warning-symbolic", "warning"));
             group.add(&row);
         }
-        match (&tooling.aur_helper, &report.aur_error) {
-            (Some(_), Some(err)) => {
-                let row = adw::ActionRow::builder().use_markup(false).build();
-                row.set_title("AUR check failed");
-                row.set_subtitle(err);
-                row.add_prefix(&icon("dialog-warning-symbolic", "warning"));
-                group.add(&row);
-            }
-            (None, _) => {
-                let row = adw::ActionRow::builder()
-                    .title("AUR packages are not checked")
-                    .subtitle("Install an AUR helper (paru or yay) to include them; updates run with pacman meanwhile")
-                    .build();
-                row.add_prefix(&icon("dialog-information-symbolic", "dim-label"));
-                group.add(&row);
-            }
-            (Some(_), None) => {}
+        if let Some(err) = &report.aur_error {
+            let row = adw::ActionRow::builder().use_markup(false).build();
+            row.set_title("AUR check failed");
+            row.set_subtitle(err);
+            row.add_prefix(&icon("dialog-warning-symbolic", "warning"));
+            group.add(&row);
         }
 
         let total = report.total();
@@ -241,39 +263,38 @@ impl Page {
                 1 => "1 update available".to_owned(),
                 n => format!("{n} updates available"),
             })
-            .subtitle(match &tooling.aur_helper {
-                Some(_) => format!(
-                    "{} from repositories · {} from the AUR · {important} important",
-                    report.repo.len(),
-                    report.aur.len()
-                ),
-                None => format!(
-                    "{} from repositories · {important} important",
-                    report.repo.len()
-                ),
-            })
+            .subtitle(format!(
+                "{} from repositories · {} from the AUR · {important} important",
+                report.repo.len(),
+                report.aur.len()
+            ))
             .build();
         summary.add_prefix(&if total == 0 {
-            icon("emblem-ok-symbolic", "success")
+            icon("object-select-symbolic", "success")
         } else {
             icon("software-update-available-symbolic", "accent")
         });
-        if total > 0 {
-            let command = tooling.upgrade_command();
+        if apply::active() {
+            let btn = gtk::Button::builder()
+                .label("Show progress")
+                .valign(gtk::Align::Center)
+                .css_classes(["pill"])
+                .tooltip_text("A system update is running")
+                .build();
+            let ctx = self.ctx.clone();
+            btn.connect_clicked(move |_| dialog::open(&ctx));
+            summary.add_suffix(&btn);
+        } else if total > 0 {
             let btn = gtk::Button::builder()
                 .label("Update everything")
                 .valign(gtk::Align::Center)
                 .css_classes(["suggested-action", "pill"])
-                .tooltip_text(format!(
-                    "Opens a terminal running {command} (asks for your password there)"
-                ))
+                .tooltip_text(
+                    "Review the updates (news, AUR changes and security checks), then update with one password prompt",
+                )
                 .build();
-            let page = Rc::downgrade(self);
-            btn.connect_clicked(move |_| {
-                if let Some(page) = page.upgrade() {
-                    page.run_terminal("System update", &command);
-                }
-            });
+            let ctx = self.ctx.clone();
+            btn.connect_clicked(move |_| dialog::open(&ctx));
             summary.add_suffix(&btn);
         }
         group.add(&summary);
@@ -296,6 +317,19 @@ impl Page {
                 .build();
             for u in list {
                 exp.add_row(&update_row(u, aur));
+            }
+            group.add(&exp);
+        }
+        if !report.not_in_aur.is_empty() {
+            let exp = adw::ExpanderRow::builder()
+                .title(format!("Not from the AUR ({})", report.not_in_aur.len()))
+                .subtitle("Foreign packages the AUR doesn't know; never updated here")
+                .build();
+            for f in &report.not_in_aur {
+                let row = adw::ActionRow::builder().use_markup(false).build();
+                row.set_title(&f.name);
+                row.set_subtitle(&f.version);
+                exp.add_row(&row);
             }
             group.add(&exp);
         }
@@ -324,7 +358,7 @@ impl Page {
         status_row.set_title(&status.text);
         status_row.set_title_lines(0);
         status_row.add_prefix(&match status.kind {
-            StatusKind::UpToDate => icon("emblem-ok-symbolic", "success"),
+            StatusKind::UpToDate => icon("object-select-symbolic", "success"),
             StatusKind::RepoUpdate => icon("software-update-available-symbolic", "accent"),
             StatusKind::BehindUpstream => icon("dialog-information-symbolic", "warning"),
             StatusKind::Git => icon("emblem-system-symbolic", "accent"),
@@ -709,7 +743,7 @@ impl Page {
                             published(rel, now)
                         ),
                     });
-                    row.add_prefix(&icon("emblem-ok-symbolic", "success"));
+                    row.add_prefix(&icon("object-select-symbolic", "success"));
                 }
             },
             SelfCheck::Source(c) => match &c.plan.blocker {
@@ -727,7 +761,7 @@ impl Page {
                         .unwrap_or("upstream");
                     row.set_title(&format!("Up to date with {upstream}"));
                     row.set_subtitle(&format!("Fetched and compared · {checked_ago}"));
-                    row.add_prefix(&icon("emblem-ok-symbolic", "success"));
+                    row.add_prefix(&icon("object-select-symbolic", "success"));
                 }
             },
         }
@@ -754,7 +788,7 @@ impl Page {
                 row.set_subtitle(
                     "Restart to finish updating. Hyprdeck restarts by itself once the window is closed.",
                 );
-                row.add_prefix(&icon("emblem-ok-symbolic", "success"));
+                row.add_prefix(&icon("object-select-symbolic", "success"));
                 let btn = gtk::Button::builder()
                     .label("Restart now")
                     .valign(gtk::Align::Center)
@@ -765,7 +799,7 @@ impl Page {
             }
             Job::Done(msg) => {
                 row.set_title(msg);
-                row.add_prefix(&icon("emblem-ok-symbolic", "success"));
+                row.add_prefix(&icon("object-select-symbolic", "success"));
             }
             Job::Failed(msg) => {
                 row.set_title("Update failed");

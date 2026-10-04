@@ -4,6 +4,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+      day: sunday
     groups:
       cargo:
         patterns: ["*"]
@@ -11,3 +12,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+      day: sunday
+    groups:
+      actions:
+        patterns: ["*"]
