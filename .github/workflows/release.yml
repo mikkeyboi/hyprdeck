@@ -1,15 +1,19 @@
 name: Release
 
 # Builds and publishes a stable release for a `vX.Y.Z` tag. Runs when a
-# maintainer pushes a tag, and is called by the weekly workflow (tags pushed with
-# GITHUB_TOKEN don't trigger workflows, so it calls this one directly).
+# maintainer pushes a tag, and is called by the weekly workflow with the tag to
+# create and the commit to release.
 on:
   push:
     tags: ["v[0-9]*"]
   workflow_call:
     inputs:
       tag:
-        description: Release tag (vX.Y.Z) that already exists on the remote
+        description: Release tag (vX.Y.Z) to create
+        required: true
+        type: string
+      sha:
+        description: Commit to release (the tag is created there)
         required: true
         type: string
 
@@ -26,6 +30,7 @@ jobs:
     container: archlinux:latest
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
+      SHA: ${{ inputs.sha || github.sha }}
     steps:
       - name: Install toolchain and packaging tools
         run: |
@@ -33,7 +38,7 @@ jobs:
             glib2 file desktop-file-utils appstream squashfs-tools zsync github-cli
       - uses: actions/checkout@v7
         with:
-          ref: refs/tags/${{ env.TAG }}
+          ref: ${{ env.SHA }}
           fetch-depth: 0
       - name: Prepare
         run: |
@@ -48,5 +53,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # Creates the tag at $SHA when it doesn't exist yet (weekly releases).
           gh release create "$TAG" dist/Hyprdeck-x86_64.AppImage dist/Hyprdeck-x86_64.AppImage.sha256 \
-            --repo "$GITHUB_REPOSITORY" --title "Hyprdeck $TAG" --generate-notes --verify-tag --latest
+            --repo "$GITHUB_REPOSITORY" --target "$SHA" --title "Hyprdeck $TAG" --generate-notes --latest
