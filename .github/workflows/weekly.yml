@@ -8,8 +8,8 @@ name: Weekly release
 #   2. `cargo update` (semver-compatible lockfile refresh). If it changes anything,
 #      run the full CI suite here, open a PR, mark the required checks with this
 #      run's results and merge it.
-#   3. If main has commits since the latest vX.Y.Z tag, tag the next version and
-#      run release.yml for it.
+#   3. If main has commits since the latest vX.Y.Z tag, run release.yml to
+#      publish the next version from main's HEAD.
 on:
   schedule:
     - cron: "0 15 * * 1"
@@ -46,7 +46,7 @@ jobs:
       - name: Install toolchain and packaging tools
         run: |
           pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus hyprland \
-            glib2 file desktop-file-utils appstream squashfs-tools zsync github-cli
+            glib2 file desktop-file-utils appstream squashfs-tools zsync github-cli jq
       - uses: actions/checkout@v7
         with:
           ref: main
@@ -95,19 +95,31 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # GitHub rejects GITHUB_TOKEN `git push`es that create refs on history
+          # containing workflow changes, so the branch and commit are made
+          # through the REST API instead (the commit only touches Cargo.lock).
+          repo="$GITHUB_REPOSITORY"
           branch="automation/cargo-update-$(date -u +%Y-%m-%d)"
-          git switch -c "$branch"
-          git commit -am "Update Rust dependencies (cargo update)"
-          git push --force origin "$branch"
-          url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+          base="$(git rev-parse HEAD)"
+          gh api -X DELETE "repos/$repo/git/refs/heads/$branch" 2>/dev/null || true
+          gh api "repos/$repo/git/refs" -f ref="refs/heads/$branch" -f sha="$base" >/dev/null
+          blob="$(gh api "repos/$repo/contents/Cargo.lock?ref=$branch" --jq .sha)"
+          base64 -w0 Cargo.lock > /tmp/lock.b64
+          jq -n --arg msg "Update Rust dependencies (cargo update)" --arg branch "$branch" \
+                --arg sha "$blob" --rawfile content /tmp/lock.b64 \
+                '{message: $msg, branch: $branch, sha: $sha, content: $content}' |
+            gh api -X PUT "repos/$repo/contents/Cargo.lock" --input - >/dev/null
+          sha="$(gh api "repos/$repo/git/ref/heads/$branch" --jq .object.sha)"
+          # Same tree this job verified: main + the refreshed Cargo.lock.
+          test "$(gh api "repos/$repo/commits/$sha" --jq '[.files[].filename] | join(",")')" = Cargo.lock
+          url="$(gh pr create --repo "$repo" --base main --head "$branch" \
             --title "Update Rust dependencies (cargo update)" \
             --body "Weekly semver-compatible lockfile refresh. fmt, clippy, tests and the AppImage build passed in $RUN_URL.")"
-          sha="$(git rev-parse HEAD)"
           # PRs opened with GITHUB_TOKEN don't trigger CI; this job already ran
-          # the same checks on this exact commit, so report them as its statuses.
+          # the same checks on this exact tree, so report them as its statuses.
           for context in "fmt, clippy, test" "AppImage (smoke build)"; do
-            gh api "repos/$GITHUB_REPOSITORY/statuses/$sha" -f state=success \
-              -f context="$context" -f target_url="$RUN_URL" -f description="Verified by the weekly release run"
+            gh api "repos/$repo/statuses/$sha" -f state=success \
+              -f context="$context" -f target_url="$RUN_URL" -f description="Verified by the weekly release run" >/dev/null
           done
           gh pr merge "$url" --squash --delete-branch
 
@@ -117,6 +129,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.next.outputs.tag }}
+      sha: ${{ steps.next.outputs.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -142,11 +155,11 @@ jobs:
             *)     patch=$((patch + 1)) ;;
           esac
           tag="v$major.$minor.$patch"
-          git -c user.name="github-actions[bot]" \
-              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              tag -a "$tag" -m "Hyprdeck $tag" HEAD
-          git push origin "$tag"
+          # The tag is created by release.yml through the releases API (a git
+          # push of a tag with GITHUB_TOKEN is refused for histories that touch
+          # workflow files).
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "Releasing $tag ($count commit(s) since $last)." >> "$GITHUB_STEP_SUMMARY"
 
   publish:
@@ -156,5 +169,6 @@ jobs:
     uses: ./.github/workflows/release.yml
     with:
       tag: ${{ needs.release.outputs.tag }}
+      sha: ${{ needs.release.outputs.sha }}
     permissions:
       contents: write
