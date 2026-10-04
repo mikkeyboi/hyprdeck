@@ -14,6 +14,7 @@
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -827,7 +828,7 @@ pub fn apply_appimage(
         label,
         restart: Restart {
             exec: c.path.clone(),
-            service: true,
+            service: service_runs_appimage(&c.path),
         },
     })
 }
@@ -1097,6 +1098,30 @@ pub fn lock() -> Result<UpdateLock> {
         }
         Err(std::fs::TryLockError::Error(e)) => Err(anyhow!(e).context("locking the update")),
     }
+}
+
+/// Whether `hyprdeck.service` currently runs from `appimage` (its main process
+/// carries `APPIMAGE=<same file>`). Updating some other copy must not restart
+/// the user's service.
+pub fn service_runs_appimage(appimage: &Path) -> bool {
+    let Some(pid) = cmd::systemctl_user(["show", "-p", "MainPID", "--value", SERVICE])
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&p| p != 0)
+    else {
+        return false;
+    };
+    let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    let want = std::fs::canonicalize(appimage).unwrap_or_else(|_| appimage.to_path_buf());
+    environ
+        .split(|&b| b == 0)
+        .filter_map(|kv| kv.strip_prefix(b"APPIMAGE="))
+        .any(|v| {
+            let p = Path::new(std::ffi::OsStr::from_bytes(v));
+            std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()) == want
+        })
 }
 
 /// Restart `hyprdeck.service` if it is active. Returns `Some(is_this_process)`

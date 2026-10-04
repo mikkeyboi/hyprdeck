@@ -244,7 +244,7 @@ fn render_self(
             };
             let _ = writeln!(out, "Status:    {status}");
             if let Some(b) = &c.plan.blocker {
-                let _ = writeln!(out, "Blocked:   {}: {}", b.title(), b.message());
+                let _ = writeln!(out, "Blocked:   {}", b.message());
             }
             if let Some(e) = &c.fetch_error {
                 let _ = writeln!(out, "Warning:   {e}");
