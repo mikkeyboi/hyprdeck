@@ -163,8 +163,12 @@ fn self_install(mode: &Mode, channel: Channel, channel_given: bool) -> Result<()
             Some(_) => println!("Restarted hyprdeck.service"),
             None => println!("Start hyprdeck again to use the new version"),
         }
-    } else {
+    } else if matches!(mode, Mode::Source(_)) {
         println!("install.sh restarted hyprdeck.service if it was running");
+    } else {
+        println!(
+            "hyprdeck.service doesn't run this AppImage; start it again to use the new version"
+        );
     }
     Ok(())
 }
