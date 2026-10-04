@@ -270,7 +270,7 @@ impl Page {
                 "No config errors",
                 "Hyprland and hyprdeck both load the config cleanly",
             );
-            r.add_prefix(&gtk::Image::from_icon_name("emblem-ok-symbolic"));
+            r.add_prefix(&gtk::Image::from_icon_name("object-select-symbolic"));
             errors.add(&r);
         }
         self.health.append(&errors);

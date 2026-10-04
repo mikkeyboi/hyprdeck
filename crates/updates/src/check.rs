@@ -115,7 +115,8 @@ pub struct Tooling {
     pub pacman: bool,
     /// `checkupdates` from pacman-contrib.
     pub checkupdates: bool,
-    /// `paru` or `yay`, in that order of preference.
+    /// `paru` or `yay`, in that order of preference. Only used for the explicit
+    /// "open in a terminal" fallbacks; listing and updating work without one.
     pub aur_helper: Option<String>,
 }
 
@@ -136,7 +137,8 @@ impl Tooling {
         }
     }
 
-    /// Full system upgrade, run interactively in a terminal.
+    /// Full system upgrade, run interactively in a terminal (the fallback for
+    /// the in-app update).
     pub fn upgrade_command(&self) -> String {
         match &self.aur_helper {
             Some(h) => format!("{h} -Syu"),
@@ -167,8 +169,12 @@ pub struct Report {
     pub tooling: Tooling,
     pub repo: Vec<Update>,
     pub repo_error: Option<String>,
+    /// Installed foreign packages with a newer AUR version.
     pub aur: Vec<Update>,
     pub aur_error: Option<String>,
+    /// Installed foreign packages the AUR doesn't know (never updated).
+    #[serde(default)]
+    pub not_in_aur: Vec<aur::Foreign>,
     /// Detected components only.
     pub tracked: Vec<Tracked>,
 }
@@ -337,14 +343,14 @@ pub fn now() -> i64 {
 }
 
 /// The temporary sync database `checkupdates` maintains (`${TMPDIR:-/tmp}/checkup-db-${UID}`).
-fn checkupdates_db() -> Option<PathBuf> {
+pub(crate) fn checkupdates_db() -> Option<PathBuf> {
     let uid = std::fs::metadata("/proc/self").ok()?.uid();
     let tmp = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     let db = tmp.join(format!("checkup-db-{uid}"));
     db.join("sync").is_dir().then_some(db)
 }
 
-fn repo_updates(tooling: &Tooling) -> Result<Vec<Update>, String> {
+pub(crate) fn repo_updates(tooling: &Tooling) -> Result<Vec<Update>, String> {
     if !tooling.checkupdates {
         return Err("checkupdates not found: install the pacman-contrib package to check repository updates".into());
     }
@@ -353,16 +359,6 @@ fn repo_updates(tooling: &Tooling) -> Result<Vec<Update>, String> {
         0 => Ok(parse::parse_updates(&out.stdout)),
         2 => Ok(Vec::new()),
         code => Err(failure("checkupdates", code, &out.stderr)),
-    }
-}
-
-fn aur_updates(helper: &str) -> Result<Vec<Update>, String> {
-    let out = cmd::output(helper, ["-Qua", "--color", "never"]).map_err(|e| format!("{e:#}"))?;
-    match out.status {
-        0 => Ok(parse::parse_updates(&out.stdout)),
-        // Like `pacman -Qu`, exit 1 with no diagnostics means "nothing to upgrade".
-        1 if out.stderr.trim().is_empty() => Ok(Vec::new()),
-        code => Err(failure(&format!("{helper} -Qua"), code, &out.stderr)),
     }
 }
 
@@ -436,7 +432,7 @@ pub fn detect(
 }
 
 /// Packages that count as important beyond the generic patterns: those of tracked projects.
-fn mark_important(updates: &mut [Update], tracked: &[Tracked]) {
+pub(crate) fn mark_important(updates: &mut [Update], tracked: &[Tracked]) {
     for u in updates {
         u.important = parse::is_important(&u.name)
             || tracked
@@ -523,11 +519,10 @@ pub fn run_check() -> Report {
         .iter()
         .filter_map(|p| Some((p, detect(p, tooling.pacman, &installed, cmd::which)?)))
         .collect();
-    let (mut repo, repo_error, mut aur, aur_error, tracked) = std::thread::scope(|s| {
+    let (mut repo, repo_error, aur, aur_error, tracked) = std::thread::scope(|s| {
         let aur = tooling
-            .aur_helper
-            .clone()
-            .map(|h| s.spawn(move || aur_updates(&h)));
+            .pacman
+            .then(|| s.spawn(|| aur::list_updates().map_err(|e| format!("{e:#}"))));
         // Network lookups are independent of pacman; run them in parallel.
         let gh: Vec<_> = detected
             .iter()
@@ -554,12 +549,14 @@ pub fn run_check() -> Report {
         } else {
             Vec::new()
         };
-        let (aur, aur_error) = match aur {
-            Some(h) => split(
-                h.join()
-                    .unwrap_or_else(|_| Err("AUR update check panicked".into())),
+        let (aur, aur_error) = match aur.map(|h| h.join()) {
+            Some(Ok(Ok(listing))) => (listing, None),
+            Some(Ok(Err(e))) => (aur::Listing::default(), Some(e)),
+            Some(Err(_)) => (
+                aur::Listing::default(),
+                Some("AUR update check panicked".into()),
             ),
-            None => (Vec::new(), None),
+            None => (aur::Listing::default(), None),
         };
         let in_aur = in_aur.join().unwrap_or_default();
         let tracked: Vec<Tracked> = detected
@@ -575,6 +572,11 @@ pub fn run_check() -> Report {
         (repo, repo_error, aur, aur_error, tracked)
     });
     mark_important(&mut repo, &tracked);
+    let aur::Listing {
+        updates: mut aur,
+        not_in_aur,
+        ..
+    } = aur;
     mark_important(&mut aur, &tracked);
     Report {
         checked_at: now,
@@ -583,6 +585,7 @@ pub fn run_check() -> Report {
         repo_error,
         aur,
         aur_error,
+        not_in_aur,
         tracked,
     }
 }

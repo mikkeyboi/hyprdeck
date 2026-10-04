@@ -1,0 +1,160 @@
+name: Weekly release
+
+# Every Monday: fold in pending dependency updates, then cut a stable release if
+# `main` changed since the last one. Nightly builds (nightly.yml) still ship every
+# merged change; stable users get a vetted weekly cadence.
+#
+#   1. Merge Dependabot PRs whose checks passed (others get "@dependabot rebase").
+#   2. `cargo update` (semver-compatible lockfile refresh). If it changes anything,
+#      run the full CI suite here, open a PR, mark the required checks with this
+#      run's results and merge it.
+#   3. If main has commits since the latest vX.Y.Z tag, tag the next version and
+#      run release.yml for it.
+on:
+  schedule:
+    - cron: "0 15 * * 1"
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version part to bump
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      force:
+        description: Release even when nothing changed since the last tag
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: weekly-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dependencies:
+    name: Dependency updates
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain and packaging tools
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus hyprland \
+            glib2 file desktop-file-utils appstream squashfs-tools zsync github-cli
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Prepare
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Merge green Dependabot PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr list --repo "$GITHUB_REPOSITORY" --author "app/dependabot" --state open \
+              --json number,mergeStateStatus --jq '.[] | "\(.number) \(.mergeStateStatus)"' |
+          while read -r number state; do
+            case "$state" in
+              CLEAN) gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --squash --delete-branch \
+                       && echo "merged #$number" ;;
+              BEHIND) gh pr comment "$number" --repo "$GITHUB_REPOSITORY" --body "@dependabot rebase" \
+                       && echo "asked #$number to rebase" ;;
+              *) echo "leaving #$number ($state)" ;;
+            esac
+          done
+          git pull --ff-only origin main
+      - name: Refresh Cargo.lock
+        id: lock
+        run: |
+          cargo update
+          if git diff --quiet Cargo.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --stat Cargo.lock
+          fi
+      - name: Verify updated dependencies (fmt, clippy, test, AppImage)
+        if: steps.lock.outputs.changed == 'true'
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          packaging/appimage/build-appimage.sh
+      - name: Merge the lockfile update
+        if: steps.lock.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          branch="automation/cargo-update-$(date -u +%Y-%m-%d)"
+          git switch -c "$branch"
+          git commit -am "Update Rust dependencies (cargo update)"
+          git push --force origin "$branch"
+          url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" \
+            --title "Update Rust dependencies (cargo update)" \
+            --body "Weekly semver-compatible lockfile refresh. fmt, clippy, tests and the AppImage build passed in $RUN_URL.")"
+          sha="$(git rev-parse HEAD)"
+          # PRs opened with GITHUB_TOKEN don't trigger CI; this job already ran
+          # the same checks on this exact commit, so report them as its statuses.
+          for context in "fmt, clippy, test" "AppImage (smoke build)"; do
+            gh api "repos/$GITHUB_REPOSITORY/statuses/$sha" -f state=success \
+              -f context="$context" -f target_url="$RUN_URL" -f description="Verified by the weekly release run"
+          done
+          gh pr merge "$url" --squash --delete-branch
+
+  release:
+    name: Tag release
+    needs: dependencies
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Decide the next version
+        id: next
+        env:
+          BUMP: ${{ inputs.bump || 'patch' }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          last="$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null || echo v0.0.0)"
+          count="$(git rev-list --count "$last..HEAD")"
+          echo "last release $last, $count commit(s) since"
+          if [ "$count" = 0 ] && [ "$FORCE" != true ]; then
+            echo "Nothing new since $last; no release this week." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          IFS=. read -r major minor patch <<< "${last#v}"
+          case "$BUMP" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            *)     patch=$((patch + 1)) ;;
+          esac
+          tag="v$major.$minor.$patch"
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              tag -a "$tag" -m "Hyprdeck $tag" HEAD
+          git push origin "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag ($count commit(s) since $last)." >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish
+    needs: release
+    if: needs.release.outputs.tag != ''
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}
+    permissions:
+      contents: write

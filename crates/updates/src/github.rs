@@ -143,7 +143,7 @@ pub fn tagged_release(
 
 /// Serve `path` when younger than `max_age`, otherwise `fetch` and cache the
 /// result; on fetch failure fall back to any stale cache with a warning.
-fn cached<T>(
+pub(crate) fn cached<T>(
     path: &Path,
     now: i64,
     max_age: i64,

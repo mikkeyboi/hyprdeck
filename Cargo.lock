@@ -881,9 +881,11 @@ name = "hd-updates"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "gtk4",
  "hyprdeck-core",
  "libadwaita",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

@@ -12,7 +12,10 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$root"
 
 app_id="io.github.mikkeyboi.Hyprdeck"
-version="$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"name":"hyprdeck","version":"\([^"]*\)".*/\1/p')"
+# Same rule as crates/core/build.rs: release CI sets HYPRDECK_VERSION, otherwise
+# the nearest vX.Y.Z tag, otherwise the crate version.
+version="${HYPRDECK_VERSION:-$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null | sed 's/^v//')}"
+version="${version:-$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"name":"hyprdeck","version":"\([^"]*\)".*/\1/p')}"
 tools="${HYPRDECK_APPIMAGE_TOOLS:-$root/target/appimage-tools}"
 appdir="$root/target/AppDir"
 dist="$root/dist"
@@ -34,6 +37,8 @@ install -Dm755 target/release/hyprdeck "$appdir/usr/bin/hyprdeck"
 install -Dm644 "data/$app_id.desktop" "$appdir/usr/share/applications/$app_id.desktop"
 install -Dm644 "data/icons/$app_id.svg" "$appdir/usr/share/icons/hicolor/scalable/apps/$app_id.svg"
 install -Dm644 "data/$app_id.metainfo.xml" "$appdir/usr/share/metainfo/$app_id.metainfo.xml"
+sed -i "s|<release version=\"[^\"]*\" date=\"[^\"]*\"/>|<release version=\"$version\" date=\"$(date -u +%Y-%m-%d)\"/>|" \
+    "$appdir/usr/share/metainfo/$app_id.metainfo.xml"
 
 # GTK4 needs its own GSettings schemas (file chooser, settings); bundle them so
 # the AppImage works on hosts without GTK4. Image loading uses the host's

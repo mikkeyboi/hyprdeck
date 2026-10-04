@@ -50,6 +50,10 @@ jobs:
           pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus \
             glib2 file desktop-file-utils appstream squashfs-tools zsync
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # tags: the build's version comes from `git describe`
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/cache@v6
         with:
           path: |

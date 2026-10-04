@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel><title>Arch Linux: Recent news updates</title><link>https://archlinux.org/news/</link><description>The latest and greatest news from the Arch Linux distribution.</description><atom:link href="https://archlinux.org/feeds/news/" rel="self"/><language>en-us</language><lastBuildDate>Tue, 22 Sep 2026 09:09:27 +0000</lastBuildDate><item><title>Mkinitcpio &gt;=42 requires manual intervention for TPM2-based unlocking of LUKS devices</title><link>https://archlinux.org/news/mkinitcpio-42-requires-manual-intervention-for-tpm2-based-unlocking-of-luks-devices/</link><description>&lt;p&gt;Starting with package version &lt;code&gt;42-1&lt;/code&gt;, the mkinitcpio systemd hook now includes &lt;code&gt;systemd-pcrosseparator.service&lt;/code&gt; (as &lt;a href="https://github.com/systemd/systemd/blob/1f9d56a7ab1d814044ac02939b42fd0efb99a8ab/NEWS#L69"&gt;intended by systemd v261&lt;/a&gt;).&lt;/p&gt;
+&lt;p&gt;This affects the measurements of PCR values &lt;code&gt;0-7&lt;/code&gt;, &lt;code&gt;9&lt;/code&gt; and &lt;code&gt;12-14&lt;/code&gt;.
+If you configured the systemd hook and unlock LUKS partitions, that depend on these values, you need to re-enroll the &lt;a href="https://wiki.archlinux.org/title/Trusted_Platform_Module"&gt;TPM2&lt;/a&gt; in use.&lt;/p&gt;
+&lt;p&gt;For guidance, please refer to &lt;a href="https://man.archlinux.org/man/systemd-cryptenroll.1"&gt;systemd-cryptenroll(1)&lt;/a&gt;, or the &lt;a href="https://wiki.archlinux.org/title/Systemd-cryptenroll"&gt;ArchWiki article on systemd-cryptenroll&lt;/a&gt;, when using pinned values.
+Refer to &lt;a href="https://man.archlinux.org/man/core/systemd/systemd-pcrlock.8"&gt;systemd-pcrlock(8)&lt;/a&gt;, when relying on custom policies and a disabled &lt;code&gt;systemd-pcrlock-make-policy.service&lt;/code&gt;.&lt;/p&gt;</description><dc:creator xmlns:dc="http://purl.org/dc/elements/1.1/">David Runge</dc:creator><pubDate>Tue, 22 Sep 2026 09:09:27 +0000</pubDate><guid isPermaLink="false">tag:archlinux.org,2026-09-22:/news/mkinitcpio-42-requires-manual-intervention-for-tpm2-based-unlocking-of-luks-devices/</guid></item><item><title>virtualbox-ext-vnc &gt;= 7.2.12-2 requires manual intervention</title><link>https://archlinux.org/news/virtualbox-ext-vnc-7212-2-requires-manual-intervention/</link><description>&lt;p&gt;Previously, we installed its contents in a way that made &lt;code&gt;pacman&lt;/code&gt; not
+aware of the files (using &lt;code&gt;VBoxManage extpack install ...&lt;/code&gt; from an
+install script). To mitigate issues during upgrade, you can use one of
+the following methods:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;Uninstall &lt;code&gt;virtualbox-ext-vnc&lt;/code&gt; before upgrading the system, then
+installing it again.&lt;/li&gt;
+&lt;li&gt;Run &lt;code&gt;VBoxManage extpack uninstall 'VNC'&lt;/code&gt; as root before upgrading the
+system.&lt;/li&gt;
+&lt;li&gt;Instruct &lt;code&gt;pacman&lt;/code&gt; once to overwrite the existing files:&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;code&gt;pacman -Syu --overwrite '/usr/lib/virtualbox/ExtensionPacks/VNC/*'&lt;/code&gt;&lt;/p&gt;</description><dc:creator xmlns:dc="http://purl.org/dc/elements/1.1/">Christian Hesse</dc:creator><pubDate>Tue, 21 Jul 2026 13:01:46 +0000</pubDate><guid isPermaLink="false">tag:archlinux.org,2026-07-21:/news/virtualbox-ext-vnc-7212-2-requires-manual-intervention/</guid></item><item><title>Active AUR malicious packages incident</title><link>https://archlinux.org/news/active-aur-malicious-packages-incident/</link><description>&lt;p&gt;We are currently experiencing a high volume of malicious package adoptions and updates in the Arch User Repository.&lt;/p&gt;
+&lt;p&gt;We are actively working to track down existing malicious commits and attempting to prevent additional malicious commits from being pushed.
+While this is happening, and while we work to create a more permanent solution, users may see issues with the following:&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;Creating new accounts on the AUR&lt;/li&gt;
+&lt;li&gt;Pushing package updates&lt;/li&gt;
+&lt;li&gt;Adopting or creating new packages&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;We continue to encourage all users of AUR packages to review &lt;em&gt;all&lt;/em&gt; PKGBUILD and install script changes when updating, especially during this time.
+If you notice suspicious commits to a package that you use, please reach out to Arch staff via the aur-general mailing list with more information.&lt;/p&gt;</description><dc:creator xmlns:dc="http://purl.org/dc/elements/1.1/">Campbell Jones</dc:creator><pubDate>Fri, 12 Jun 2026 18:41:28 +0000</pubDate><guid isPermaLink="false">tag:archlinux.org,2026-06-12:/news/active-aur-malicious-packages-incident/</guid></item></channel></rss>

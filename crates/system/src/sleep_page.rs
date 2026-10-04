@@ -358,7 +358,7 @@ fn fill_wakes(p: &Rc<Page>, logs: &[WakeLog]) {
         };
         let r = row(&title, &subtitle);
         let icon = if log.problems.is_empty() {
-            "emblem-ok-symbolic"
+            "object-select-symbolic"
         } else {
             "dialog-warning-symbolic"
         };
@@ -557,7 +557,7 @@ fn nvidia_group(n: &NvidiaInfo, mem_sleep: Option<&str>) -> adw::PreferencesGrou
     for (level, text) in n.interpret(mem_sleep) {
         let r = row(&text, "");
         r.add_prefix(&gtk::Image::from_icon_name(match level {
-            Level::Ok => "emblem-ok-symbolic",
+            Level::Ok => "object-select-symbolic",
             Level::Info => "dialog-information-symbolic",
             Level::Warning => "dialog-warning-symbolic",
         }));

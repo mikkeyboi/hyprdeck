@@ -223,8 +223,8 @@ mod tests {
 
     #[test]
     fn aur_helper_lines_skip_ignored_and_noise() {
-        let text = "example-app-bin 1.22.3-1 -> 1.23.0-1\n\
-                    example-nightly-bin 0.0.45_nightly.20260930.2510-1 -> 0.0.46_nightly.20261003.2632-1\n\
+        let text = "example-app-bin 3.4.1-1 -> 3.5.0-1\n\
+                    example-nightly-bin 0.3.1_nightly.20260101.100-1 -> 0.3.2_nightly.20260102.120-1\n\
                     linux-zen 7.2.8-1 -> 7.2.8-2 [ignored]\n\
                     :: Looking for devel upgrades...\n";
         let u = parse_updates(text);
@@ -232,7 +232,7 @@ mod tests {
             u.iter().map(|u| u.name.as_str()).collect::<Vec<_>>(),
             ["example-app-bin", "example-nightly-bin"]
         );
-        assert_eq!(u[1].new, "0.0.46_nightly.20261003.2632-1");
+        assert_eq!(u[1].new, "0.3.2_nightly.20260102.120-1");
     }
 
     #[test]

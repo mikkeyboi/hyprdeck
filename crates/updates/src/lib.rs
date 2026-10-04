@@ -1,18 +1,28 @@
 //! Updates: pending repo/AUR upgrades, upstream releases of detected desktop
 //! components (Hyprland, shells, bars, …) and hyprdeck's own version, with
-//! background checks and a tray entry.
+//! background checks, a tray entry and an in-app system update (review →
+//! one password prompt → progress → summary).
 
+mod apply;
 mod aur;
 mod check;
+mod dialog;
 mod github;
+mod helper;
+mod news;
 mod page;
 mod parse;
+mod pkgbuild;
+mod progress;
+mod review;
+mod scan;
 mod selfstate;
 mod selfupdate;
 mod state;
 mod vercmp;
 
 use std::fmt::Write as _;
+use std::io::Write as _;
 
 use anyhow::{Result, anyhow, bail};
 use hyprdeck_core::ui::PageInfo;
@@ -54,10 +64,181 @@ pub fn cli(args: &[String]) -> Option<Result<()>> {
                 .map_err(Into::into)
         }
         Some("self") => self_cli(&args[2..]),
+        Some("apply") => apply_cli(&args[2..]),
+        Some("root-helper") => helper::main(&args[2..]),
         _ => Err(anyhow!(
-            "usage: hyprdeck updates <check|json|self [check|install] [--channel stable|nightly]>"
+            "usage: hyprdeck updates <check|json|apply [--yes] [--skip-aur]|self [check|install] [--channel stable|nightly]>"
         )),
     })
+}
+
+const APPLY_USAGE: &str = "usage: hyprdeck updates apply [--yes] [--skip-aur]";
+
+/// Ask on the terminal; anything but y/yes (including EOF) is "no".
+fn ask(prompt: &str) -> bool {
+    print!("{prompt} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// `hyprdeck updates apply`: the review as text, confirmation, then the same
+/// engine as the app with textual progress.
+fn apply_cli(args: &[String]) -> Result<()> {
+    let (mut yes, mut skip_aur) = (false, false);
+    for a in args {
+        match a.as_str() {
+            "--yes" | "-y" => yes = true,
+            "--skip-aur" => skip_aur = true,
+            _ => bail!(APPLY_USAGE),
+        }
+    }
+    let _lock = apply::lock()?;
+    println!("Preparing the review (checking updates, news and AUR repositories)…");
+    let review = review::prepare(skip_aur);
+    println!();
+    print!("{}", review::render(&review, true));
+    if review.repo_error.is_some() && review.repo.is_empty() && review.aur.is_empty() {
+        bail!("could not determine pending updates");
+    }
+    if !review.has_updates() {
+        println!("\nNothing to update.");
+        return Ok(());
+    }
+    let mut approved = review.default_approved();
+    println!();
+    for a in review.aur.iter().filter(|a| a.approvable()) {
+        let Some(risk) = a.risk().filter(|r| *r >= scan::Severity::Warning) else {
+            continue;
+        };
+        if yes {
+            println!(
+                "Skipping AUR {} ({} findings; --yes only installs packages without warnings)",
+                a.pkgbase,
+                risk.label()
+            );
+            continue;
+        }
+        let include = ask(&format!(
+            "Build AUR {} despite {} findings?",
+            a.pkgbase,
+            risk.label()
+        )) && (risk < scan::Severity::Critical
+            || ask(&format!(
+                "Critical findings can mean {} is malicious. Really build and install it?",
+                a.pkgbase
+            )));
+        if include {
+            approved.insert(a.pkgbase.clone());
+        }
+    }
+    let plan = review.plan(&approved);
+    for (name, reason) in &plan.skipped {
+        println!("Skipping AUR {name}: {reason}");
+    }
+    if !yes {
+        if !review.unread_news().is_empty() && !ask("Have you read the news above?") {
+            bail!("cancelled: read the news first");
+        }
+        let what = format!(
+            "{} repository and {} AUR package update(s)",
+            review.repo.len(),
+            plan.aur.len()
+        );
+        if !ask(&format!(
+            "Proceed with {what}? pacman asks for your password via polkit."
+        )) {
+            bail!("cancelled");
+        }
+    }
+    let mut steps: Vec<apply::Step> = Vec::new();
+    let summary = apply::run(
+        &plan,
+        &apply::RealSystem,
+        &std::sync::atomic::AtomicBool::new(false),
+        &mut |event| match event {
+            apply::Event::Steps(s) => steps = s,
+            apply::Event::Step {
+                index,
+                state,
+                detail,
+            } => {
+                let Some(step) = steps.get(index) else { return };
+                let mark = match state {
+                    apply::StepState::Running => "…",
+                    apply::StepState::Done => "✓",
+                    apply::StepState::Failed => "✗",
+                    apply::StepState::Skipped => "-",
+                    apply::StepState::Pending => return,
+                };
+                match detail.filter(|d| !d.is_empty() && state != apply::StepState::Running) {
+                    Some(d) => println!("==> [{mark}] {}: {d}", step.title),
+                    None if state == apply::StepState::Running && step.state == state => {}
+                    None => println!("==> [{mark}] {}", step.title),
+                }
+                steps[index].state = state;
+            }
+            apply::Event::Phase(p) if p.starts_with("Waiting") => println!("==> {p}"),
+            apply::Event::Log(l) => println!("{l}"),
+            _ => {}
+        },
+    );
+    apply::record(&summary, check::now());
+    print!("\n{}", render_summary(&summary));
+    match summary.outcome {
+        apply::Outcome::Success | apply::Outcome::Partial => Ok(()),
+        apply::Outcome::Cancelled => bail!("cancelled"),
+        apply::Outcome::Failed => bail!("system update failed"),
+    }
+}
+
+fn render_summary(s: &apply::Summary) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", s.headline);
+    if let Some(m) = &s.message {
+        let _ = writeln!(out, "  {m}");
+    }
+    let changed: Vec<&str> = s
+        .changes
+        .iter()
+        .filter(|(op, _)| *op != progress::Op::Remove)
+        .map(|(_, n)| n.as_str())
+        .collect();
+    if !changed.is_empty() {
+        let _ = writeln!(out, "Updated ({}): {}", changed.len(), changed.join(", "));
+    }
+    for (name, reason) in &s.failed {
+        let _ = writeln!(out, "Failed: {name}: {reason}");
+    }
+    for (name, reason) in &s.skipped {
+        let _ = writeln!(out, "Skipped: {name}: {reason}");
+    }
+    if !s.restart.is_empty() {
+        let _ = writeln!(
+            out,
+            "Restart recommended (updated: {})",
+            s.restart.join(", ")
+        );
+    }
+    if !s.pacnew.is_empty() {
+        let _ = writeln!(out, "Configuration files to merge (pacdiff):");
+        for p in &s.pacnew {
+            let new = if s.new_pacnew.contains(p) {
+                " (new)"
+            } else {
+                ""
+            };
+            let _ = writeln!(out, "  {p}{new}");
+        }
+    }
+    if let Some(cmd) = &s.fallback {
+        let _ = writeln!(out, "Run it in a terminal instead: {cmd}");
+    }
+    if let Some(p) = &s.log_path {
+        let _ = writeln!(out, "Log: {}", p.display());
+    }
+    out
 }
 
 /// Exit status of `hyprdeck updates self check` when an update is available.
@@ -299,18 +480,23 @@ fn render_text(report: &check::Report, now: i64) -> String {
             &report.repo,
             &report.repo_error,
         );
-        match &tooling.aur_helper {
-            Some(helper) => section(
-                &mut out,
-                &format!("AUR updates ({helper})"),
-                &report.aur,
-                &report.aur_error,
-            ),
-            None => out.push_str("AUR updates: not checked (no AUR helper; install paru or yay)\n"),
-        }
+        section(&mut out, "AUR updates", &report.aur, &report.aur_error);
         if report.important().next().is_some() {
             out.push_str("  (* = important package)\n");
         }
+        if !report.not_in_aur.is_empty() {
+            let names: Vec<String> = report
+                .not_in_aur
+                .iter()
+                .map(|f| format!("{} {}", f.name, f.version))
+                .collect();
+            let _ = writeln!(
+                out,
+                "Not from the AUR (foreign, never updated): {}",
+                names.join(", ")
+            );
+        }
+        let _ = writeln!(out, "Note: {}", aur::VCS_NOTE);
     } else {
         out.push_str("System packages: not checked (needs an Arch-based distro with pacman)\n");
     }
@@ -362,7 +548,7 @@ fn render_text(report: &check::Report, now: i64) -> String {
 }
 
 /// `YYYY-MM-DD` (UTC) for Unix seconds.
-fn utc_date(secs: i64) -> String {
+pub(crate) fn utc_date(secs: i64) -> String {
     let z = secs.div_euclid(86_400) + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;

@@ -104,7 +104,14 @@ fn publish(report: Report, allow_notify: bool) {
     let previous = STATE.borrow().report.as_ref().map(|r| r.total());
     let total = report.total();
     if allow_notify && settings().notify && !report.failed() && total > previous.unwrap_or(0) {
-        notify::notify_bg(notification_summary(total), notification_body(&report));
+        let (summary, body) = (notification_summary(total), notification_body(&report));
+        rt::spawn(async move {
+            match notify::notify_action(&summary, &body, "Review & update").await {
+                Ok(true) => request_review(),
+                Ok(false) => {}
+                Err(e) => tracing::warn!("update notification failed: {e:#}"),
+            }
+        });
     }
     STATE.send_modify(|s| {
         s.report = Some(Arc::new(report));
@@ -156,6 +163,11 @@ async fn scheduler() {
         if state.checking {
             continue;
         }
+        // An in-app update re-checks by itself when it finishes.
+        if crate::apply::active() {
+            db_stamp = pacman_db_stamp();
+            continue;
+        }
         let stamp = pacman_db_stamp();
         if stamp != db_stamp && !std::path::Path::new(PACMAN_LOCK).exists() {
             db_stamp = stamp;
@@ -187,6 +199,7 @@ impl TrayProvider for UpdatesTray {
     fn items(&self) -> Vec<TrayItem> {
         let state = STATE.borrow();
         let label = match (&state.report, state.checking) {
+            _ if crate::apply::active() => crate::apply::tray_label().unwrap_or_default(),
             (Some(r), _) if r.total() > 0 => format!("Updates: {} available", r.total()),
             (Some(r), _) if r.failed() => "Updates: check failed".into(),
             (Some(r), _) if !r.tooling.pacman => "Updates: upstream releases".into(),
@@ -194,7 +207,13 @@ impl TrayProvider for UpdatesTray {
             (None, true) => "Updates: checking…".into(),
             (None, false) => "Updates: not checked yet".into(),
         };
-        let mut items = vec![TrayItem::action(label, "updates.show")];
+        let pending = state.report.as_ref().is_some_and(|r| r.total() > 0);
+        let id = if pending || crate::apply::active() {
+            TRAY_REVIEW
+        } else {
+            "updates.show"
+        };
+        let mut items = vec![TrayItem::action(label, id)];
         items.extend(selfstate::tray_item());
         items
     }
@@ -202,11 +221,34 @@ impl TrayProvider for UpdatesTray {
     fn activate(&self, id: &str) {
         match id {
             "updates.show" => events::send(AppEvent::ShowPage("updates".into())),
+            TRAY_REVIEW => request_review(),
             selfstate::TRAY_INSTALL => selfstate::update(Origin::Tray),
             selfstate::TRAY_RESTART => selfstate::restart_now(),
             _ => {}
         }
     }
+}
+
+/// Tray entry that opens the update review (or the running update).
+const TRAY_REVIEW: &str = "updates.review";
+
+/// `true` while a request to open the update dialog is pending.
+static REVIEW: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::Sender::new(false));
+
+/// Show the updates page and open the update dialog (from the tray or a
+/// notification). Callable from any thread.
+pub fn request_review() {
+    REVIEW.send_replace(true);
+    events::send(AppEvent::ShowPage("updates".into()));
+}
+
+pub fn review_requests() -> watch::Receiver<bool> {
+    REVIEW.subscribe()
+}
+
+/// Consume a pending review request.
+pub fn take_review_request() -> bool {
+    REVIEW.send_if_modified(|pending| std::mem::replace(pending, false))
 }
 
 pub fn start() {

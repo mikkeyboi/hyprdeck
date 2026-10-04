@@ -18,7 +18,8 @@ USAGE:
       audio     enable | off | toggle | status | list-devices | list-streams | route … | unroute …
       bluetooth list | connect <addr|name> | disconnect <addr|name>
       defaults  list | set <category> <app.desktop>
-      updates   check | json
+      updates   check | json | apply [--yes] [--skip-aur]
+                self [check | install [--channel stable|nightly]]
       system    diagnose | resume-log
       tweaks    gamemode on|off|toggle
 
@@ -27,7 +28,9 @@ Pages: startup, display, input, keybinds, audio, bluetooth, defaults, updates, s
 type Cli = fn(&[String]) -> Option<anyhow::Result<()>>;
 
 fn main() -> ExitCode {
+    // Logs go to stderr: stdout carries command output and the update helper's protocol.
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("HYPRDECK_LOG")
                 .unwrap_or_else(|_| "info".into()),
