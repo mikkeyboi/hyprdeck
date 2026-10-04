@@ -43,7 +43,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if matches!(args.first().map(String::as_str), Some("-V" | "--version")) {
-        println!("hyprdeck {}", env!("CARGO_PKG_VERSION"));
+        println!("hyprdeck {}", hyprdeck_core::version_string());
         return ExitCode::SUCCESS;
     }
     let clis: [Cli; 8] = [

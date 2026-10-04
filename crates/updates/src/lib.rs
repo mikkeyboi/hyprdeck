@@ -7,14 +7,16 @@ mod check;
 mod github;
 mod page;
 mod parse;
+mod selfstate;
 mod selfupdate;
 mod state;
 mod vercmp;
 
 use std::fmt::Write as _;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use hyprdeck_core::ui::PageInfo;
+use selfupdate::{Channel, Mode, SelfCheck};
 
 pub fn pages() -> Vec<PageInfo> {
     vec![PageInfo {
@@ -51,8 +53,213 @@ pub fn cli(args: &[String]) -> Option<Result<()>> {
                 .map(|s| println!("{s}"))
                 .map_err(Into::into)
         }
-        _ => Err(anyhow!("usage: hyprdeck updates <check|json>")),
+        Some("self") => self_cli(&args[2..]),
+        _ => Err(anyhow!(
+            "usage: hyprdeck updates <check|json|self [check|install] [--channel stable|nightly]>"
+        )),
     })
+}
+
+/// Exit status of `hyprdeck updates self check` when an update is available.
+const EXIT_UPDATE_AVAILABLE: i32 = 10;
+const SELF_USAGE: &str = "usage: hyprdeck updates self [check|install] [--channel stable|nightly]";
+
+fn self_cli(args: &[String]) -> Result<()> {
+    let settings = state::settings();
+    let mode = selfupdate::mode();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (command, channel) = match args[..] {
+        [] => (None, None),
+        ["--channel", c] => (None, Some(c)),
+        [cmd] => (Some(cmd), None),
+        [cmd, "--channel", c] => (Some(cmd), Some(c)),
+        _ => bail!(SELF_USAGE),
+    };
+    let channel_given = channel.is_some();
+    let channel = match channel {
+        Some(c) => Channel::parse(c).ok_or_else(|| anyhow!("unknown channel {c:?}"))?,
+        None => settings.self_update_channel,
+    };
+    match command {
+        None | Some("check") => {
+            let force = command.is_some();
+            let now = check::now();
+            let result = SelfCheck::run(&mode, channel, now, force);
+            print!(
+                "{}",
+                render_self(&mode, settings.self_update_policy, &result, now)
+            );
+            let check = result?;
+            if force && check.offer().is_some() {
+                use std::io::Write as _;
+                std::io::stdout().flush()?;
+                std::process::exit(EXIT_UPDATE_AVAILABLE);
+            }
+            Ok(())
+        }
+        Some("install") => self_install(&mode, channel, channel_given),
+        _ => bail!(SELF_USAGE),
+    }
+}
+
+struct CliProgress;
+
+impl selfupdate::Progress for CliProgress {
+    fn step(&self, msg: &str) {
+        println!("{msg}");
+    }
+
+    fn log(&self, text: &str) {
+        print!("{text}");
+    }
+}
+
+fn self_install(mode: &Mode, channel: Channel, channel_given: bool) -> Result<()> {
+    let _lock = selfupdate::lock()?;
+    let applied = match mode {
+        Mode::AppImage(path) => {
+            println!("Checking the {} channel…", channel.as_str());
+            let c = selfupdate::check_appimage(path, channel, check::now(), true)?;
+            let Some(label) = c.target_label() else {
+                bail!(
+                    "{}",
+                    match channel {
+                        Channel::Stable => "no releases published yet",
+                        Channel::Nightly => "no nightly build published yet",
+                    }
+                );
+            };
+            if !c.available {
+                println!(
+                    "Hyprdeck {} is up to date (latest on {}: {label})",
+                    hyprdeck_core::version_string(),
+                    channel.as_str()
+                );
+                return Ok(());
+            }
+            selfupdate::apply_appimage(&c, false, &CliProgress)?
+        }
+        Mode::Source(dir) => {
+            if channel_given {
+                println!(
+                    "Note: source installs follow their branch's upstream; --channel is ignored"
+                );
+            }
+            let c = selfupdate::check_source(dir, true, hyprdeck_core::BUILD_COMMIT)?;
+            if !c.plan.available() && c.plan.blocker.is_none() {
+                println!("Hyprdeck {} is up to date", hyprdeck_core::version_string());
+                return Ok(());
+            }
+            selfupdate::apply_source(dir, &CliProgress)?
+        }
+        Mode::Installed => bail!(
+            "this installation can't update itself; get new versions from {}",
+            selfupdate::RELEASES_URL
+        ),
+    };
+    println!("{}", applied.message);
+    if applied.restart.service {
+        match selfupdate::restart_service()? {
+            Some(_) => println!("Restarted hyprdeck.service"),
+            None => println!("Start hyprdeck again to use the new version"),
+        }
+    } else {
+        println!("install.sh restarted hyprdeck.service if it was running");
+    }
+    Ok(())
+}
+
+fn render_self(
+    mode: &Mode,
+    policy: selfupdate::Policy,
+    result: &Result<SelfCheck>,
+    now: i64,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Hyprdeck {}", hyprdeck_core::version_string());
+    let _ = writeln!(out, "Install:   {}", mode.describe());
+    let _ = writeln!(out, "Policy:    {}", policy.label());
+    let check = match result {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(out, "Status:    check failed: {e:#}");
+            return out;
+        }
+    };
+    let offer = check.offer();
+    match check {
+        SelfCheck::Installed => {
+            let _ = writeln!(
+                out,
+                "Status:    can't update itself; releases: {}",
+                selfupdate::RELEASES_URL
+            );
+        }
+        SelfCheck::AppImage(c) => {
+            let _ = writeln!(out, "Channel:   {}", c.channel.as_str());
+            let status = match (&c.release, &offer) {
+                (None, _) if c.channel == Channel::Nightly => {
+                    "no nightly build published yet".to_owned()
+                }
+                (None, _) => "no releases published yet".to_owned(),
+                (Some(_), Some(o)) => o.title.clone(),
+                (Some(r), None) => format!(
+                    "up to date (latest: {})",
+                    c.target_label().unwrap_or_else(|| r.tag.clone())
+                ),
+            };
+            let _ = writeln!(
+                out,
+                "Status:    {status} · checked {}",
+                ago(now - c.fetched_at)
+            );
+            if let Some(w) = &c.warning {
+                let _ = writeln!(out, "Warning:   {w}");
+            }
+            if let (Some(o), Some(r)) = (&offer, &c.release) {
+                let _ = writeln!(out, "           {}  {}", o.detail, r.url);
+            }
+        }
+        SelfCheck::Source(c) => {
+            if let Some(g) = &c.git {
+                let _ = writeln!(
+                    out,
+                    "Branch:    {} → {}",
+                    g.branch.as_deref().unwrap_or("(detached)"),
+                    g.upstream.as_deref().unwrap_or("(no upstream)")
+                );
+            }
+            if let Some(h) = &c.head {
+                let _ = writeln!(
+                    out,
+                    "Checkout:  {} {}",
+                    selfupdate::short(&h.hash),
+                    h.subject
+                );
+            }
+            let status = match &offer {
+                Some(o) => o.title.clone(),
+                None if c.plan.blocker.is_some() => "can't follow upstream".into(),
+                None => "up to date".into(),
+            };
+            let _ = writeln!(out, "Status:    {status}");
+            if let Some(b) = &c.plan.blocker {
+                let _ = writeln!(out, "Blocked:   {}", b.message());
+            }
+            if let Some(e) = &c.fetch_error {
+                let _ = writeln!(out, "Warning:   {e}");
+            }
+            for commit in &c.incoming {
+                let _ = writeln!(
+                    out,
+                    "  {} {}",
+                    selfupdate::short(&commit.hash),
+                    commit.subject
+                );
+            }
+        }
+    }
+    out
 }
 
 fn save(report: &check::Report) {

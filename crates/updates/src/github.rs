@@ -1,10 +1,11 @@
-//! Latest GitHub release lookup (unauthenticated REST API) with an on-disk cache
-//! in the state dir so the 60 requests/hour anonymous limit is never a problem.
+//! GitHub release lookups (unauthenticated REST API) with an on-disk cache in
+//! the state dir so the 60 requests/hour anonymous limit is never a problem.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use hyprdeck_core::{cmd, store};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::parse;
@@ -41,11 +42,20 @@ impl Release {
     }
 }
 
+/// A release published under a fixed tag plus the commit the tag points to
+/// (e.g. a rolling `nightly` prerelease).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaggedRelease {
+    pub release: Release,
+    /// Full commit hash.
+    pub commit: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CacheEntry {
+struct CacheEntry<T> {
     fetched_at: i64,
-    /// `None`: the repository has no published releases (HTTP 404).
-    release: Option<Release>,
+    /// `None` inside `T`: the release does not exist (HTTP 404).
+    release: T,
 }
 
 #[derive(Deserialize)]
@@ -68,36 +78,85 @@ struct ApiAsset {
 }
 
 #[derive(Deserialize)]
+struct ApiCommit {
+    sha: String,
+}
+
+#[derive(Deserialize)]
 struct ApiError {
     message: String,
 }
 
-/// Result of a lookup: the release (`None` when the repository has none) plus a
+/// Result of a lookup: the release (`None` when it does not exist) plus a
 /// warning when only stale cached data could be returned because the network
 /// request failed.
-pub struct Lookup {
-    pub release: Option<Release>,
+pub struct Lookup<T = Option<Release>> {
+    pub release: T,
     pub fetched_at: i64,
     pub warning: Option<String>,
 }
 
-fn cache_path(repo: &str) -> PathBuf {
+fn cache_path(key: &str) -> PathBuf {
     store::state_dir()
         .join("github")
-        .join(format!("{}.json", repo.replace('/', "_")))
-}
-
-fn read_cache(repo: &str) -> Option<CacheEntry> {
-    let text = std::fs::read_to_string(cache_path(repo)).ok()?;
-    serde_json::from_str(&text).ok()
+        .join(format!("{}.json", key.replace('/', "_")))
 }
 
 /// Latest release of `owner/repo`, served from cache when younger than one hour.
 /// Blocking (spawns curl).
 pub fn latest_release(repo: &str, now: i64) -> Result<Lookup> {
-    let cached = read_cache(repo);
+    latest_release_within(repo, now, CACHE_TTL_SECS)
+}
+
+/// Like [`latest_release`] with a custom cache age (`0` forces a request).
+pub fn latest_release_within(repo: &str, now: i64, max_age: i64) -> Result<Lookup> {
+    cached(&cache_path(repo), now, max_age, || {
+        api_get(&format!("repos/{repo}/releases/latest"), now)?
+            .map(|body| parse_release(&body))
+            .transpose()
+    })
+}
+
+/// The release published under `tag` and the commit the tag points to;
+/// `None` when no such release exists. Cached for `max_age` seconds.
+pub fn tagged_release(
+    repo: &str,
+    tag: &str,
+    now: i64,
+    max_age: i64,
+) -> Result<Lookup<Option<TaggedRelease>>> {
+    cached(&cache_path(&format!("{repo}@{tag}")), now, max_age, || {
+        let Some(body) = api_get(&format!("repos/{repo}/releases/tags/{tag}"), now)? else {
+            return Ok(None);
+        };
+        let release = parse_release(&body)?;
+        let commit = api_get(&format!("repos/{repo}/commits/{tag}"), now)?
+            .ok_or_else(|| anyhow!("release {tag} exists but its tag has no commit"))?;
+        let commit: ApiCommit =
+            serde_json::from_str(&commit).context("unexpected GitHub commit JSON")?;
+        Ok(Some(TaggedRelease {
+            release,
+            commit: commit.sha,
+        }))
+    })
+}
+
+/// Serve `path` when younger than `max_age`, otherwise `fetch` and cache the
+/// result; on fetch failure fall back to any stale cache with a warning.
+fn cached<T>(
+    path: &Path,
+    now: i64,
+    max_age: i64,
+    fetch: impl FnOnce() -> Result<T>,
+) -> Result<Lookup<T>>
+where
+    T: Clone + Serialize + DeserializeOwned,
+{
+    let cached: Option<CacheEntry<T>> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
     if let Some(c) = &cached
-        && now - c.fetched_at < CACHE_TTL_SECS
+        && now - c.fetched_at < max_age
         && now >= c.fetched_at
     {
         return Ok(Lookup {
@@ -106,15 +165,15 @@ pub fn latest_release(repo: &str, now: i64) -> Result<Lookup> {
             warning: None,
         });
     }
-    match fetch(repo, now) {
+    match fetch() {
         Ok(release) => {
             let entry = CacheEntry {
                 fetched_at: now,
                 release,
             };
             let json = serde_json::to_vec_pretty(&entry).context("serializing cache")?;
-            if let Err(e) = store::write_atomic(&cache_path(repo), &json) {
-                tracing::warn!("caching GitHub release for {repo}: {e:#}");
+            if let Err(e) = store::write_atomic(path, &json) {
+                tracing::warn!("caching GitHub lookup {}: {e:#}", path.display());
             }
             Ok(Lookup {
                 release: entry.release,
@@ -136,9 +195,10 @@ pub fn latest_release(repo: &str, now: i64) -> Result<Lookup> {
     }
 }
 
-/// `Ok(None)` when GitHub answers 404 (no releases, or no such repository).
-fn fetch(repo: &str, now: i64) -> Result<Option<Release>> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+/// GET `https://api.github.com/<path>`; `Ok(None)` when GitHub answers 404 or
+/// 422 (no such release/repository/commit).
+fn api_get(path: &str, now: i64) -> Result<Option<String>> {
+    let url = format!("https://api.github.com/{path}");
     let out = cmd::output(
         "curl",
         [
@@ -161,20 +221,20 @@ fn fetch(repo: &str, now: i64) -> Result<Option<Release>> {
     let resp = parse::parse_http_response(&out.stdout)
         .ok_or_else(|| anyhow!("malformed HTTP response from GitHub"))?;
     match resp.status {
-        200 => {}
+        200 => Ok(Some(resp.body.to_owned())),
         403 | 429 if resp.header("x-ratelimit-remaining") == Some("0") || resp.status == 429 => {
             let reset = resp
                 .header("x-ratelimit-reset")
                 .and_then(|v| v.parse::<i64>().ok());
-            return Err(match reset {
+            Err(match reset {
                 Some(t) if t > now => anyhow!(
                     "GitHub API rate limit reached; resets in {}",
                     crate::duration(t - now)
                 ),
                 _ => anyhow!("GitHub API rate limit reached"),
-            });
+            })
         }
-        404 => return Ok(None),
+        404 | 422 => Ok(None),
         status => {
             let msg = serde_json::from_str::<ApiError>(resp.body)
                 .map(|e| e.message)
@@ -182,9 +242,11 @@ fn fetch(repo: &str, now: i64) -> Result<Option<Release>> {
             bail!("GitHub returned HTTP {status} {msg}");
         }
     }
-    let api: ApiRelease =
-        serde_json::from_str(resp.body).context("unexpected GitHub release JSON")?;
-    Ok(Some(Release {
+}
+
+fn parse_release(body: &str) -> Result<Release> {
+    let api: ApiRelease = serde_json::from_str(body).context("unexpected GitHub release JSON")?;
+    Ok(Release {
         name: api
             .name
             .filter(|n| !n.trim().is_empty())
@@ -206,5 +268,5 @@ fn fetch(repo: &str, now: i64) -> Result<Option<Release>> {
                 size: a.size,
             })
             .collect(),
-    }))
+    })
 }

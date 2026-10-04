@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use hyprdeck_core::events::{self, AppEvent};
 use hyprdeck_core::tray::{self, TrayItem, TrayProvider};
 
-use crate::engine::{self, Status};
+use crate::engine::{self, OutputChoice, Status, simultaneous_label};
 use crate::{PAGE_ID, daemon, ui};
 
 const PRESETS: [u32; 5] = [0, 25, 50, 75, 100];
@@ -81,14 +81,17 @@ fn menu(st: &Status) -> Vec<TrayItem> {
         items: group,
     });
 
+    let current = st.current_choice();
     let defaults = st
-        .sinks
-        .iter()
-        .filter(|s| !s.is_virtual() || (s.is_primary() && st.active))
-        .map(|s| TrayItem::Radio {
-            label: s.label.clone(),
-            id: format!("default:{}", s.name),
-            selected: s.is_default,
+        .output_choices()
+        .into_iter()
+        .map(|c| TrayItem::Radio {
+            label: match &c {
+                OutputChoice::Device(name) => st.label(name).to_owned(),
+                OutputChoice::Simultaneous => simultaneous_label(st.live_selected().len()),
+            },
+            id: format!("default:{}", c.token()),
+            selected: current.as_ref() == Some(&c),
         })
         .collect();
     items.push(TrayItem::Submenu {
@@ -215,7 +218,7 @@ impl TrayProvider for AudioTray {
         match verb {
             "toggle" => daemon::tray_action(engine::toggle()),
             "member" => daemon::tray_action(async move { engine::toggle_member(&arg).await }),
-            "default" => daemon::tray_action(async move { engine::set_default(&arg).await }),
+            "default" => daemon::tray_action(OutputChoice::parse(&arg).apply()),
             "volall" => daemon::tray_action(async move {
                 engine::apply_to_all(arg.parse().unwrap_or(0.0)).await
             }),

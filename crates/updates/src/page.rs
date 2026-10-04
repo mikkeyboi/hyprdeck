@@ -1,7 +1,6 @@
 //! The "Updates" page.
 
-use std::cell::RefCell;
-use std::path::PathBuf;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Once;
 
@@ -10,13 +9,16 @@ use gtk::{gio, glib};
 use hyprdeck_core::{cmd, rt, ui, ui::Ctx};
 
 use crate::check::{self, PROJECTS, StatusKind, Tooling, Tracked};
-use crate::github::{Lookup, Release};
+use crate::github::Release;
 use crate::parse::{CrateUpdate, Update};
-use crate::selfupdate::{self, Mode, SourceInfo};
+use crate::selfstate::{self, Checked, Job, Origin, SelfState};
+use crate::selfupdate::{self, Blocker, Channel, Mode, Policy, SelfCheck, SourceCheck};
 use crate::state::{self, State};
 
 /// The page re-checks on show when the last check is older than this.
 const STALE_ON_SHOW: i64 = 15 * 60;
+/// Same for hyprdeck's own update check (a source check runs `git fetch`).
+const SELF_STALE_ON_SHOW: i64 = 5 * 60;
 
 const CSS: &str = "
 .hd-badge { font-size: smaller; font-weight: bold; padding: 1px 8px; border-radius: 999px;
@@ -41,51 +43,41 @@ fn load_css() {
     });
 }
 
-/// What the hyprdeck section shows, by install mode.
-enum SelfView {
-    Loading,
-    Source {
-        info: Result<SourceInfo, String>,
-        /// Latest crate-update lookup (`None` while running).
-        crates: Option<Result<Vec<CrateUpdate>, String>>,
-    },
-    AppImage {
-        path: PathBuf,
-        /// Latest-release lookup (`None` while running).
-        latest: Option<Result<Lookup, String>>,
-    },
-    Installed,
-}
-
-/// AppImage self-update progress; survives re-renders and page re-shows.
-enum Download {
-    Idle,
-    Running(String),
-    Done { tag: String, verified: bool },
-    Failed(String),
-}
-
 struct Page {
     ctx: Ctx,
     system: gtk::Box,
     tracked: gtk::Box,
     hyprdeck: gtk::Box,
-    me: RefCell<SelfView>,
-    download: RefCell<Download>,
+    /// "Restart to finish" after an installed update.
+    banner: adw::Banner,
+    /// Install mode, resolved when the page is first shown.
+    mode: RefCell<Option<Mode>>,
+    /// Source mode: latest crate-update lookup (`None` while running).
+    crates: RefCell<Option<Result<Vec<CrateUpdate>, String>>>,
+    /// Keeps the build log expander open across re-renders.
+    log_expanded: Cell<bool>,
 }
 
 pub fn build(ctx: &Ctx) -> gtk::Widget {
     load_css();
     let (scroller, content) = ui::page_scaffold();
     let section = || gtk::Box::new(gtk::Orientation::Vertical, 24);
+    let banner = adw::Banner::builder()
+        .use_markup(false)
+        .button_label("Restart now")
+        .build();
+    banner.connect_button_clicked(|_| selfstate::restart_now());
     let page = Rc::new(Page {
         ctx: ctx.clone(),
         system: section(),
         tracked: section(),
         hyprdeck: section(),
-        me: RefCell::new(SelfView::Loading),
-        download: RefCell::new(Download::Idle),
+        banner,
+        mode: RefCell::new(None),
+        crates: RefCell::new(None),
+        log_expanded: Cell::new(false),
     });
+    content.append(&page.banner);
     content.append(&page.system);
     content.append(&page.tracked);
     content.append(&page.hyprdeck);
@@ -101,6 +93,15 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
             let Some(page) = weak.upgrade() else { break };
             let st = rx.borrow_and_update().clone();
             page.render(&st);
+        }
+    });
+    let weak = Rc::downgrade(&page);
+    let mut rx = selfstate::subscribe();
+    glib::spawn_future_local(async move {
+        while rx.changed().await.is_ok() {
+            let Some(page) = weak.upgrade() else { break };
+            let st = rx.borrow_and_update().clone();
+            page.render_hyprdeck(&st);
         }
     });
 
@@ -484,139 +485,429 @@ impl Page {
         btn
     }
 
-    /// Refresh the hyprdeck section for the current install mode.
+    /// Resolve the install mode, refresh the self-update check when stale and
+    /// (source mode) look up crate updates.
     fn load_hyprdeck(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            match rt::blocking(selfupdate::mode).await {
-                Mode::Source(dir) => {
-                    let info = rt::blocking(move || {
-                        selfupdate::source_info(&dir).map_err(|e| format!("{e:#}"))
-                    })
-                    .await;
-                    let dir = info.as_ref().ok().map(|i| i.dir.clone());
-                    {
-                        let Some(page) = weak.upgrade() else { return };
-                        *page.me.borrow_mut() = SelfView::Source { info, crates: None };
-                        page.render_hyprdeck();
-                    }
-                    let Some(dir) = dir else { return };
-                    let result = rt::blocking(move || {
-                        selfupdate::crate_updates(&dir).map_err(|e| format!("{e:#}"))
-                    })
-                    .await;
-                    let Some(page) = weak.upgrade() else { return };
-                    if let SelfView::Source { crates, .. } = &mut *page.me.borrow_mut() {
-                        *crates = Some(result);
-                    }
-                    page.render_hyprdeck();
-                }
-                Mode::AppImage(path) => {
-                    {
-                        let Some(page) = weak.upgrade() else { return };
-                        *page.me.borrow_mut() = SelfView::AppImage { path, latest: None };
-                        page.render_hyprdeck();
-                    }
-                    let lookup = rt::blocking(|| {
-                        selfupdate::latest(check::now()).map_err(|e| format!("{e:#}"))
-                    })
-                    .await;
-                    let Some(page) = weak.upgrade() else { return };
-                    if let SelfView::AppImage { latest, .. } = &mut *page.me.borrow_mut() {
-                        *latest = Some(lookup);
-                    }
-                    page.render_hyprdeck();
-                }
-                Mode::Installed => {
-                    let Some(page) = weak.upgrade() else { return };
-                    *page.me.borrow_mut() = SelfView::Installed;
-                    page.render_hyprdeck();
-                }
+            let mode = rt::blocking(selfupdate::mode).await;
+            let st = selfstate::current();
+            let stale = st
+                .last
+                .as_ref()
+                .is_none_or(|c| c.mode != mode || check::now() - c.at > SELF_STALE_ON_SHOW);
+            if stale && !st.job.is_running() {
+                selfstate::check(false, false);
             }
+            {
+                let Some(page) = weak.upgrade() else { return };
+                *page.mode.borrow_mut() = Some(mode.clone());
+                page.render_hyprdeck(&selfstate::current());
+            }
+            let Mode::Source(dir) = mode else { return };
+            let result =
+                rt::blocking(move || selfupdate::crate_updates(&dir).map_err(|e| format!("{e:#}")))
+                    .await;
+            let Some(page) = weak.upgrade() else { return };
+            *page.crates.borrow_mut() = Some(result);
+            page.render_hyprdeck(&selfstate::current());
         });
     }
 
-    fn render_hyprdeck(self: &Rc<Self>) {
+    fn render_hyprdeck(self: &Rc<Self>, st: &SelfState) {
+        match &st.job {
+            Job::RestartPending { label, .. } => {
+                self.banner.set_title(&format!(
+                    "Hyprdeck {label} is installed — restart to finish updating"
+                ));
+                self.banner.set_revealed(true);
+            }
+            _ => self.banner.set_revealed(false),
+        }
         ui::clear(&self.hyprdeck);
-        let group = adw::PreferencesGroup::builder().title("hyprdeck").build();
+        let Some(mode) = self.mode.borrow().clone() else {
+            return;
+        };
+        let group = adw::PreferencesGroup::builder().title("Hyprdeck").build();
+        group.set_description(Some(&glib::markup_escape_text(&mode.describe())));
         self.hyprdeck.append(&group);
-        match &*self.me.borrow() {
-            SelfView::Loading => {}
-            SelfView::Source { info, crates } => self.render_source(&group, info, crates.as_ref()),
-            SelfView::AppImage { path, latest } => {
-                self.render_appimage(&group, path, latest.as_ref())
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        header.append(&self_check_button(st));
+        if !matches!(mode, Mode::Source(_)) {
+            header.append(&self.link_button("Releases", selfupdate::RELEASES_URL));
+        }
+        group.set_header_suffix(Some(&header));
+        group.add(&value_row(
+            "Version",
+            "Running build",
+            &hyprdeck_core::version_string(),
+        ));
+
+        let checked = st.last.as_deref().filter(|c| c.mode == mode);
+        group.add(&self.self_status_row(checked, st));
+        self.add_job_rows(&group, &mode, st);
+
+        let check = checked.and_then(|c| c.result.as_ref().ok());
+        match check {
+            Some(SelfCheck::AppImage(c)) => {
+                if let Some(w) = &c.warning {
+                    let row = adw::ActionRow::builder().use_markup(false).build();
+                    row.set_title("GitHub lookup problem");
+                    row.set_subtitle(w);
+                    row.add_prefix(&icon("dialog-warning-symbolic", "warning"));
+                    group.add(&row);
+                }
+                if c.available
+                    && let Some(rel) = &c.release
+                {
+                    if selfupdate::select_assets(&rel.assets).is_none() {
+                        let b = Blocker::NoAsset {
+                            tag: rel.tag.clone(),
+                        };
+                        let row = adw::ActionRow::builder().use_markup(false).build();
+                        row.set_title(b.title());
+                        row.set_subtitle(&b.message());
+                        row.add_prefix(&icon("dialog-warning-symbolic", "warning"));
+                        row.add_suffix(&self.link_button("Release page", &rel.url));
+                        group.add(&row);
+                    }
+                    group.add(&notes_row(rel));
+                }
             }
-            SelfView::Installed => {
-                group.set_header_suffix(Some(
-                    &self.link_button("Releases", selfupdate::RELEASES_URL),
-                ));
-                group.add(&value_row(
-                    "Installed version",
-                    "Installed by a package or script; new versions are published on GitHub",
-                    selfupdate::VERSION,
-                ));
+            Some(SelfCheck::Source(c)) => self.add_source_rows(&group, c),
+            _ => {}
+        }
+        if !matches!(mode, Mode::Installed) {
+            group.add(&self.policy_row());
+        }
+        match &mode {
+            Mode::AppImage(_) => group.add(&self.channel_row()),
+            Mode::Source(dir) => {
+                let upstream = match check {
+                    Some(SelfCheck::Source(c)) => c.git.as_ref().and_then(|g| g.upstream.clone()),
+                    _ => None,
+                };
+                let row = value_row(
+                    "Update channel",
+                    &format!(
+                        "Source installs follow their branch's upstream ({}); the stable and nightly channels apply to AppImage installs",
+                        upstream.as_deref().unwrap_or("none set")
+                    ),
+                    "",
+                );
+                row.set_subtitle_lines(0);
+                group.add(&row);
+                self.add_source_extras(&group, dir, check);
             }
+            Mode::Installed => {}
         }
     }
 
-    fn render_source(
+    /// The headline: up to date, what is available, or why it can't update.
+    fn self_status_row(
         self: &Rc<Self>,
-        group: &adw::PreferencesGroup,
-        info: &Result<SourceInfo, String>,
-        crates: Option<&Result<Vec<CrateUpdate>, String>>,
-    ) {
-        let info = match info {
-            Ok(info) => info,
+        checked: Option<&Checked>,
+        st: &SelfState,
+    ) -> adw::ActionRow {
+        let row = adw::ActionRow::builder().use_markup(false).build();
+        row.set_subtitle_lines(0);
+        let Some(checked) = checked else {
+            row.set_title(if st.checking {
+                "Checking for updates…"
+            } else {
+                "Not checked yet"
+            });
+            if st.checking {
+                row.add_suffix(&adw::Spinner::new());
+            }
+            return row;
+        };
+        let now = check::now();
+        let checked_ago = format!("checked {}", crate::ago(now - checked.at));
+        let check = match &checked.result {
+            Ok(c) => c,
             Err(e) => {
-                let row = adw::ActionRow::builder().use_markup(false).build();
-                row.set_title("Source checkout not available");
+                row.set_title("Could not check for updates");
                 row.set_subtitle(e);
                 row.add_prefix(&icon("dialog-warning-symbolic", "warning"));
-                group.add(&row);
-                return;
+                return row;
             }
         };
-        group.set_description(Some(&glib::markup_escape_text(&format!(
-            "Built from source at {}",
-            info.dir.display()
-        ))));
-        group.add(&value_row("Version", "Running build", selfupdate::VERSION));
-
-        let now = check::now();
-        match &info.git {
-            Some(git) => {
-                group.add(&match &git.head {
-                    Some(h) => {
-                        let row = value_row(
-                            &h.subject,
-                            &format!(
-                                "{} · {} · committed {}",
-                                git.branch.as_deref().unwrap_or("detached"),
-                                h.hash,
-                                crate::ago(now - h.time)
-                            ),
-                            "",
-                        );
-                        row.set_title_lines(1);
-                        row.set_subtitle_selectable(true);
-                        row
+        if let Some(offer) = check.offer() {
+            row.set_title(&offer.title);
+            let mut sub = offer.detail.clone();
+            if let SelfCheck::AppImage(c) = check
+                && let Some(assets) = c
+                    .release
+                    .as_ref()
+                    .and_then(|r| selfupdate::select_assets(&r.assets))
+            {
+                sub.push_str(&format!(
+                    " · {:.1} MB{}",
+                    assets.appimage.size as f64 / 1e6,
+                    if assets.checksum.is_some() {
+                        " · SHA-256 checksum published"
+                    } else {
+                        ""
                     }
-                    None => value_row("No commits yet", "", ""),
-                });
-                group.add(&match git.dirty {
-                    0 => value_row("Working tree", "Clean — matches the last commit", ""),
-                    1 => value_row("Working tree", "1 uncommitted change", ""),
-                    n => value_row("Working tree", &format!("{n} uncommitted changes"), ""),
-                });
+                ));
             }
-            None => group.add(&value_row(
-                "Git",
-                "Not a git checkout (or git is not installed)",
+            row.set_subtitle(&format!("{sub} · {checked_ago}"));
+            row.add_prefix(&icon("software-update-available-symbolic", "accent"));
+            if offer.blocker.is_none() && !st.job.is_running() && !st.job.restart_pending() {
+                let btn = gtk::Button::builder()
+                    .label("Update now")
+                    .valign(gtk::Align::Center)
+                    .css_classes(["suggested-action", "pill"])
+                    .tooltip_text(match check {
+                        SelfCheck::Source(_) => {
+                            "Pulls the new commits and runs install.sh in the background; hyprdeck.service restarts when it finishes"
+                        }
+                        _ => "Downloads and installs the update; restarts once the window is closed",
+                    })
+                    .build();
+                btn.connect_clicked(|_| selfstate::update(Origin::Page));
+                row.add_suffix(&btn);
+            }
+            return row;
+        }
+        match check {
+            SelfCheck::Installed => {
+                row.set_title("Updates are not managed by Hyprdeck");
+                row.set_subtitle(
+                    "Get new versions from the releases page or the package/script you installed with",
+                );
+                row.add_prefix(&icon("dialog-information-symbolic", "dim-label"));
+            }
+            SelfCheck::AppImage(c) => match &c.release {
+                None => {
+                    row.set_title(match c.channel {
+                        Channel::Stable => "No releases published yet",
+                        Channel::Nightly => "No nightly build published yet",
+                    });
+                    row.set_subtitle(&format!(
+                        "github.com/{} has no {} to update to · {checked_ago}",
+                        selfupdate::REPO,
+                        match c.channel {
+                            Channel::Stable => "releases",
+                            Channel::Nightly => "nightly prerelease",
+                        }
+                    ));
+                    row.add_prefix(&icon("dialog-information-symbolic", "dim-label"));
+                }
+                Some(rel) => {
+                    row.set_title("Up to date");
+                    row.set_subtitle(&match &c.commit {
+                        Some(commit) => format!(
+                            "Latest nightly build is {} · {checked_ago}",
+                            selfupdate::short(commit)
+                        ),
+                        None => format!(
+                            "Latest release {} · {} · {checked_ago}",
+                            rel.tag,
+                            published(rel, now)
+                        ),
+                    });
+                    row.add_prefix(&icon("emblem-ok-symbolic", "success"));
+                }
+            },
+            SelfCheck::Source(c) => match &c.plan.blocker {
+                Some(b) => {
+                    row.set_title(b.title());
+                    row.set_subtitle(&b.message());
+                    row.add_prefix(&icon("dialog-information-symbolic", "warning"));
+                    row.add_suffix(&self.terminal_fallback(&c.dir, b));
+                }
+                None => {
+                    let upstream = c
+                        .git
+                        .as_ref()
+                        .and_then(|g| g.upstream.as_deref())
+                        .unwrap_or("upstream");
+                    row.set_title(&format!("Up to date with {upstream}"));
+                    row.set_subtitle(&format!("Fetched and compared · {checked_ago}"));
+                    row.add_prefix(&icon("emblem-ok-symbolic", "success"));
+                }
+            },
+        }
+        row
+    }
+
+    fn add_job_rows(self: &Rc<Self>, group: &adw::PreferencesGroup, mode: &Mode, st: &SelfState) {
+        let row = adw::ActionRow::builder().use_markup(false).build();
+        row.set_subtitle_lines(0);
+        match &st.job {
+            Job::Idle => return,
+            Job::Running(step) => {
+                row.set_title(step);
+                if matches!(mode, Mode::Source(_)) {
+                    row.set_subtitle(&format!(
+                        "Building in the background (unit hyprdeck-self-update); output goes to {}",
+                        selfupdate::log_path().display()
+                    ));
+                }
+                row.add_suffix(&adw::Spinner::new());
+            }
+            Job::RestartPending { label, .. } => {
+                row.set_title(&format!("Hyprdeck {label} is installed"));
+                row.set_subtitle(
+                    "Restart to finish updating. Hyprdeck restarts by itself once the window is closed.",
+                );
+                row.add_prefix(&icon("emblem-ok-symbolic", "success"));
+                let btn = gtk::Button::builder()
+                    .label("Restart now")
+                    .valign(gtk::Align::Center)
+                    .css_classes(["suggested-action"])
+                    .build();
+                btn.connect_clicked(|_| selfstate::restart_now());
+                row.add_suffix(&btn);
+            }
+            Job::Done(msg) => {
+                row.set_title(msg);
+                row.add_prefix(&icon("emblem-ok-symbolic", "success"));
+            }
+            Job::Failed(msg) => {
+                row.set_title("Update failed");
+                row.set_subtitle(msg);
+                row.add_prefix(&icon("dialog-warning-symbolic", "warning"));
+            }
+        }
+        group.add(&row);
+        if let Some(log) = st.log.as_deref().filter(|l| !l.trim().is_empty()) {
+            let exp = adw::ExpanderRow::builder().use_markup(false).build();
+            exp.set_title("Build log");
+            exp.set_subtitle(&selfupdate::log_path().display().to_string());
+            exp.add_row(
+                &gtk::Label::builder()
+                    .label(log.trim_end())
+                    .wrap(true)
+                    .wrap_mode(gtk::pango::WrapMode::WordChar)
+                    .xalign(0.0)
+                    .selectable(true)
+                    .css_classes(["monospace"])
+                    .margin_top(12)
+                    .margin_bottom(12)
+                    .margin_start(12)
+                    .margin_end(12)
+                    .build(),
+            );
+            exp.set_expanded(self.log_expanded.get());
+            let weak = Rc::downgrade(self);
+            exp.connect_expanded_notify(move |e| {
+                if let Some(page) = weak.upgrade() {
+                    page.log_expanded.set(e.is_expanded());
+                }
+            });
+            group.add(&exp);
+        }
+    }
+
+    /// Source check details: fetch problems, blocked updates, incoming commits.
+    fn add_source_rows(self: &Rc<Self>, group: &adw::PreferencesGroup, c: &SourceCheck) {
+        if let Some(e) = &c.fetch_error {
+            let row = adw::ActionRow::builder().use_markup(false).build();
+            row.set_title("git fetch failed");
+            row.set_subtitle(e);
+            row.add_prefix(&icon("dialog-warning-symbolic", "warning"));
+            group.add(&row);
+        }
+        // Without an update, the blocker is the status row itself.
+        if let Some(b) = c.plan.blocker.as_ref().filter(|_| c.plan.available()) {
+            let row = adw::ActionRow::builder().use_markup(false).build();
+            row.set_title(&format!("Can't update automatically: {}", b.title()));
+            row.set_subtitle(&b.message());
+            row.set_subtitle_lines(0);
+            row.add_prefix(&icon("dialog-warning-symbolic", "warning"));
+            row.add_suffix(&self.terminal_fallback(&c.dir, b));
+            group.add(&row);
+        }
+        if c.incoming.is_empty() {
+            return;
+        }
+        let now = check::now();
+        let exp = adw::ExpanderRow::builder().use_markup(false).build();
+        exp.set_title(&format!(
+            "Incoming commits ({}{})",
+            c.incoming.len(),
+            if c.plan.behind > c.incoming.len() {
+                format!(" of {}", c.plan.behind)
+            } else {
+                String::new()
+            }
+        ));
+        exp.set_subtitle("What updating pulls in, newest first");
+        for commit in &c.incoming {
+            let row = value_row(
+                &commit.subject,
+                &format!(
+                    "{} · {}",
+                    selfupdate::short(&commit.hash),
+                    crate::ago(now - commit.time)
+                ),
                 "",
-            )),
+            );
+            row.set_subtitle_selectable(true);
+            exp.add_row(&row);
+        }
+        group.add(&exp);
+    }
+
+    /// "Open terminal" for updates hyprdeck can't do by itself.
+    fn terminal_fallback(&self, dir: &std::path::Path, blocker: &Blocker) -> gtk::Button {
+        let d = cmd::shell_quote(&dir.to_string_lossy());
+        let command = match blocker {
+            Blocker::NoCargo | Blocker::NoInstallScript => format!("cd {d} && ./install.sh"),
+            _ => format!("cd {d} && git status --short --branch; exec \"${{SHELL:-bash}}\""),
+        };
+        let btn = gtk::Button::builder()
+            .label("Open terminal")
+            .valign(gtk::Align::Center)
+            .tooltip_text(command.as_str())
+            .build();
+        let ctx = self.ctx.clone();
+        btn.connect_clicked(move |_| {
+            if let Err(e) = cmd::spawn_in_terminal("Update Hyprdeck", &command) {
+                ctx.error("Could not open a terminal", &e);
+            }
+        });
+        btn
+    }
+
+    /// Checkout state, crate updates and the manual rebuild (source mode).
+    fn add_source_extras(
+        self: &Rc<Self>,
+        group: &adw::PreferencesGroup,
+        dir: &std::path::Path,
+        check: Option<&SelfCheck>,
+    ) {
+        let now = check::now();
+        if let Some(SelfCheck::Source(c)) = check
+            && let Some(git) = &c.git
+        {
+            if let Some(h) = &c.head {
+                let row = value_row(
+                    &h.subject,
+                    &format!(
+                        "{} · {} · committed {}",
+                        git.branch.as_deref().unwrap_or("detached"),
+                        selfupdate::short(&h.hash),
+                        crate::ago(now - h.time)
+                    ),
+                    "",
+                );
+                row.set_title_lines(1);
+                row.set_subtitle_selectable(true);
+                group.add(&row);
+            }
+            group.add(&match git.dirty() {
+                0 => value_row("Working tree", "Clean — matches the last commit", ""),
+                1 => value_row("Working tree", "1 uncommitted change", ""),
+                n => value_row("Working tree", &format!("{n} uncommitted changes"), ""),
+            });
         }
 
-        match crates {
+        match &*self.crates.borrow() {
             None => {
                 let row = adw::ActionRow::builder()
                     .title("Crate dependencies")
@@ -637,7 +928,7 @@ impl Page {
                     .subtitle(format!(
                         "{} compatible update{} available (cargo update)",
                         list.len(),
-                        if list.len() == 1 { "" } else { "s" }
+                        selfupdate::plural(list.len())
                     ))
                     .build();
                 for c in list {
@@ -647,22 +938,23 @@ impl Page {
             }
         }
 
+        let has_install_script = dir.join("install.sh").is_file();
         let rebuild = adw::ActionRow::builder()
             .title("Rebuild and reinstall")
-            .subtitle(if info.has_install_script {
+            .subtitle(if has_install_script {
                 "Runs ./install.sh in a terminal (release build, then installs hyprdeck)"
             } else {
-                "install.sh is not executable in the source checkout"
+                "install.sh is missing from the source checkout"
             })
             .build();
         let btn = gtk::Button::builder()
             .label("Rebuild…")
             .valign(gtk::Align::Center)
-            .sensitive(info.has_install_script)
+            .sensitive(has_install_script)
             .build();
         let cmdline = format!(
             "cd {} && ./install.sh",
-            cmd::shell_quote(&info.dir.to_string_lossy())
+            cmd::shell_quote(&dir.to_string_lossy())
         );
         let weak = Rc::downgrade(self);
         btn.connect_clicked(move |_| {
@@ -674,176 +966,110 @@ impl Page {
         group.add(&rebuild);
     }
 
-    fn render_appimage(
-        self: &Rc<Self>,
-        group: &adw::PreferencesGroup,
-        path: &std::path::Path,
-        latest: Option<&Result<Lookup, String>>,
-    ) {
-        group.set_description(Some(&glib::markup_escape_text(&format!(
-            "Running from AppImage {}",
-            path.display()
-        ))));
-        group.set_header_suffix(Some(
-            &self.link_button("Releases", selfupdate::RELEASES_URL),
-        ));
-        group.add(&value_row("Installed version", "", selfupdate::VERSION));
-        let now = check::now();
-
-        match &*self.download.borrow() {
-            Download::Done { tag, verified } => {
-                let row = adw::ActionRow::builder().use_markup(false).build();
-                row.set_title(&format!("Updated to {tag}"));
-                row.set_subtitle(if *verified {
-                    "Checksum verified; restart to use the new version"
-                } else {
-                    "No checksum was published; restart to use the new version"
-                });
-                row.add_prefix(&icon("emblem-ok-symbolic", "success"));
-                let btn = gtk::Button::builder()
-                    .label("Restart hyprdeck")
-                    .valign(gtk::Align::Center)
-                    .css_classes(["suggested-action"])
-                    .build();
-                let (weak, path) = (Rc::downgrade(self), path.to_path_buf());
-                btn.connect_clicked(move |_| {
-                    let (weak, path) = (weak.clone(), path.clone());
-                    glib::spawn_future_local(async move {
-                        let result = rt::blocking(move || selfupdate::restart(&path)).await;
-                        let Some(page) = weak.upgrade() else { return };
-                        match result {
-                            Ok(()) => page.ctx.toast("Restarting hyprdeck…"),
-                            Err(e) => page.ctx.error("Restart failed", &e),
-                        }
-                    });
-                });
-                row.add_suffix(&btn);
-                group.add(&row);
+    fn policy_row(&self) -> adw::ComboRow {
+        let row = combo_row(
+            "Hyprdeck updates",
+            "What background checks do when a new Hyprdeck version is out",
+            &Policy::ALL.map(Policy::label),
+        );
+        let current = state::settings().self_update_policy;
+        row.set_selected(Policy::ALL.iter().position(|&p| p == current).unwrap_or(0) as u32);
+        let ctx = self.ctx.clone();
+        row.connect_selected_notify(move |r| {
+            let Some(&policy) = Policy::ALL.get(r.selected() as usize) else {
                 return;
-            }
-            Download::Running(tag) => {
-                let row = adw::ActionRow::builder().use_markup(false).build();
-                row.set_title(&format!("Downloading {tag}…"));
-                row.set_subtitle(&format!("Replaces {} when complete", path.display()));
-                row.add_suffix(&adw::Spinner::new());
-                group.add(&row);
-                return;
-            }
-            Download::Failed(e) => {
-                let row = adw::ActionRow::builder().use_markup(false).build();
-                row.set_title("Update failed");
-                row.set_subtitle(e);
-                row.add_prefix(&icon("dialog-warning-symbolic", "warning"));
-                group.add(&row);
-            }
-            Download::Idle => {}
-        }
-
-        let lookup = match latest {
-            None => {
-                let row = adw::ActionRow::builder()
-                    .title("Latest release")
-                    .subtitle("Checking GitHub…")
-                    .build();
-                row.add_suffix(&adw::Spinner::new());
-                group.add(&row);
-                return;
-            }
-            Some(Err(e)) => {
-                let row = adw::ActionRow::builder().use_markup(false).build();
-                row.set_title("Could not check for updates");
-                row.set_subtitle(e);
-                row.add_prefix(&icon("dialog-warning-symbolic", "warning"));
-                group.add(&row);
-                return;
-            }
-            Some(Ok(lookup)) => lookup,
-        };
-        if let Some(w) = &lookup.warning {
-            let row = adw::ActionRow::builder().use_markup(false).build();
-            row.set_title("GitHub lookup problem");
-            row.set_subtitle(w);
-            row.add_prefix(&icon("dialog-warning-symbolic", "warning"));
-            group.add(&row);
-        }
-        let Some(rel) = &lookup.release else {
-            let row = adw::ActionRow::builder()
-                .title("No releases published yet")
-                .subtitle(format!(
-                    "github.com/{} has no releases to update to · checked {}",
-                    selfupdate::REPO,
-                    crate::ago(now - lookup.fetched_at)
-                ))
-                .build();
-            row.add_prefix(&icon("dialog-information-symbolic", "dim-label"));
-            group.add(&row);
-            return;
-        };
-
-        if !selfupdate::is_newer(&rel.tag) {
-            let row = adw::ActionRow::builder().use_markup(false).build();
-            row.set_title("Up to date");
-            row.set_subtitle(&format!(
-                "Latest release {} · {}",
-                rel.tag,
-                published(rel, now)
-            ));
-            row.add_prefix(&icon("emblem-ok-symbolic", "success"));
-            group.add(&row);
-            return;
-        }
-        let row = adw::ActionRow::builder().use_markup(false).build();
-        row.set_title(&format!("Update available: {}", rel.tag));
-        row.add_prefix(&icon("software-update-available-symbolic", "accent"));
-        match selfupdate::select_assets(&rel.assets) {
-            Some(assets) => {
-                row.set_subtitle(&format!(
-                    "{} · {:.1} MB{}",
-                    published(rel, now),
-                    assets.appimage.size as f64 / 1e6,
-                    if assets.checksum.is_some() {
-                        " · SHA-256 checksum published"
-                    } else {
-                        ""
-                    }
-                ));
-                let btn = gtk::Button::builder()
-                    .label("Download update")
-                    .valign(gtk::Align::Center)
-                    .css_classes(["suggested-action"])
-                    .build();
-                let (weak, path, tag) = (Rc::downgrade(self), path.to_path_buf(), rel.tag.clone());
-                btn.connect_clicked(move |_| {
-                    let Some(page) = weak.upgrade() else { return };
-                    *page.download.borrow_mut() = Download::Running(tag.clone());
-                    page.render_hyprdeck();
-                    let (weak, path, tag, assets) =
-                        (weak.clone(), path.clone(), tag.clone(), assets.clone());
-                    glib::spawn_future_local(async move {
-                        let result =
-                            rt::blocking(move || selfupdate::install_appimage(&path, &assets))
-                                .await;
-                        let Some(page) = weak.upgrade() else { return };
-                        *page.download.borrow_mut() = match result {
-                            Ok(verified) => Download::Done { tag, verified },
-                            Err(e) => Download::Failed(format!("{e:#}")),
-                        };
-                        page.render_hyprdeck();
-                    });
-                });
-                row.add_suffix(&btn);
-            }
-            None => {
-                row.set_subtitle(&format!(
-                    "The release has no {} file; download it from the release page",
-                    selfupdate::APPIMAGE_ASSET
-                ));
-                row.add_suffix(&self.link_button("Release page", &rel.url));
-            }
-        }
-        group.add(&row);
-        group.add(&notes_row(rel));
+            };
+            save_settings(
+                &ctx,
+                state::Settings {
+                    self_update_policy: policy,
+                    ..state::settings()
+                },
+                false,
+            );
+        });
+        row
     }
+
+    fn channel_row(&self) -> adw::ComboRow {
+        let row = combo_row(
+            "Update channel",
+            "Stable follows tagged releases; nightly follows every push to main (untested builds)",
+            &Channel::ALL.map(Channel::label),
+        );
+        let current = state::settings().self_update_channel;
+        row.set_selected(Channel::ALL.iter().position(|&c| c == current).unwrap_or(0) as u32);
+        let ctx = self.ctx.clone();
+        row.connect_selected_notify(move |r| {
+            let Some(&channel) = Channel::ALL.get(r.selected() as usize) else {
+                return;
+            };
+            save_settings(
+                &ctx,
+                state::Settings {
+                    self_update_channel: channel,
+                    ..state::settings()
+                },
+                true,
+            );
+        });
+        row
+    }
+}
+
+fn self_check_button(st: &SelfState) -> gtk::Button {
+    let btn = gtk::Button::builder()
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    if st.checking {
+        let b = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        b.append(&adw::Spinner::new());
+        b.append(&gtk::Label::new(Some("Checking…")));
+        btn.set_child(Some(&b));
+        btn.set_sensitive(false);
+    } else {
+        btn.set_child(Some(
+            &adw::ButtonContent::builder()
+                .icon_name("view-refresh-symbolic")
+                .label("Check now")
+                .build(),
+        ));
+        btn.set_tooltip_text(Some(
+            "Check GitHub / the upstream branch for a new Hyprdeck",
+        ));
+        btn.connect_clicked(|_| selfstate::check(true, false));
+    }
+    btn
+}
+
+fn combo_row(title: &str, subtitle: &str, labels: &[&str]) -> adw::ComboRow {
+    let row = adw::ComboRow::builder()
+        .use_markup(false)
+        .model(&gtk::StringList::new(labels))
+        .build();
+    row.set_title(title);
+    row.set_subtitle(subtitle);
+    row
+}
+
+/// Persist settings off the main thread; `recheck` re-runs the self-update check.
+fn save_settings(ctx: &Ctx, new: state::Settings, recheck: bool) {
+    if new == state::settings() {
+        return;
+    }
+    let ctx = ctx.clone();
+    glib::spawn_future_local(async move {
+        match rt::blocking(move || state::save_settings(new)).await {
+            Ok(()) => {
+                ctx.toast("Update settings saved");
+                if recheck {
+                    selfstate::check(false, false);
+                }
+            }
+            Err(e) => ctx.error("Saving update settings failed", &e),
+        }
+    });
 }
 
 /// Shown when none of the known components is installed.
@@ -896,6 +1122,7 @@ fn settings_group(ctx: &Ctx) -> adw::PreferencesGroup {
             let new = state::Settings {
                 interval_hours: interval.value() as u32,
                 notify: notify.is_active(),
+                ..state::settings()
             };
             if new == state::settings() {
                 return;

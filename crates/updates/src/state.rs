@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::check::{self, Report};
+use crate::selfstate::{self, Origin};
+use crate::selfupdate::{Channel, Policy};
 
 /// `~/.config/hyprdeck/updates.toml`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +21,10 @@ pub struct Settings {
     pub interval_hours: u32,
     /// Desktop notification when the number of pending updates grows.
     pub notify: bool,
+    /// What background checks do about new hyprdeck versions.
+    pub self_update_policy: Policy,
+    /// Which AppImage builds to follow (source installs follow their branch).
+    pub self_update_channel: Channel,
 }
 
 impl Default for Settings {
@@ -26,6 +32,8 @@ impl Default for Settings {
         Settings {
             interval_hours: 6,
             notify: true,
+            self_update_policy: Policy::default(),
+            self_update_channel: Channel::default(),
         }
     }
 }
@@ -166,6 +174,9 @@ async fn scheduler() {
         };
         if now >= due {
             trigger(true);
+            if settings().self_update_policy != Policy::Off {
+                selfstate::check(false, true);
+            }
         }
     }
 }
@@ -183,12 +194,17 @@ impl TrayProvider for UpdatesTray {
             (None, true) => "Updates: checking…".into(),
             (None, false) => "Updates: not checked yet".into(),
         };
-        vec![TrayItem::action(label, "updates.show")]
+        let mut items = vec![TrayItem::action(label, "updates.show")];
+        items.extend(selfstate::tray_item());
+        items
     }
 
     fn activate(&self, id: &str) {
-        if id == "updates.show" {
-            events::send(AppEvent::ShowPage("updates".into()));
+        match id {
+            "updates.show" => events::send(AppEvent::ShowPage("updates".into())),
+            selfstate::TRAY_INSTALL => selfstate::update(Origin::Tray),
+            selfstate::TRAY_RESTART => selfstate::restart_now(),
+            _ => {}
         }
     }
 }
@@ -196,4 +212,5 @@ impl TrayProvider for UpdatesTray {
 pub fn start() {
     tray::register(Arc::new(UpdatesTray));
     rt::spawn(scheduler());
+    selfstate::start();
 }

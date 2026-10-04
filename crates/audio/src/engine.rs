@@ -79,6 +79,77 @@ impl Status {
             .collect::<Vec<_>>()
             .join(", ")
     }
+
+    /// The remembered group's outputs that are connected right now.
+    pub fn live_selected(&self) -> Vec<String> {
+        self.config
+            .selected
+            .iter()
+            .filter(|n| self.devices().any(|d| &d.name == *n))
+            .cloned()
+            .collect()
+    }
+
+    /// "Default output" entries: every real output in display order, then the
+    /// simultaneous output.
+    pub fn output_choices(&self) -> Vec<OutputChoice> {
+        self.devices()
+            .map(|d| OutputChoice::Device(d.name.clone()))
+            .chain([OutputChoice::Simultaneous])
+            .collect()
+    }
+
+    /// The entry matching the current default sink; `None` when the default is not
+    /// one of [`Self::output_choices`] (no default, or a routing helper sink).
+    pub fn current_choice(&self) -> Option<OutputChoice> {
+        let current = OutputChoice::parse(&self.default_sink);
+        self.output_choices().into_iter().find(|c| *c == current)
+    }
+}
+
+/// Where system sound goes: one real output, or the simultaneous output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputChoice {
+    Device(String),
+    Simultaneous,
+}
+
+impl OutputChoice {
+    /// CLI/tray token for the simultaneous output.
+    pub const SIMULTANEOUS: &str = "simultaneous";
+
+    /// `simultaneous` (or the combine sink's own name) or an output's sink name.
+    pub fn parse(s: &str) -> Self {
+        if s == Self::SIMULTANEOUS || s == PRIMARY_SINK {
+            OutputChoice::Simultaneous
+        } else {
+            OutputChoice::Device(s.to_owned())
+        }
+    }
+
+    /// Inverse of [`Self::parse`].
+    pub fn token(&self) -> &str {
+        match self {
+            OutputChoice::Device(name) => name,
+            OutputChoice::Simultaneous => Self::SIMULTANEOUS,
+        }
+    }
+
+    /// Make this the default: [`use_output`] or [`use_simultaneous`] with the remembered group.
+    pub async fn apply(self) -> Result<String> {
+        match self {
+            OutputChoice::Device(name) => use_output(&name).await,
+            OutputChoice::Simultaneous => use_simultaneous(None).await,
+        }
+    }
+}
+
+/// Label of the simultaneous entry for a group of `n` outputs.
+pub fn simultaneous_label(n: usize) -> String {
+    match n {
+        1 => "Simultaneous output (1 device)".to_owned(),
+        n => format!("Simultaneous output ({n} devices)"),
+    }
 }
 
 pub async fn status() -> Result<Status> {
@@ -177,7 +248,7 @@ pub async fn enable(members: &[String]) -> Result<String> {
 pub async fn disable() -> Result<String> {
     let _g = lock().await?;
     let mut cfg = load_config().await?;
-    let dest = disable_locked(&mut cfg).await?;
+    let dest = disable_locked(&mut cfg, None).await?;
     Ok(match dest {
         Some(label) => format!("Simultaneous output off. Default: {label}"),
         None => "Simultaneous output off".to_owned(),
@@ -190,7 +261,7 @@ pub async fn toggle() -> Result<String> {
     let mut cfg = load_config().await?;
     let sinks = pw::list_sinks("").await?;
     if sinks.iter().any(Sink::is_primary) {
-        disable_locked(&mut cfg).await?;
+        disable_locked(&mut cfg, None).await?;
         return Ok("Simultaneous output off".to_owned());
     }
     let members = if cfg.selected.len() >= 2 {
@@ -213,7 +284,7 @@ pub async fn set_selected(members: &[String]) -> Result<String> {
         let _g = lock().await?;
         let mut cfg = load_config().await?;
         if pw::sink_exists(PRIMARY_SINK).await? {
-            disable_locked(&mut cfg).await?;
+            disable_locked(&mut cfg, None).await?;
             return Ok("Simultaneous output off".to_owned());
         }
         bail!("Select at least two audio outputs.");
@@ -304,15 +375,19 @@ async fn enable_locked(cfg: &mut Config, members: &[String], remember: bool) -> 
         .join(", "))
 }
 
-/// Returns the label of the output that became default (if the default had to move).
-async fn disable_locked(cfg: &mut Config) -> Result<Option<String>> {
+/// Returns the label of the output that took over the group's streams. `to` names that
+/// output; otherwise the current default is kept when it is a real output, else the
+/// remembered `restore_sink`.
+async fn disable_locked(cfg: &mut Config, to: Option<&str>) -> Result<Option<String>> {
     let sinks = pw::list_sinks("").await?;
     let mut new_default = None;
     if let Some(primary) = sinks.iter().find(|s| s.is_primary()) {
         let current = pw::default_or_empty().await;
         let live: HashSet<&str> = sinks.iter().map(|s| s.name.as_str()).collect();
         let usable = |n: &str| !n.is_empty() && n != PRIMARY_SINK && live.contains(n);
-        let dest = if usable(&current) {
+        let dest = if let Some(to) = to {
+            to.to_owned()
+        } else if usable(&current) {
             current.clone()
         } else if usable(&cfg.restore_sink) {
             cfg.restore_sink.clone()
@@ -607,10 +682,85 @@ pub async fn set_mute(sink: &str, muted: bool) -> Result<()> {
     pw::run(&pw::mute_command(sink, muted)).await.map(drop)
 }
 
-pub async fn set_default(sink: &str) -> Result<String> {
-    pw::run(&pw::default_command(sink)).await?;
+/// Make one real output the default ("where system sound goes"). A simultaneous output
+/// that is on is turned off and its streams move to `sink`; the ticked group is kept for
+/// next time. (Leaving it loaded but not default would not last: the daemon restores an
+/// enabled group as the default at the next login or PipeWire restart.)
+pub async fn use_output(sink: &str) -> Result<String> {
+    let _g = lock().await?;
+    let mut cfg = load_config().await?;
     let sinks = pw::list_sinks("").await?;
-    Ok(format!("Default output: {}", label_in(&sinks, sink)))
+    let label = sinks
+        .iter()
+        .find(|s| s.name == sink && !s.is_virtual())
+        .map(|s| s.label.clone())
+        .ok_or_else(|| anyhow!("{sink} is not a connected audio output"))?;
+    let running = sinks.iter().any(Sink::is_primary);
+    if running || cfg.enabled {
+        disable_locked(&mut cfg, Some(sink)).await?;
+    }
+    pw::run(&pw::default_command(sink)).await?;
+    Ok(if running {
+        format!("Simultaneous output off. Sound goes to {label}")
+    } else {
+        format!("Sound goes to {label}")
+    })
+}
+
+/// Make the simultaneous output the default ("where system sound goes"). `members` are
+/// the ticked outputs and become the remembered group; `None` uses the remembered group's
+/// connected outputs. A running group with exactly these outputs is reused, so playback
+/// continues uninterrupted; unrouted streams move onto it, as when it is turned on.
+pub async fn use_simultaneous(members: Option<Vec<String>>) -> Result<String> {
+    let _g = lock().await?;
+    let mut cfg = load_config().await?;
+    let sinks = pw::list_sinks("").await?;
+    let remember = members.is_some();
+    let members = match members {
+        Some(m) => clean_members(&m),
+        None => cfg
+            .selected
+            .iter()
+            .filter(|n| sinks.iter().any(|s| &s.name == *n))
+            .cloned()
+            .collect(),
+    };
+    if members.len() < 2 {
+        bail!("Simultaneous output needs at least two connected outputs in the group.");
+    }
+    let running = sinks.iter().any(Sink::is_primary)
+        && same_group(&pw::combine_targets(PRIMARY_SINK).await, &members);
+    if !running {
+        enable_locked(&mut cfg, &members, remember).await?;
+    } else if !cfg.enabled || (remember && cfg.selected != members) {
+        cfg.enabled = true;
+        if remember {
+            cfg.selected = members.clone();
+        }
+        save_config(&cfg).await?;
+    }
+    if pw::default_or_empty().await != PRIMARY_SINK {
+        pw::run(&pw::default_command(PRIMARY_SINK)).await?;
+        let Some(primary) = pw::list_sinks("").await?.into_iter().find(Sink::is_primary) else {
+            bail!("The simultaneous output disappeared while switching to it.");
+        };
+        // Streams claimed by a routing rule stay where the rule put them.
+        let moving: Vec<u32> = pw::list_streams()
+            .await?
+            .0
+            .iter()
+            .filter(|s| s.sink_index != primary.index && cfg.route_for(s).is_none())
+            .map(|s| s.index)
+            .collect();
+        move_all(&moving, PRIMARY_SINK).await;
+    }
+    let labels: Vec<&str> = members.iter().map(|n| label_in(&sinks, n)).collect();
+    Ok(format!("Sound goes to {}", labels.join(" + ")))
+}
+
+/// Whether a combine sink's `targets` are exactly `members` (order aside).
+fn same_group(targets: &[String], members: &[String]) -> bool {
+    targets.len() == members.len() && members.iter().all(|m| targets.contains(m))
 }
 
 pub async fn move_stream(stream: u32, sink: &str) -> Result<String> {
@@ -838,4 +988,90 @@ async fn unload(name: &str) -> Result<()> {
         bail!("Timed out while removing the previous {name} routes.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pw::tests::{sinks_json, streams_json};
+
+    const BT: &str = "bluez_output.AA_BB_CC_DD_EE_FF.1";
+    const USB: &str = "alsa_output.usb-Generic_USB_Audio-01.analog-stereo";
+    const HDMI: &str = "alsa_output.pci-0000_01_00.1.hdmi-stereo";
+
+    fn status(default_sink: &str, selected: &[&str]) -> Status {
+        let sinks = pw::parse_sinks(&sinks_json(), default_sink);
+        let (streams, fanout) = pw::parse_streams(&streams_json());
+        Status {
+            active: sinks.iter().any(Sink::is_primary),
+            default_sink: default_sink.to_owned(),
+            sinks,
+            streams,
+            fanout,
+            config: Config {
+                selected: selected.iter().map(|s| (*s).to_owned()).collect(),
+                ..Config::default()
+            },
+        }
+    }
+
+    fn device(name: &str) -> OutputChoice {
+        OutputChoice::Device(name.to_owned())
+    }
+
+    #[test]
+    fn choice_tokens_round_trip() {
+        assert_eq!(
+            OutputChoice::parse("simultaneous"),
+            OutputChoice::Simultaneous
+        );
+        assert_eq!(
+            OutputChoice::parse(PRIMARY_SINK),
+            OutputChoice::Simultaneous
+        );
+        assert_eq!(OutputChoice::parse(USB), device(USB));
+        for c in [OutputChoice::Simultaneous, device(HDMI)] {
+            assert_eq!(OutputChoice::parse(c.token()), c);
+        }
+    }
+
+    #[test]
+    fn choices_list_real_outputs_then_simultaneous() {
+        assert_eq!(
+            status("", &[]).output_choices(),
+            [
+                device(BT),
+                device(USB),
+                device(HDMI),
+                OutputChoice::Simultaneous
+            ]
+        );
+    }
+
+    #[test]
+    fn current_choice_follows_the_default_sink() {
+        assert_eq!(
+            status(PRIMARY_SINK, &[]).current_choice(),
+            Some(OutputChoice::Simultaneous)
+        );
+        assert_eq!(status(HDMI, &[]).current_choice(), Some(device(HDMI)));
+        // Not offered by the selector: routing helper, vanished output, no default.
+        for other in ["simultaneous_route_chat_ab12", "alsa_output.gone", ""] {
+            assert_eq!(status(other, &[]).current_choice(), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn live_selection_skips_disconnected_and_virtual_outputs() {
+        let st = status(USB, &[BT, "bluez_output.gone", PRIMARY_SINK, HDMI]);
+        assert_eq!(st.live_selected(), [BT, HDMI]);
+    }
+
+    #[test]
+    fn group_comparison_ignores_order() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        assert!(same_group(&s(&[BT, USB]), &s(&[USB, BT])));
+        assert!(!same_group(&s(&[BT, USB, HDMI]), &s(&[USB, BT])));
+        assert!(!same_group(&s(&[BT, USB]), &s(&[USB, HDMI])));
+    }
 }
