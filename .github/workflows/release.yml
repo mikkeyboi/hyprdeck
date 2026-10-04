@@ -20,7 +20,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus hyprland \
             glib2 file desktop-file-utils appstream squashfs-tools zsync github-cli
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify tag matches crate version
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
