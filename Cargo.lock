@@ -933,6 +933,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "dirs",
+ "futures-util",
  "gtk4",
  "libadwaita",
  "mlua",

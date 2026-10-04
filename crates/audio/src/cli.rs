@@ -5,11 +5,17 @@ use hyprdeck_core::rt;
 use serde_json::json;
 
 use crate::config::{MatchKind, Route};
+use crate::engine::OutputChoice;
+use crate::pw::PRIMARY_SINK;
 use crate::{engine, pw};
 
 const USAGE: &str = "\
 Usage: hyprdeck audio <command>
 
+  default [SINK|simultaneous]
+                          print where system sound goes (name<TAB>label), or send it to one
+                          output (turns simultaneous output off) or to the simultaneous
+                          output over the remembered group
   enable SINK SINK...     play on these outputs at the same time (becomes the default)
   off                     turn simultaneous output off (alias: disable)
   toggle                  on with the remembered group, or off
@@ -47,6 +53,11 @@ pub fn run(args: &[String]) -> Result<()> {
             "off" | "disable" => println!("{}", engine::disable().await?),
             "toggle" => println!("{}", engine::toggle().await?),
             "status" => status().await?,
+            "default" => match rest {
+                [] => print_default().await?,
+                [target] => println!("{}", OutputChoice::parse(target).apply().await?),
+                _ => bail!("usage: hyprdeck audio default [SINK|simultaneous]"),
+            },
             "list-devices" => {
                 for s in engine::status().await?.devices() {
                     println!("{}\t{}\t{}", s.conn.label(), s.description, s.name);
@@ -100,6 +111,29 @@ async fn status() -> Result<()> {
         "routes": routes,
     });
     println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+/// `name<TAB>label` of the default output; `simultaneous` for the combine sink.
+async fn print_default() -> Result<()> {
+    let st = engine::status().await?;
+    if st.default_sink.is_empty() {
+        bail!("No default output is set.");
+    }
+    if st.current_choice() == Some(OutputChoice::Simultaneous) {
+        let members: Vec<&str> = st
+            .members_of(PRIMARY_SINK)
+            .iter()
+            .map(|s| s.label.as_str())
+            .collect();
+        println!(
+            "{}\tSimultaneous output: {}",
+            OutputChoice::SIMULTANEOUS,
+            members.join(" + ")
+        );
+    } else {
+        println!("{}\t{}", st.default_sink, st.label(&st.default_sink));
+    }
     Ok(())
 }
 

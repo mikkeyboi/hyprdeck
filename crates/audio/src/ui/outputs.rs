@@ -1,4 +1,5 @@
-//! Outputs tab: status hero, device list (group selection, default, volume) and per-output sync.
+//! Outputs tab: status hero, default output selector, device list (group selection,
+//! default, volume) and per-output sync.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -10,7 +11,8 @@ use hyprdeck_core::events::{self, AppEvent};
 use hyprdeck_core::ui::{Ctx, page_scaffold};
 
 use super::{ROUTING_TAB, VolumeControl, act, act_then, badge, follow, show_tab};
-use crate::engine::{self, Status};
+use crate::daemon;
+use crate::engine::{self, OutputChoice, Status, simultaneous_label};
 use crate::pw::{PRIMARY_SINK, Sink};
 
 struct DeviceRow {
@@ -37,6 +39,18 @@ struct Page {
     playing: gtk::Box,
     switch: gtk::Switch,
     switch_guard: Cell<bool>,
+    default_group: adw::PreferencesGroup,
+    default_row: adw::ComboRow,
+    default_model: gtk::StringList,
+    default_spinner: adw::Spinner,
+    /// Entries behind `default_model`, same order.
+    default_choices: RefCell<Vec<OutputChoice>>,
+    /// The live default as of the last snapshot.
+    default_current: RefCell<Option<OutputChoice>>,
+    /// Set while the selection is changed programmatically.
+    default_guard: Cell<bool>,
+    /// A default change is being applied; snapshots leave the selector alone.
+    default_busy: Cell<bool>,
     group: adw::PreferencesGroup,
     empty: adw::ActionRow,
     rows: RefCell<Vec<DeviceRow>>,
@@ -99,6 +113,24 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     hero.append(&switch);
     content.append(&hero);
 
+    // Default output selector; the chosen entry shows as the row subtitle, so long
+    // device names get the full width instead of an ellipsized button label.
+    let default_model = gtk::StringList::new(&[]);
+    let default_row = adw::ComboRow::builder()
+        .use_markup(false)
+        .use_subtitle(true)
+        .model(&default_model)
+        .sensitive(false)
+        .build();
+    default_row.set_title("Default output");
+    let default_spinner = adw::Spinner::builder().visible(false).build();
+    default_row.add_suffix(&default_spinner);
+    let default_group = adw::PreferencesGroup::builder()
+        .description("Where system sound goes.")
+        .build();
+    default_group.add(&default_row);
+    content.append(&default_group);
+
     // Devices.
     let group = adw::PreferencesGroup::builder()
         .title("Outputs")
@@ -154,6 +186,14 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         playing,
         switch,
         switch_guard: Cell::new(false),
+        default_group,
+        default_row,
+        default_model,
+        default_spinner,
+        default_choices: RefCell::default(),
+        default_current: RefCell::default(),
+        default_guard: Cell::new(false),
+        default_busy: Cell::new(false),
         group,
         empty,
         rows: RefCell::default(),
@@ -203,6 +243,43 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         }
     });
     let p = page.clone();
+    page.default_row.connect_selected_notify(move |row| {
+        if p.default_guard.get() {
+            return;
+        }
+        let Some(choice) = p
+            .default_choices
+            .borrow()
+            .get(row.selected() as usize)
+            .cloned()
+        else {
+            return;
+        };
+        if p.default_current.borrow().as_ref() == Some(&choice) {
+            return;
+        }
+        match choice {
+            OutputChoice::Simultaneous => {
+                let ticked = p.checked();
+                if ticked.len() < 2 {
+                    p.ctx
+                        .toast("Tick at least two outputs below to play on all of them at once.");
+                    p.select_current_default();
+                    return;
+                }
+                p.touched.set(false);
+                p.apply_default(
+                    "Could not switch to simultaneous output",
+                    engine::use_simultaneous(Some(ticked)),
+                );
+            }
+            OutputChoice::Device(name) => p
+                .apply_default("Could not change the default output", async move {
+                    engine::use_output(&name).await
+                }),
+        }
+    });
+    let p = page.clone();
     select_all.connect_clicked(move |_| {
         for r in p.rows.borrow().iter() {
             r.check.set_active(true);
@@ -241,6 +318,7 @@ impl Page {
                 self.hero_title.set_label("PipeWire is not available");
                 self.hero_sub.set_label(e);
                 self.switch.set_sensitive(false);
+                self.default_row.set_sensitive(false);
                 return;
             }
         };
@@ -248,7 +326,96 @@ impl Page {
         self.active.set(st.active);
         self.update_hero(st);
         self.update_devices(st);
+        self.update_default(st);
         self.update_sync(st);
+    }
+
+    /// Mirror the live default in the selector (labels may have changed too).
+    fn update_default(&self, st: &Status) {
+        if self.default_busy.get() {
+            // The action's completion re-syncs from the newest snapshot.
+            return;
+        }
+        let choices = st.output_choices();
+        let ticked = self.checked().len();
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|c| match c {
+                OutputChoice::Device(name) => match st.sink(name) {
+                    Some(s) => format!("{} ({})", s.label, s.conn.label()),
+                    None => name.clone(),
+                },
+                OutputChoice::Simultaneous => simultaneous_label(ticked),
+            })
+            .collect();
+        let model = &self.default_model;
+        let same = model.n_items() as usize == labels.len()
+            && labels
+                .iter()
+                .enumerate()
+                .all(|(i, l)| model.string(i as u32).as_deref() == Some(l.as_str()));
+        self.default_guard.set(true);
+        if !same {
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            model.splice(0, model.n_items(), &refs);
+        }
+        self.default_choices.replace(choices);
+        self.default_current.replace(st.current_choice());
+        self.default_guard.set(false);
+        self.select_current_default();
+        self.default_row.set_sensitive(true);
+        self.default_group
+            .set_description(Some(&glib::markup_escape_text(&default_subtitle(st))));
+    }
+
+    /// Point the selector back at the live default without applying anything.
+    fn select_current_default(&self) {
+        let index = self
+            .default_current
+            .borrow()
+            .as_ref()
+            .and_then(|c| self.default_choices.borrow().iter().position(|x| x == c));
+        self.default_guard.set(true);
+        self.default_row
+            .set_selected(index.map_or(gtk::INVALID_LIST_POSITION, |i| i as u32));
+        self.default_guard.set(false);
+    }
+
+    /// Keep the simultaneous entry's device count in step with the ticks.
+    fn refresh_simultaneous_label(&self) {
+        let n = self.default_model.n_items();
+        if n == 0 {
+            return;
+        }
+        let label = simultaneous_label(self.checked().len());
+        if self.default_model.string(n - 1).as_deref() != Some(label.as_str()) {
+            let selected = self.default_row.selected();
+            self.default_guard.set(true);
+            self.default_model.splice(n - 1, 1, &[label.as_str()]);
+            self.default_row.set_selected(selected);
+            self.default_guard.set(false);
+        }
+    }
+
+    /// Run a default-output change with the selector busy until it lands.
+    fn apply_default<F>(self: &Rc<Self>, what: &'static str, fut: F)
+    where
+        F: Future<Output = anyhow::Result<String>> + Send + 'static,
+    {
+        self.default_busy.set(true);
+        self.default_row.set_sensitive(false);
+        self.default_spinner.set_visible(true);
+        let p = self.clone();
+        act_then(&self.ctx, what, fut, move |_| {
+            p.default_busy.set(false);
+            p.default_spinner.set_visible(false);
+            p.default_row.set_sensitive(true);
+            // Success or not, show what PipeWire now reports.
+            match daemon::current().as_deref() {
+                Some(Ok(st)) => p.update_default(st),
+                _ => p.select_current_default(),
+            }
+        });
     }
 
     fn update_hero(&self, st: &Status) {
@@ -431,8 +598,8 @@ impl Page {
         let (p, name) = (self.clone(), d.name.clone());
         make_default.connect_clicked(move |_| {
             let name = name.clone();
-            act(&p.ctx, "Could not change the default output", async move {
-                engine::set_default(&name).await
+            p.apply_default("Could not change the default output", async move {
+                engine::use_output(&name).await
             });
         });
         let p = self.clone();
@@ -442,6 +609,7 @@ impl Page {
                 p.touched.set(true);
             }
             p.refresh_apply();
+            p.refresh_simultaneous_label();
         });
         DeviceRow {
             name: d.name.clone(),
@@ -568,5 +736,21 @@ impl Page {
             updating,
             last_user,
         }
+    }
+}
+
+/// Explains the selector's current state and what picking an entry does.
+fn default_subtitle(st: &Status) -> String {
+    match st.current_choice() {
+        None if st.default_sink.is_empty() => {
+            "No default output is set. Pick where system sound goes.".to_owned()
+        }
+        None => format!(
+            "Sound currently goes to {}, which is not listed here. Pick where system sound goes.",
+            st.label(&st.default_sink)
+        ),
+        Some(OutputChoice::Simultaneous) => "Plays on every output in the group. Picking a single output turns simultaneous output off; the ticks below are kept.".to_owned(),
+        Some(OutputChoice::Device(_)) if st.active => "Simultaneous output still plays apps moved onto it, but is not the default. Picking an output turns it off; the ticks below are kept.".to_owned(),
+        Some(OutputChoice::Device(_)) => "Where apps play unless a routing rule sends them elsewhere. Simultaneous output plays on every output ticked below.".to_owned(),
     }
 }

@@ -1,0 +1,42 @@
+name: Nightly
+
+# Republish the `nightly` prerelease from every main-branch CI run that passed,
+# reusing the AppImage CI already built (stamped with that commit). Hyprdeck's
+# "Nightly" update channel follows this release.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: Hyprdeck-x86_64.AppImage
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: dist
+      - name: Publish nightly prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          cd dist && sha256sum -c Hyprdeck-x86_64.AppImage.sha256 && cd ..
+          gh release delete nightly --repo "$REPO" --cleanup-tag --yes || true
+          gh release create nightly dist/Hyprdeck-x86_64.AppImage dist/Hyprdeck-x86_64.AppImage.sha256 \
+            --repo "$REPO" --target "$SHA" --prerelease --latest=false \
+            --title "Nightly build (${SHA::7})" \
+            --notes "Automated build of \`main\` at $SHA, published after CI passed. May be unstable. Choose the **Nightly** channel in Hyprdeck → Updates to follow these builds."

@@ -92,6 +92,19 @@ pub fn plain_toast(title: &str) -> adw::Toast {
     adw::Toast::builder().use_markup(false).title(title).build()
 }
 
+static WINDOW_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the main window is currently shown (readable from any thread), so
+/// background work can avoid disrupting the user, e.g. delaying a restart.
+pub fn window_visible() -> bool {
+    WINDOW_VISIBLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set by the app shell whenever the main window is shown or hidden.
+pub fn set_window_visible(visible: bool) {
+    WINDOW_VISIBLE.store(visible, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Call `f` every time `widget` becomes visible (page shown / window re-opened).
 pub fn on_shown(widget: &impl IsA<gtk::Widget>, f: impl Fn() + 'static) {
     widget.connect_map(move |_| f());

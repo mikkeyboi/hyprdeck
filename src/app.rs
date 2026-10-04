@@ -177,6 +177,7 @@ impl Shell {
                 glib::Propagation::Stop
             });
         }
+        window.connect_visible_notify(|w| hyprdeck_core::ui::set_window_visible(w.is_visible()));
 
         Rc::new(Shell {
             ctx,
@@ -282,7 +283,7 @@ fn install_actions(
             let dialog = adw::AboutDialog::builder()
                 .application_name("Hyprdeck")
                 .application_icon(APP_ICON)
-                .version(env!("CARGO_PKG_VERSION"))
+                .version(hyprdeck_core::version_string())
                 .comments("Startup apps, displays, input, audio, Bluetooth, updates and sleep/wake for Hyprland + Noctalia")
                 .developer_name("mikkeyboi")
                 .website("https://github.com/mikkeyboi/hyprdeck")
