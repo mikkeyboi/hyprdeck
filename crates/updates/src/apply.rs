@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use hyprdeck_core::{cmd, notify, rt, store, tray, ui};
+use hyprdeck_core::{cmd, notify, rt, store, tray};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
@@ -1241,9 +1241,21 @@ pub fn start(plan: Plan) -> Result<()> {
         if summary.outcome != Outcome::Cancelled {
             state::trigger(false);
         }
-        if !ui::window_visible() && summary.outcome != Outcome::Cancelled {
+        if summary.outcome != Outcome::Cancelled {
             let body = summary_line(&summary);
-            if let Ok(true) = notify::notify_action(&summary.headline, &body, "Show details").await
+            let severity = if summary.outcome == Outcome::Success {
+                notify::Severity::Normal
+            } else {
+                notify::Severity::Error
+            };
+            if let Ok(true) = notify::notify_action(
+                notify::Category::PackageUpdates,
+                severity,
+                &summary.headline,
+                &body,
+                "Show details",
+            )
+            .await
             {
                 state::request_review();
             }

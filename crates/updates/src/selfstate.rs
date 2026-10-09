@@ -193,7 +193,14 @@ async fn apply_policy(checked: &Checked) {
         (_, Some(blocker)) => {
             let body = format!("{}\n{}", offer.detail, blocker.message());
             rt::spawn(async move {
-                if let Ok(true) = notify::notify_action(&offer.title, &body, "Open Hyprdeck").await
+                if let Ok(true) = notify::notify_action(
+                    notify::Category::HyprdeckUpdates,
+                    notify::Severity::Normal,
+                    &offer.title,
+                    &body,
+                    "Open Hyprdeck",
+                )
+                .await
                 {
                     events::send(AppEvent::ShowPage("updates".into()));
                 }
@@ -201,7 +208,15 @@ async fn apply_policy(checked: &Checked) {
         }
         (_, None) => {
             rt::spawn(async move {
-                match notify::notify_action(&offer.title, &offer.detail, "Update now").await {
+                match notify::notify_action(
+                    notify::Category::HyprdeckUpdates,
+                    notify::Severity::Normal,
+                    &offer.title,
+                    &offer.detail,
+                    "Update now",
+                )
+                .await
+                {
                     Ok(true) => update(Origin::Notification),
                     Ok(false) => {}
                     Err(e) => tracing::warn!("update notification failed: {e:#}"),
@@ -302,7 +317,12 @@ async fn run(origin: Origin) {
                     .await
                 });
             if announce {
-                notify::notify_bg("Hyprdeck update failed", msg);
+                notify::notify_bg(
+                    notify::Category::HyprdeckUpdates,
+                    notify::Severity::Error,
+                    "Hyprdeck update failed",
+                    msg,
+                );
             }
         }
     }
@@ -323,6 +343,8 @@ fn installed(applied: Applied, notify: bool) {
         RestartPlan::Now => {
             if notify {
                 notify::notify_bg(
+                    notify::Category::HyprdeckUpdates,
+                    notify::Severity::Normal,
                     format!("Hyprdeck {label} installed"),
                     "Restarting Hyprdeck…",
                 );
@@ -332,6 +354,8 @@ fn installed(applied: Applied, notify: bool) {
         RestartPlan::WhenHidden => {
             rt::spawn(async move {
                 let ask = notify::notify_action(
+                    notify::Category::HyprdeckUpdates,
+                    notify::Severity::Normal,
                     &format!("Hyprdeck {label} is installed"),
                     "Restart Hyprdeck to finish updating. It restarts by itself once the window is closed.",
                     "Restart now",
@@ -376,7 +400,12 @@ pub fn restart_now() {
             let msg = format!("Restart failed: {e:#}");
             tracing::warn!("{msg}");
             set_job(Job::Failed(msg.clone()));
-            notify::notify_bg("Hyprdeck update", msg);
+            notify::notify_bg(
+                notify::Category::HyprdeckUpdates,
+                notify::Severity::Error,
+                "Hyprdeck update",
+                msg,
+            );
         }
     });
 }
@@ -438,8 +467,18 @@ pub fn start() {
         };
         if report {
             match &job {
-                Job::Done(msg) => notify::notify_bg("Hyprdeck updated", msg.clone()),
-                Job::Failed(msg) => notify::notify_bg("Hyprdeck update failed", msg.clone()),
+                Job::Done(msg) => notify::notify_bg(
+                    notify::Category::HyprdeckUpdates,
+                    notify::Severity::Normal,
+                    "Hyprdeck updated",
+                    msg.clone(),
+                ),
+                Job::Failed(msg) => notify::notify_bg(
+                    notify::Category::HyprdeckUpdates,
+                    notify::Severity::Error,
+                    "Hyprdeck update failed",
+                    msg.clone(),
+                ),
                 _ => {}
             }
         }

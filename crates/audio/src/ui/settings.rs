@@ -1,4 +1,4 @@
-//! Settings tab: notifications, volume ceiling, sound server info and self-test.
+//! Settings tab: volume ceiling, sound server info and self-test.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -16,14 +16,9 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     let (scroller, content) = page_scaffold();
 
     let behaviour = adw::PreferencesGroup::builder().title("Behaviour").build();
-    let notify = adw::SwitchRow::builder()
-        .title("Desktop notifications")
-        .subtitle("For changes made from the tray, and when the simultaneous output is restored automatically")
-        .build();
     let max = adw::SpinRow::with_range(100.0, 150.0, 5.0);
     max.set_title("Maximum volume");
     max.set_subtitle("Ceiling for every slider, preset and tray action (percent)");
-    behaviour.add(&notify);
     behaviour.add(&max);
     let restore = adw::ActionRow::builder()
         .title("Restore at login")
@@ -60,24 +55,6 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     content.append(&server);
 
     let updating = Rc::new(Cell::new(false));
-    let u = updating.clone();
-    let c = ctx.clone();
-    notify.connect_active_notify(move |row| {
-        if u.get() {
-            return;
-        }
-        let on = row.is_active();
-        act_then(
-            &c,
-            "Could not save settings",
-            async move {
-                engine::update_settings(move |cfg| cfg.notifications = on)
-                    .await
-                    .map(|()| String::new())
-            },
-            |_| {},
-        );
-    });
     let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
     let (u, c) = (updating.clone(), ctx.clone());
     max.connect_value_notify(move |row| {
@@ -114,11 +91,10 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         });
     });
 
-    let (u, n, m) = (updating, notify, max);
+    let (u, m) = (updating, max);
     follow(&scroller, move |snap| {
         let Ok(st) = snap else { return };
         u.set(true);
-        n.set_active(st.config.notifications);
         m.set_value(st.config.max_volume as f64);
         u.set(false);
     });

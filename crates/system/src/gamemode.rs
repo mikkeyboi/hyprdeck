@@ -77,7 +77,12 @@ impl TrayProvider for Tray {
                 .map_err(anyhow::Error::from)
                 .and_then(|r| r)
             {
-                notify::notify_bg("Game mode", format!("{e:#}"));
+                notify::notify_bg(
+                    notify::Category::System,
+                    notify::Severity::Error,
+                    "Game mode",
+                    format!("{e:#}"),
+                );
             }
         });
     }

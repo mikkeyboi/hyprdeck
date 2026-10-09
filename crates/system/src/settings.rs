@@ -21,8 +21,6 @@ pub struct ResumeGuard {
     /// Seconds to wait after wake before checking the displays.
     pub delay_secs: u32,
     pub rescue: RescuePolicy,
-    /// Desktop notification when a problem is found or displays are reset.
-    pub notify: bool,
 }
 
 impl Default for ResumeGuard {
@@ -31,7 +29,6 @@ impl Default for ResumeGuard {
             enabled: true,
             delay_secs: 3,
             rescue: RescuePolicy::OnProblem,
-            notify: true,
         }
     }
 }

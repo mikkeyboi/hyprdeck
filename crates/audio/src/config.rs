@@ -170,8 +170,6 @@ pub struct Config {
     pub restore_sink: String,
     /// Volume ceiling (100–150 %) for every slider and preset.
     pub max_volume: u32,
-    /// Desktop notifications for actions taken from the tray.
-    pub notifications: bool,
     pub routes: Vec<Route>,
 }
 
@@ -182,7 +180,6 @@ impl Default for Config {
             selected: Vec::new(),
             restore_sink: String::new(),
             max_volume: pw::MAX_VOLUME,
-            notifications: true,
             routes: Vec::new(),
         }
     }
@@ -515,7 +512,6 @@ mod tests {
             selected: vec!["a".into(), "b".into()],
             restore_sink: "usb_dac".into(),
             max_volume: 120,
-            notifications: false,
             routes: vec![
                 Route {
                     volume: Some(80),
@@ -552,7 +548,6 @@ mod tests {
 selected = ["bluez_output.AA_BB_CC_DD_EE_FF.1", "alsa_output.usb-Generic_USB_Audio-01.analog-stereo"]
 restore_sink = "alsa_output.usb-Generic_USB_Audio-01.analog-stereo"
 max_volume = 150
-notifications = true
 
 [[routes]]
 id = "e8ac9f7a"

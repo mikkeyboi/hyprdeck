@@ -1142,20 +1142,14 @@ fn settings_group(ctx: &Ctx) -> adw::PreferencesGroup {
             0.0,
         ))
         .build();
-    let notify = adw::SwitchRow::builder()
-        .title("Notify about new updates")
-        .subtitle("Desktop notification when the number of pending updates grows")
-        .active(s.notify)
-        .build();
     let save = {
-        let (ctx, interval, notify) = (ctx.clone(), interval.downgrade(), notify.downgrade());
+        let (ctx, interval) = (ctx.clone(), interval.downgrade());
         move || {
-            let (Some(interval), Some(notify)) = (interval.upgrade(), notify.upgrade()) else {
+            let Some(interval) = interval.upgrade() else {
                 return;
             };
             let new = state::Settings {
                 interval_hours: interval.value() as u32,
-                notify: notify.is_active(),
                 ..state::settings()
             };
             if new == state::settings() {
@@ -1170,12 +1164,8 @@ fn settings_group(ctx: &Ctx) -> adw::PreferencesGroup {
             });
         }
     };
-    let save = Rc::new(save);
-    let s2 = save.clone();
-    interval.connect_value_notify(move |_| s2());
-    notify.connect_active_notify(move |_| save());
+    interval.connect_value_notify(move |_| save());
     group.add(&interval);
-    group.add(&notify);
     group
 }
 

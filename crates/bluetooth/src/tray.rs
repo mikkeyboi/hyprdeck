@@ -107,7 +107,12 @@ impl TrayProvider for Provider {
                 } else {
                     "connect to"
                 };
-                notify::notify_bg("Bluetooth", format!("Couldn't {what} {label}: {e:#}"));
+                notify::notify_bg(
+                    notify::Category::Bluetooth,
+                    notify::Severity::Error,
+                    "Bluetooth",
+                    format!("Couldn't {what} {label}: {e:#}"),
+                );
                 // The click toggled the check mark optimistically; re-render real state.
                 tray::refresh();
             }

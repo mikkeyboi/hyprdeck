@@ -109,7 +109,12 @@ fn system_cli(args: &[&str]) -> Result<()> {
             let text = std::fs::read_to_string(&report.path)?;
             print_log_summary(&guard::parse_header(report.path.clone(), &text));
             if let Some((summary, body)) = report.notification() {
-                rt::runtime().block_on(notify::notify(&summary, &body))?;
+                rt::runtime().block_on(notify::notify(
+                    notify::Category::System,
+                    report.notification_severity(),
+                    &summary,
+                    &body,
+                ))?;
             }
             Ok(())
         }

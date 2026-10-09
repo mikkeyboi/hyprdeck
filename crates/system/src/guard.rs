@@ -173,10 +173,14 @@ async fn on_wake(mark: Option<SleepMark>) -> Result<()> {
     }
     tokio::time::sleep(Duration::from_secs(u64::from(s.delay_secs))).await;
     let report = tokio::task::spawn_blocking(move || after_wake(mark, s.rescue, false)).await??;
-    if s.notify
-        && let Some((summary, body)) = report.notification()
-    {
-        notify::notify(&summary, &body).await?;
+    if let Some((summary, body)) = report.notification() {
+        notify::notify(
+            notify::Category::System,
+            report.notification_severity(),
+            &summary,
+            &body,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -274,7 +278,14 @@ impl Rescue {
 }
 
 impl WakeReport {
-    /// Desktop notification for this wake, if it warrants one.
+    pub fn notification_severity(&self) -> notify::Severity {
+        match &self.rescue {
+            Rescue::Skipped | Rescue::Failed(_) => notify::Severity::Error,
+            Rescue::NotNeeded | Rescue::Done => notify::Severity::Normal,
+        }
+    }
+
+    /// Notification for this wake, if it warrants one.
     pub fn notification(&self) -> Option<(String, String)> {
         let problems = self.problems.join("\n");
         match &self.rescue {

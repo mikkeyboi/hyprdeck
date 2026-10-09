@@ -52,6 +52,8 @@ fn all_pages() -> Vec<PageInfo> {
 }
 
 fn start_background_services() {
+    // Migrate retired notification switches before providers can save their settings.
+    hyprdeck_core::notify::settings();
     hd_startup::start_background();
     hd_display::start_background();
     hd_input::start_background();
@@ -319,7 +321,10 @@ fn event_loop(
             match ev {
                 AppEvent::ShowWindow => get_shell(&app).present(None),
                 AppEvent::ShowPage(id) => get_shell(&app).present(Some(&id)),
-                AppEvent::Toast(msg) => get_shell(&app).ctx.toast(msg),
+                AppEvent::Toast(msg) if hyprdeck_core::ui::window_visible() => {
+                    get_shell(&app).ctx.toast(msg);
+                }
+                AppEvent::Toast(_) => {}
                 AppEvent::Quit => {
                     hold.borrow_mut().take();
                     app.quit();

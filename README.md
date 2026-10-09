@@ -94,6 +94,39 @@ By default the service starts in the tray (**Preferences → Start minimized**).
 Hyprdeck in the tray; quit from the tray menu. Running `hyprdeck` again, or `hyprdeck --page <id>`,
 focuses the running instance.
 
+## Notifications
+
+Configure all background notifications under **Preferences → Notifications**. Popups expire after
+**8 seconds** by default; failures and wake-recovery problems use **12 seconds**. Action buttons such
+as **Review & update** no longer make a notification stay indefinitely. Choose a timed lifetime
+(1–3600 seconds), the desktop server's default, or explicitly **Until dismissed**.
+
+Delivery can be **Desktop**, **In-app only**, or **Off**, with separate overrides for package updates,
+Hyprdeck updates, audio, Bluetooth, and system/wake events. Desktop delivery uses an in-app toast
+instead while the main window is visible. In-app-only delivery never opens a window. These controls
+do not disable update checks, change the automatic-install policy, or disable wake recovery;
+interactive operation feedback remains in the app.
+
+New update notifications replace the previous live popup for the same update category. Expiring or
+dismissing a popup never starts an update or restart. Update actions and results remain available
+through the tray and Updates page. Your desktop notification server controls appearance, expiration,
+Do Not Disturb, and notification history; Hyprdeck does not create a separate notification inbox.
+
+Settings are saved in `~/.config/hyprdeck/notifications.toml` (or under `$XDG_CONFIG_HOME`). The old
+audio, package-update, and wake notification switches migrate once into category overrides, preserving
+disabled notifications. A malformed settings file is reported rather than overwritten.
+
+```toml
+delivery = "desktop"         # desktop, in_app, off
+timeout = "timed"            # timed, server_default, until_dismissed
+duration_seconds = 8
+error_duration_seconds = 12
+
+[overrides]
+audio = "off"
+package_updates = "in_app"
+```
+
 ## Command line
 
 ```

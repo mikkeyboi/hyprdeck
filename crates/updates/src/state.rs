@@ -19,8 +19,6 @@ use crate::selfupdate::{Channel, Policy};
 pub struct Settings {
     /// Hours between automatic background checks.
     pub interval_hours: u32,
-    /// Desktop notification when the number of pending updates grows.
-    pub notify: bool,
     /// What background checks do about new hyprdeck versions.
     pub self_update_policy: Policy,
     /// Which AppImage builds to follow (source installs follow their branch).
@@ -31,7 +29,6 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             interval_hours: 6,
-            notify: true,
             self_update_policy: Policy::default(),
             self_update_channel: Channel::default(),
         }
@@ -84,8 +81,8 @@ pub fn current() -> State {
     STATE.borrow().clone()
 }
 
-/// Start a check unless one is already running. `notify` allows a desktop
-/// notification when the update count grew. Callable from any thread.
+/// Start a check unless one is already running. `notify` allows a notification
+/// when the update count grew. Callable from any thread.
 pub fn trigger(notify: bool) {
     let started = STATE.send_if_modified(|s| !std::mem::replace(&mut s.checking, true));
     if !started {
@@ -103,10 +100,18 @@ fn publish(report: Report, allow_notify: bool) {
     }
     let previous = STATE.borrow().report.as_ref().map(|r| r.total());
     let total = report.total();
-    if allow_notify && settings().notify && !report.failed() && total > previous.unwrap_or(0) {
+    if allow_notify && !report.failed() && total > previous.unwrap_or(0) {
         let (summary, body) = (notification_summary(total), notification_body(&report));
         rt::spawn(async move {
-            match notify::notify_action(&summary, &body, "Review & update").await {
+            match notify::notify_action(
+                notify::Category::PackageUpdates,
+                notify::Severity::Normal,
+                &summary,
+                &body,
+                "Review & update",
+            )
+            .await
+            {
                 Ok(true) => request_review(),
                 Ok(false) => {}
                 Err(e) => tracing::warn!("update notification failed: {e:#}"),

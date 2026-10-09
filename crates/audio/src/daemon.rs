@@ -125,25 +125,24 @@ async fn restore_if_needed() {
     match engine::restore().await {
         Ok(Some(msg)) => {
             tracing::info!("{msg}");
-            notify_if_enabled(msg).await;
+            notify::notify_bg(
+                notify::Category::Audio,
+                notify::Severity::Normal,
+                "Audio",
+                msg,
+            );
         }
         Ok(None) => {}
         Err(e) => {
             tracing::warn!("restoring simultaneous output: {e:#}");
             *RESTORE_FAILED_FOR.lock().unwrap_or_else(|e| e.into_inner()) = Some(key);
-            notify_if_enabled(format!("Could not restore simultaneous output: {e:#}")).await;
+            notify::notify_bg(
+                notify::Category::Audio,
+                notify::Severity::Error,
+                "Audio",
+                format!("Could not restore simultaneous output: {e:#}"),
+            );
         }
-    }
-}
-
-async fn notify_if_enabled(body: String) {
-    let enabled = tokio::task::spawn_blocking(crate::config::load)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .is_none_or(|c| c.notifications);
-    if enabled {
-        notify::notify_bg("Audio", body);
     }
 }
 
@@ -218,7 +217,7 @@ where
     .await
 }
 
-/// Run an engine operation from the tray (non-GTK thread); reports via desktop notification.
+/// Run an engine operation from the tray (non-GTK thread); reports via configured delivery.
 pub fn tray_action<F>(fut: F)
 where
     F: Future<Output = Result<String>> + Send + 'static,
@@ -227,11 +226,21 @@ where
         let r = fut.await;
         refresh_now().await;
         match r {
-            Ok(msg) if !msg.is_empty() => notify_if_enabled(msg).await,
+            Ok(msg) if !msg.is_empty() => notify::notify_bg(
+                notify::Category::Audio,
+                notify::Severity::Normal,
+                "Audio",
+                msg,
+            ),
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!("{e:#}");
-                notify_if_enabled(format!("{e:#}")).await;
+                notify::notify_bg(
+                    notify::Category::Audio,
+                    notify::Severity::Error,
+                    "Audio",
+                    format!("{e:#}"),
+                );
             }
         }
     });

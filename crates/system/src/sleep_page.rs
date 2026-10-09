@@ -171,15 +171,10 @@ fn build_guard_settings(ctx: &Ctx, group: &adw::PreferencesGroup) {
         .subtitle("Seconds to wait after wake before checking the displays")
         .adjustment(&gtk::Adjustment::new(3.0, 1.0, 60.0, 1.0, 5.0, 0.0))
         .build();
-    let notify = adw::SwitchRow::builder()
-        .title("Notify")
-        .subtitle("Show a notification when a problem is found or the displays are reset")
-        .build();
     for r in [
         enabled.upcast_ref::<gtk::Widget>(),
         policy.upcast_ref(),
         delay.upcast_ref(),
-        notify.upcast_ref(),
     ] {
         r.set_sensitive(false);
         group.add(r);
@@ -202,19 +197,16 @@ fn build_guard_settings(ctx: &Ctx, group: &adw::PreferencesGroup) {
                 .unwrap_or(1) as u32,
         );
         delay.set_value(f64::from(s.resume.delay_secs));
-        notify.set_active(s.resume.notify);
         for r in [
             enabled.upcast_ref::<gtk::Widget>(),
             policy.upcast_ref(),
             delay.upcast_ref(),
-            notify.upcast_ref(),
         ] {
             r.set_sensitive(true);
         }
         let dependents = [
             policy.clone().upcast::<gtk::Widget>(),
             delay.clone().upcast(),
-            notify.clone().upcast(),
         ];
         for d in &dependents {
             d.set_sensitive(s.resume.enabled);
@@ -249,10 +241,6 @@ fn build_guard_settings(ctx: &Ctx, group: &adw::PreferencesGroup) {
         widgets::on_spin_settled(&delay, move |v| {
             let secs = v.round() as u32;
             s3(Box::new(move |s| s.resume.delay_secs = secs));
-        });
-        notify.connect_active_notify(move |r| {
-            let on = r.is_active();
-            save(Box::new(move |s| s.resume.notify = on));
         });
     });
 }
