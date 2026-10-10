@@ -30,6 +30,7 @@ loads last. Your hand-written config is never rewritten behind your back.
 | **Updates** | Repo and AUR updates in-app: a review screen (unread Arch news, and for every AUR package a PKGBUILD diff plus a security scan you approve), then one password prompt and a progress bar with a live log. AUR packages are built as your user, never as root. Background checks with notifications. Compares detected components (Hyprland, Noctalia, Quickshell, Waybar, hyprlock, …) to their upstream releases, and can switch to or from `-git` packages. Updates Hyprdeck itself (see below). |
 | **Sleep & Wake** | A resume guard saves diagnostics after every wake. If a display comes back dark (for example after an HDMI FRL link-training failure), it resets the display with a DPMS cycle and reload. Also: a "fix black screen" button and optional keybind, journal-based wake history, and GPU power-management checks. |
 | **Tweaks** | Game mode (runtime only), config health (errors, overridden options and binds), Hyprland log viewer. Corsair/OpenLinkHub resume tuning when present. |
+| **Plugins** | Install separately released subprocess plugins, explicitly enable trusted code, view live state and native controls, and check/apply checksum-verified GitHub release updates. Peripheral integrations stay out of the main application. |
 
 Pages and sections adapt to what's installed: missing `ddcutil`, `bluetoothd`, `pacman`, an AUR helper,
 uwsm, Noctalia or an NVIDIA driver hides or explains the related features instead of failing.
@@ -132,13 +133,16 @@ package_updates = "in_app"
 ```
 hyprdeck --help
 hyprdeck --page display               # open on a page (startup, display, input, keybinds, audio,
-                                      #   bluetooth, defaults, updates, sleep, tweaks)
+                                      #   bluetooth, defaults, updates, sleep, tweaks, plugins)
 hyprdeck display rescue               # DPMS off/on + reload: recovers a black screen after wake
 hyprdeck audio toggle                 # simultaneous output on/off
 hyprdeck defaults set browser firefox.desktop
 hyprdeck tweaks gamemode toggle
 hyprdeck updates check
 hyprdeck system diagnose
+hyprdeck plugins list
+hyprdeck plugins install owner/repository
+hyprdeck plugins enable plugin-id     # explicitly trust and activate installed user-code
 ```
 
 ## Files
@@ -148,6 +152,7 @@ hyprdeck system diagnose
 | `~/.config/hyprdeck/*.toml` | Settings, one file per feature |
 | `~/.config/hypr/hyprdeck.lua` | Generated from `hyprland.toml`. `hyprland.lua` gets `require("hyprdeck")` appended the first time you apply a setting |
 | `~/.local/state/hyprdeck/` | Resume diagnostics, update report, release cache |
+| `~/.local/share/hyprdeck/plugins/` | Separately installed plugin manifests and executables (or under `$XDG_DATA_HOME`) |
 
 Hand-written config is only edited when you explicitly ask for it, and only the one line involved:
 disabling a startup command comments out its line, and Default Apps edits a launcher variable.
@@ -163,6 +168,8 @@ The project is a Cargo workspace:
   option schema (parsed from Hyprland's `hl.meta.lua` stubs), the tray registry and UI helpers.
 - `crates/<feature>` (`startup`, `display`, `input`, `audio`, `bluetooth`, `defaults`, `updates`, `system`):
   each exports `pages()`, `start_background()` and `cli()`.
+- `crates/plugins`: external plugin protocol, trusted activation, native control rendering, and
+  checksum-verified independent GitHub release installation/updates. No peripheral backend is bundled.
 - `src/`: window shell, tray host, CLI router.
 
 ```sh
@@ -181,6 +188,18 @@ CI runs fmt, clippy, tests and an AppImage build in an Arch Linux container. Rel
   or to bump the minor/major version.
 - Dependabot PRs are set to auto-merge as soon as their checks pass.
 - Versions come from `vX.Y.Z` tags. Builds between tags report e.g. `0.1.2+5 (abc1234)`.
+
+### Building plugins
+
+Plugins are independent executables, not linked Rust or GTK libraries. Hyprdeck renders their
+versioned JSON state as native controls and executes actions in a separate process. See
+**[docs/PLUGINS.md](docs/PLUGINS.md)** for the complete protocol, build/install examples, trust model,
+and GitHub release/update instructions. Install and enable plugins under **Plugins**, or use
+`hyprdeck plugins install <folder|owner/repo>` followed by `hyprdeck plugins enable <id>`.
+
+Plugins execute as your user and are not sandboxed. Installing is not enabling; only enable code
+and release repositories you trust. Firmware operations, where a plugin genuinely supports them,
+remain explicit actions and are never part of automatic plugin updates.
 
 Issues and pull requests are welcome. Include `hyprdeck --version`, `hyprctl version | head -1` and
 relevant `journalctl --user -u hyprdeck` output in bug reports.

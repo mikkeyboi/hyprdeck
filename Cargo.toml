@@ -34,6 +34,7 @@ hd-bluetooth = { path = "crates/bluetooth" }
 hd-updates = { path = "crates/updates" }
 hd-system = { path = "crates/system" }
 hd-defaults = { path = "crates/defaults" }
+hd-plugins = { path = "crates/plugins" }
 
 [package]
 name = "hyprdeck"
@@ -62,6 +63,7 @@ hd-bluetooth.workspace = true
 hd-updates.workspace = true
 hd-system.workspace = true
 hd-defaults.workspace = true
+hd-plugins.workspace = true
 
 [profile.release]
 lto = "thin"

@@ -141,15 +141,20 @@ the window quits it.
   already makes combine sinks, turn one of them off.
 - **Sleep & Wake:** the resume guard is on by default. After each wake it writes diagnostics to
   `~/.local/state/hyprdeck/resume/`.
+- **Plugins:** peripheral backends are separate releases and are not bundled. See
+  [PLUGINS.md](PLUGINS.md) for build/install instructions. Installing a plugin does not execute it;
+  enabling explicitly trusts unsandboxed code running as the user. Never enable an unrelated plugin
+  or apply its update without the user's authorization. Plugin updates do not flash hardware.
 
 ## 6. Files Hyprdeck owns
 
 | Path | Purpose |
 | --- | --- |
-| `~/.config/hyprdeck/*.toml` | Settings (`app`, `hyprland`, `audio`, `updates`, `system`) |
+| `~/.config/hyprdeck/*.toml` | Feature settings, including `plugins.toml` enabled/trusted plugin IDs |
 | `~/.config/hyprdeck/backup/` | Imported HyprMod file |
 | `~/.config/hypr/hyprdeck.lua` | Generated Hyprland settings, `require`d last by `hyprland.lua` |
 | `~/.local/state/hyprdeck/` | Resume diagnostics, update report, GitHub release cache |
+| `~/.local/share/hyprdeck/plugins/` | External plugin manifests and executables (or under `$XDG_DATA_HOME`) |
 | `~/.config/systemd/user/hyprdeck.service` | Login service |
 
 ## 7. Uninstall
