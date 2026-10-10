@@ -12,6 +12,7 @@ use hyprdeck_core::{
 use serde_json::{Map, Value};
 
 use crate::backend::{self, Installed};
+use crate::controller::ControllerView;
 use crate::protocol::{Control, State};
 use crate::releases;
 
@@ -24,6 +25,7 @@ struct Page {
     source: adw::EntryRow,
     install: gtk::Button,
     reload: gtk::Button,
+    refresh_interval_ms: Cell<u64>,
     busy: Cell<bool>,
     loop_started: Cell<bool>,
     plugins: RefCell<Vec<Rc<PluginView>>>,
@@ -43,6 +45,7 @@ struct Rendered {
     title: gtk::Label,
     description: gtk::Label,
     groups: Vec<(adw::PreferencesGroup, Vec<adw::ActionRow>)>,
+    controllers: Vec<Option<ControllerView>>,
 }
 
 fn label(text: &str) -> gtk::Label {
@@ -90,9 +93,14 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     );
     row.add_suffix(&reload);
     management.add(&row);
-    content.append(&management);
+    let administration = gtk::Expander::builder()
+        .label("Manage plugins")
+        .child(&management)
+        .build();
+    content.append(&administration);
     let status = label("");
     content.append(&status);
+    status.set_visible(false);
     let inventory = gtk::Box::new(gtk::Orientation::Vertical, 24);
     content.append(&inventory);
     let page = Rc::new(Page {
@@ -105,6 +113,7 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         reload,
         busy: Cell::new(false),
         loop_started: Cell::new(false),
+        refresh_interval_ms: Cell::new(2000),
         plugins: RefCell::new(Vec::new()),
     });
     let weak = Rc::downgrade(&page);
@@ -178,7 +187,7 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
                     page.end();
                 }
                 drop(root);
-                glib::timeout_future(Duration::from_secs(2)).await;
+                glib::timeout_future(Duration::from_millis(page.refresh_interval_ms.get())).await;
             }
         });
     });
@@ -195,6 +204,7 @@ impl Page {
         self.install.set_sensitive(false);
         self.reload.set_sensitive(false);
         self.status.set_text(message);
+        self.status.set_visible(message != "Refreshing…");
         true
     }
     fn end(&self) {
@@ -212,10 +222,12 @@ impl Page {
                 | "Changing activation…"
         ) {
             self.status.set_text("");
+            self.status.set_visible(false);
         }
     }
     fn fail(&self, what: &str, error: &anyhow::Error) {
         self.status.set_text(&format!("{what}: {error:#}"));
+        self.status.set_visible(true);
         self.ctx.error(what, error);
     }
     async fn load(self: &PageRef) {
@@ -281,17 +293,22 @@ impl Page {
         updates.add_suffix(&check);
         updates.add_suffix(&update);
         management.add(&updates);
-        container.append(&management);
+        let settings = gtk::Expander::builder()
+            .label(format!("{name} · plugin settings"))
+            .child(&management)
+            .build();
+        container.append(&settings);
         let diagnostics = label(installed.error.as_deref().unwrap_or(if installed.enabled {
             "Waiting for state…"
         } else {
             "Disabled: no backend has been executed."
         }));
         container.append(&diagnostics);
+        diagnostics.add_css_class("dim-label");
         let release = label("");
         container.append(&release);
         let state = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        container.append(&state);
+        container.prepend(&state);
         self.inventory.append(&container);
         let view = Rc::new(PluginView {
             id: installed.id.clone(),
@@ -399,6 +416,7 @@ impl Page {
     }
     async fn refresh(self: &PageRef) {
         let plugins = self.plugins.borrow().clone();
+        self.refresh_interval_ms.set(2000);
         for view in plugins {
             if !view.enabled {
                 continue;
@@ -447,6 +465,11 @@ impl Page {
         });
     }
     fn render(self: &PageRef, view: &Rc<PluginView>, state: State) {
+        self.refresh_interval_ms.set(
+            self.refresh_interval_ms
+                .get()
+                .min(state.refresh_interval_ms),
+        );
         let focused_edit =
             gtk::prelude::GtkWindowExt::focus(&self.ctx.window).is_some_and(|focus| {
                 focus.is_ancestor(&view.state)
@@ -467,11 +490,20 @@ impl Page {
                 let same_shape = old.state.groups.len() == state.groups.len()
                     && old.state.groups.iter().zip(&state.groups).all(|(a, b)| {
                         a.id == b.id
+                            && a.collapsed == b.collapsed
+                            && a.visualization.is_some() == b.visualization.is_some()
                             && a.rows.len() == b.rows.len()
                             && a.rows.iter().zip(&b.rows).all(|(a, b)| a.id == b.id)
                     });
                 if same_shape {
                     old.title.set_text(&state.title);
+                    for (controller, section) in old.controllers.iter().zip(&state.groups) {
+                        if let (Some(controller), Some(visualization)) =
+                            (controller, &section.visualization)
+                        {
+                            controller.update(visualization);
+                        }
+                    }
                     old.description.set_text(&state.description);
                     for ((widgets, old_group), new_group) in
                         old.groups.iter().zip(&old.state.groups).zip(&state.groups)
@@ -524,10 +556,29 @@ impl Page {
         view.state.set_sensitive(true);
         let title = label(&state.title);
         let description = label(&state.description);
+        let has_visualization = state
+            .groups
+            .iter()
+            .any(|section| section.visualization.is_some());
+        title.set_visible(!has_visualization);
+        description.set_visible(!has_visualization);
         view.state.append(&title);
         view.state.append(&description);
         let mut groups = Vec::new();
+        let mut controllers = Vec::new();
         for section in &state.groups {
+            let controller = section.visualization.as_ref().map(|visualization| {
+                let page = Rc::downgrade(self);
+                let target = Rc::downgrade(view);
+                let controller = ControllerView::new(visualization, move |row, control| {
+                    if let (Some(page), Some(view)) = (page.upgrade(), target.upgrade()) {
+                        page.control(&view, row, control);
+                    }
+                });
+                view.state.append(&controller.widget);
+                controller
+            });
+            controllers.push(controller);
             let group = group(&section.title, &section.description);
             let mut rows = Vec::new();
             for item in &section.rows {
@@ -538,7 +589,15 @@ impl Page {
                 group.add(&row);
                 rows.push(row);
             }
-            view.state.append(&group);
+            if section.collapsed {
+                let details = gtk::Expander::builder()
+                    .label(&section.title)
+                    .child(&group)
+                    .build();
+                view.state.append(&details);
+            } else {
+                view.state.append(&group);
+            }
             groups.push((group, rows));
         }
         *view.rendered.borrow_mut() = Some(Rendered {
@@ -546,6 +605,7 @@ impl Page {
             title,
             description,
             groups,
+            controllers,
         });
     }
     fn control(self: &PageRef, view: &Rc<PluginView>, row: &adw::ActionRow, control: Control) {
