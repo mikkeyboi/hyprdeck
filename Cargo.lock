@@ -850,6 +850,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hd-plugins"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "gtk4",
+ "hyprdeck-core",
+ "libadwaita",
+ "libc",
+ "semver",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hd-startup"
 version = "0.1.0"
 dependencies = [
@@ -915,6 +932,7 @@ dependencies = [
  "hd-defaults",
  "hd-display",
  "hd-input",
+ "hd-plugins",
  "hd-startup",
  "hd-system",
  "hd-updates",

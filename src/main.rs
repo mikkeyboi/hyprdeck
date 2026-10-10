@@ -22,8 +22,10 @@ USAGE:
                 self [check | install [--channel stable|nightly]]
       system    diagnose | resume-log
       tweaks    gamemode on|off|toggle
+      plugins   list | install <folder|owner/repo> | enable <id> | disable <id>
+                state <id> | action <id> <action> [JSON args] | check [id] | update <id>
 
-Pages: startup, display, input, keybinds, audio, bluetooth, defaults, updates, sleep, tweaks";
+Pages: startup, display, input, keybinds, audio, bluetooth, defaults, updates, sleep, tweaks, plugins";
 
 type Cli = fn(&[String]) -> Option<anyhow::Result<()>>;
 
@@ -49,7 +51,7 @@ fn main() -> ExitCode {
         println!("hyprdeck {}", hyprdeck_core::version_string());
         return ExitCode::SUCCESS;
     }
-    let clis: [Cli; 8] = [
+    let clis: [Cli; 9] = [
         hd_startup::cli,
         hd_display::cli,
         hd_input::cli,
@@ -58,6 +60,7 @@ fn main() -> ExitCode {
         hd_defaults::cli,
         hd_updates::cli,
         hd_system::cli,
+        hd_plugins::cli,
     ];
     if args.first().is_some_and(|a| !a.starts_with('-')) {
         // Headless commands are often piped (`hyprdeck display list | head`):

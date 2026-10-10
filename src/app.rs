@@ -48,6 +48,7 @@ fn all_pages() -> Vec<PageInfo> {
     pages.extend(hd_defaults::pages());
     pages.extend(hd_updates::pages());
     pages.extend(hd_system::pages());
+    pages.extend(hd_plugins::pages());
     pages
 }
 
@@ -62,6 +63,7 @@ fn start_background_services() {
     hd_defaults::start_background();
     hd_updates::start_background();
     hd_system::start_background();
+    hd_plugins::start_background();
 }
 
 struct Shell {
