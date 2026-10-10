@@ -202,6 +202,15 @@ levels. Front/rear selection opens an input inspector; real backend mapping cont
 the selected input. Missing proprietary mapping/RGB capabilities stay explicitly unavailable, not
 simulated. Technical state and plugin administration remain available under expandable details.
 
+<p align="center">
+  <img src="docs/screenshots/controller-front.png" width="49%" alt="Native plugin controller front view in a neutral theme">
+  <img src="docs/screenshots/controller-rear.png" width="49%" alt="Native plugin controller rear input inspector in a neutral theme">
+</p>
+
+Native controller view with a neutral libadwaita theme and a captured real Wolverine input
+snapshot from the separate [Razer plugin](https://github.com/mikkeyboi/hyprdeck-razer). Rear
+artwork is illustrative; unavailable proprietary mapping and paddle state are labeled explicitly.
+
 Plugins execute as your user and are not sandboxed. Installing is not enabling; only enable code
 and release repositories you trust. Firmware operations, where a plugin genuinely supports them,
 remain explicit actions and are never part of automatic plugin updates.
