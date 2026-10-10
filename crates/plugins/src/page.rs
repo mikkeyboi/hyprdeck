@@ -13,6 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::backend::{self, Installed};
 use crate::controller::ControllerView;
+use crate::products::Products;
 use crate::protocol::{Control, State};
 use crate::releases;
 
@@ -21,6 +22,8 @@ struct Page {
     ctx: Ctx,
     root: glib::WeakRef<gtk::ScrolledWindow>,
     inventory: gtk::Box,
+    navigation: gtk::Stack,
+    integrations: gtk::Box,
     status: gtk::Label,
     source: adw::EntryRow,
     install: gtk::Button,
@@ -39,6 +42,7 @@ struct PluginView {
     update: gtk::Button,
     dirty: Cell<bool>,
     rendered: RefCell<Option<Rendered>>,
+    products: RefCell<Option<Products>>,
 }
 struct Rendered {
     state: State,
@@ -46,6 +50,59 @@ struct Rendered {
     description: gtk::Label,
     groups: Vec<(adw::PreferencesGroup, Vec<adw::ActionRow>)>,
     controllers: Vec<Option<ControllerView>>,
+}
+
+enum FormInput {
+    Number(adw::SpinRow),
+    Text(adw::EntryRow),
+    Color(gtk::ColorDialogButton),
+    Choice(adw::ComboRow, Vec<crate::protocol::OptionItem>),
+    Switch(adw::SwitchRow),
+}
+impl FormInput {
+    fn value(&self) -> Value {
+        match self {
+            Self::Number(row) => {
+                row.update();
+                number_value(row.value())
+            }
+            Self::Text(row) => Value::String(row.text().to_string()),
+            Self::Color(widget) => Value::String(color_hex(&widget.rgba())),
+            Self::Choice(row, options) => {
+                Value::String(options[row.selected() as usize].value.clone())
+            }
+            Self::Switch(row) => Value::Bool(row.is_active()),
+        }
+    }
+}
+fn number_value(value: f64) -> Value {
+    if value.fract() == 0.0 && value >= i64::MIN as f64 && value < -(i64::MIN as f64) {
+        Value::from(value as i64)
+    } else {
+        Value::from(value)
+    }
+}
+fn color_hex(color: &gtk::gdk::RGBA) -> String {
+    format!(
+        "#{:02X}{:02X}{:02X}",
+        (color.red() * 255.0).round() as u8,
+        (color.green() * 255.0).round() as u8,
+        (color.blue() * 255.0).round() as u8
+    )
+}
+fn color_picker(value: &str) -> gtk::ColorDialogButton {
+    let dialog = gtk::ColorDialog::builder()
+        .title("Choose lighting color")
+        .with_alpha(false)
+        .build();
+    let widget = gtk::ColorDialogButton::new(Some(dialog));
+    widget.set_rgba(&gtk::gdk::RGBA::parse(value).expect("validated RGB color"));
+    widget.set_valign(gtk::Align::Center);
+    widget
+}
+fn mark_edit(view: &Rc<PluginView>, row: &adw::ActionRow) {
+    view.dirty.set(true);
+    row.add_css_class("hd-pending-edit");
 }
 
 fn label(text: &str) -> gtk::Label {
@@ -97,16 +154,34 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         .label("Manage plugins")
         .child(&management)
         .build();
-    content.append(&administration);
     let status = label("");
     content.append(&status);
     status.set_visible(false);
+    let integrations = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let installed_heading = label("Installed integrations");
+    installed_heading.add_css_class("title-3");
+    let navigation = gtk::Stack::builder()
+        .hhomogeneous(false)
+        .vhomogeneous(false)
+        .transition_type(gtk::StackTransitionType::SlideLeftRight)
+        .build();
+    let home = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    home.append(&administration);
+    home.append(&installed_heading);
+    home.append(&integrations);
+    let products_heading = label("Your products");
+    products_heading.add_css_class("title-1");
+    home.append(&products_heading);
     let inventory = gtk::Box::new(gtk::Orientation::Vertical, 24);
-    content.append(&inventory);
+    home.append(&inventory);
+    navigation.add_named(&home, Some("products"));
+    content.append(&navigation);
     let page = Rc::new(Page {
         ctx: ctx.clone(),
         root: root.downgrade(),
         inventory,
+        navigation,
+        integrations,
         status,
         source,
         install,
@@ -115,6 +190,12 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         loop_started: Cell::new(false),
         refresh_interval_ms: Cell::new(2000),
         plugins: RefCell::new(Vec::new()),
+    });
+    let scroller = root.downgrade();
+    page.navigation.connect_visible_child_notify(move |_| {
+        if let Some(root) = scroller.upgrade() {
+            root.vadjustment().set_value(0.0);
+        }
     });
     let weak = Rc::downgrade(&page);
     page.install.connect_clicked(move |_| {
@@ -237,6 +318,21 @@ impl Page {
                 while let Some(child) = self.inventory.first_child() {
                     self.inventory.remove(&child);
                 }
+                while let Some(child) = self.integrations.first_child() {
+                    self.integrations.remove(&child);
+                }
+                self.navigation.set_visible_child_name("products");
+                let pages: Vec<_> = self
+                    .navigation
+                    .pages()
+                    .iter::<gtk::StackPage>()
+                    .filter_map(Result::ok)
+                    .filter(|page| page.name().as_deref() != Some("products"))
+                    .map(|page| page.child())
+                    .collect();
+                for child in pages {
+                    self.navigation.remove(&child);
+                }
                 self.plugins.borrow_mut().clear();
                 if plugins.is_empty() {
                     self.inventory.append(&label("No plugins installed. Install a local folder or a repository with a stable binary release."));
@@ -294,19 +390,26 @@ impl Page {
         updates.add_suffix(&update);
         management.add(&updates);
         let settings = gtk::Expander::builder()
-            .label(format!("{name} · plugin settings"))
+            .label(format!(
+                "{name} · {}",
+                if installed.enabled {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
+            ))
             .child(&management)
             .build();
-        container.append(&settings);
+        self.integrations.append(&settings);
         let diagnostics = label(installed.error.as_deref().unwrap_or(if installed.enabled {
             "Waiting for state…"
         } else {
             "Disabled: no backend has been executed."
         }));
-        container.append(&diagnostics);
+        management.add(&diagnostics);
         diagnostics.add_css_class("dim-label");
         let release = label("");
-        container.append(&release);
+        management.add(&release);
         let state = gtk::Box::new(gtk::Orientation::Vertical, 12);
         container.prepend(&state);
         self.inventory.append(&container);
@@ -319,6 +422,7 @@ impl Page {
             update: update.clone(),
             dirty: Cell::new(false),
             rendered: RefCell::new(None),
+            products: RefCell::new(None),
         });
         self.plugins.borrow_mut().push(view.clone());
         let weak = Rc::downgrade(self);
@@ -435,6 +539,9 @@ impl Page {
                     view.diagnostics
                         .set_text(&format!("Backend error (will retry): {error:#}"));
                     view.state.set_sensitive(false);
+                    if let Some(products) = view.products.borrow().as_ref() {
+                        products.disconnect();
+                    }
                 }
             }
         }
@@ -445,6 +552,7 @@ impl Page {
         action: String,
         args: Map<String, Value>,
         destructive: bool,
+        submitted: Option<adw::ActionRow>,
     ) {
         if !self.begin("Running plugin action…") {
             return;
@@ -455,13 +563,20 @@ impl Page {
         ctx.spawn(async move {
             if destructive && !page.ctx.confirm("Run destructive plugin action?", "This action is marked destructive by the plugin. It runs unsandboxed as your user.", "Run action", true).await { page.end(); return; }
             view.state.set_sensitive(false);
+            if let Some(products) = view.products.borrow().as_ref() { products.set_sensitive(false); }
             let id = view.id.clone();
             let result = rt::run(async move { backend::request(&id, Some(&action), args).await }).await;
             match result {
-                Ok(state) => { view.dirty.set(false); view.rendered.borrow_mut().take(); view.diagnostics.set_text("Action completed; refreshed state received."); page.render(&view, state); }
+                Ok(state) => {
+                    if let Some(row) = submitted { row.remove_css_class("hd-pending-edit"); }
+                    view.dirty.set(false);
+                    view.diagnostics.set_text("Action completed; refreshed state received.");
+                    page.render(&view, state);
+                }
                 Err(error) => { view.diagnostics.set_text(&format!("Action failed: {error:#}")); page.ctx.error("Plugin action failed", &error); }
             }
             view.state.set_sensitive(true); page.end();
+            if let Some(products) = view.products.borrow().as_ref() { products.set_sensitive(true); }
         });
     }
     fn render(self: &PageRef, view: &Rc<PluginView>, state: State) {
@@ -470,6 +585,28 @@ impl Page {
                 .get()
                 .min(state.refresh_interval_ms),
         );
+        if !state.products.is_empty() || view.products.borrow().is_some() {
+            if view.products.borrow().is_none() {
+                while let Some(child) = view.state.first_child() {
+                    view.state.remove(&child);
+                }
+                view.rendered.borrow_mut().take();
+                let page = Rc::downgrade(self);
+                let target = Rc::downgrade(view);
+                let products = Products::new(&view.id, &self.navigation, move |row, control| {
+                    if let (Some(page), Some(view)) = (page.upgrade(), target.upgrade()) {
+                        page.control(&view, row, control);
+                    }
+                });
+                view.state.append(&products.widget);
+                *view.products.borrow_mut() = Some(products);
+            }
+            let focus = gtk::prelude::GtkWindowExt::focus(&self.ctx.window);
+            if let Some(products) = view.products.borrow().as_ref() {
+                products.update(&state, false, focus.as_ref());
+            }
+            return;
+        }
         let focused_edit =
             gtk::prelude::GtkWindowExt::focus(&self.ctx.window).is_some_and(|focus| {
                 focus.is_ancestor(&view.state)
@@ -625,7 +762,7 @@ impl Page {
                 let target = Rc::downgrade(view);
                 widget.connect_clicked(move |_| {
                     if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
-                        page.run_action(&view, action.clone(), args.clone(), destructive);
+                        page.run_action(&view, action.clone(), args.clone(), destructive, None);
                     }
                 });
             }
@@ -638,16 +775,26 @@ impl Page {
                     .active(value)
                     .valign(gtk::Align::Center)
                     .build();
+                widget.update_property(&[gtk::accessible::Property::Label(&row.title())]);
                 row.add_suffix(&widget);
+                let apply = button("Apply");
+                row.add_suffix(&apply);
+                let target = Rc::downgrade(view);
+                let edited = row.downgrade();
+                widget.connect_active_notify(move |_| {
+                    if let (Some(view), Some(row)) = (target.upgrade(), edited.upgrade()) {
+                        mark_edit(&view, &row);
+                    }
+                });
                 let weak = Rc::downgrade(self);
                 let target = Rc::downgrade(view);
-                widget.connect_state_set(move |_, value| {
+                let edited = row.downgrade();
+                apply.connect_clicked(move |_| {
                     if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
                         let mut args = args.clone();
-                        args.insert("value".into(), Value::Bool(value));
-                        page.run_action(&view, action.clone(), args, false);
+                        args.insert("value".into(), Value::Bool(widget.is_active()));
+                        page.run_action(&view, action.clone(), args, false, edited.upgrade());
                     }
-                    glib::Propagation::Stop
                 });
             }
             Control::Number {
@@ -666,38 +813,34 @@ impl Page {
                 );
                 widget.set_valign(gtk::Align::Center);
                 widget.set_width_chars(8);
+                widget.update_property(&[gtk::accessible::Property::Label(&row.title())]);
                 let apply = button("Apply");
                 row.add_suffix(&widget);
                 row.add_suffix(&apply);
                 let target = Rc::downgrade(view);
+                let edited = row.downgrade();
                 widget.connect_value_changed(move |_| {
-                    if let Some(view) = target.upgrade() {
-                        view.dirty.set(true);
+                    if let (Some(view), Some(row)) = (target.upgrade(), edited.upgrade()) {
+                        mark_edit(&view, &row);
                     }
                 });
                 let target = Rc::downgrade(view);
+                let edited = row.downgrade();
                 widget.connect_changed(move |_| {
-                    if let Some(view) = target.upgrade() {
-                        view.dirty.set(true);
+                    if let (Some(view), Some(row)) = (target.upgrade(), edited.upgrade()) {
+                        mark_edit(&view, &row);
                     }
                 });
                 let weak = Rc::downgrade(self);
                 let target = Rc::downgrade(view);
+                let edited = row.downgrade();
                 apply.connect_clicked(move |_| {
                     if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
                         widget.update();
-                        let value = widget.value();
-                        let value = if value.fract() == 0.0
-                            && value >= i64::MIN as f64
-                            && value < -(i64::MIN as f64)
-                        {
-                            Value::from(value as i64)
-                        } else {
-                            Value::from(value)
-                        };
+                        let value = number_value(widget.value());
                         let mut args = args.clone();
                         args.insert("value".into(), value);
-                        page.run_action(&view, action.clone(), args, false);
+                        page.run_action(&view, action.clone(), args, false, edited.upgrade());
                     }
                 });
             }
@@ -716,16 +859,27 @@ impl Page {
                         .position(|option| option.value == value)
                         .unwrap_or(0) as u32,
                 );
+                widget.update_property(&[gtk::accessible::Property::Label(&row.title())]);
                 row.add_suffix(&widget);
+                let apply = button("Apply");
+                row.add_suffix(&apply);
+                let target = Rc::downgrade(view);
+                let edited = row.downgrade();
+                widget.connect_selected_notify(move |_| {
+                    if let (Some(view), Some(row)) = (target.upgrade(), edited.upgrade()) {
+                        mark_edit(&view, &row);
+                    }
+                });
                 let weak = Rc::downgrade(self);
                 let target = Rc::downgrade(view);
-                widget.connect_selected_notify(move |widget| {
+                let edited = row.downgrade();
+                apply.connect_clicked(move |_| {
                     if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade())
                         && let Some(option) = options.get(widget.selected() as usize)
                     {
                         let mut args = args.clone();
                         args.insert("value".into(), Value::String(option.value.clone()));
-                        page.run_action(&view, action.clone(), args, false);
+                        page.run_action(&view, action.clone(), args, false, edited.upgrade());
                     }
                 });
             }
@@ -739,22 +893,200 @@ impl Page {
                     .valign(gtk::Align::Center)
                     .max_length(16_384)
                     .build();
+                widget.update_property(&[gtk::accessible::Property::Label(&row.title())]);
                 let apply = button("Apply");
                 row.add_suffix(&widget);
                 row.add_suffix(&apply);
                 let target = Rc::downgrade(view);
+                let edited = row.downgrade();
                 widget.connect_changed(move |_| {
-                    if let Some(view) = target.upgrade() {
-                        view.dirty.set(true);
+                    if let (Some(view), Some(row)) = (target.upgrade(), edited.upgrade()) {
+                        mark_edit(&view, &row);
                     }
                 });
                 let weak = Rc::downgrade(self);
                 let target = Rc::downgrade(view);
+                let edited = row.downgrade();
                 apply.connect_clicked(move |_| {
                     if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
                         let mut args = args.clone();
                         args.insert("value".into(), Value::String(widget.text().to_string()));
-                        page.run_action(&view, action.clone(), args, false);
+                        page.run_action(&view, action.clone(), args, false, edited.upgrade());
+                    }
+                });
+            }
+            Control::Color {
+                value,
+                action,
+                args,
+            } => {
+                let widget = color_picker(&value);
+                widget.update_property(&[gtk::accessible::Property::Label(&row.title())]);
+                let apply = button("Apply");
+                row.add_suffix(&widget);
+                row.add_suffix(&apply);
+                let target = Rc::downgrade(view);
+                let edited = row.downgrade();
+                widget.connect_rgba_notify(move |_| {
+                    if let (Some(view), Some(row)) = (target.upgrade(), edited.upgrade()) {
+                        mark_edit(&view, &row);
+                    }
+                });
+                let weak = Rc::downgrade(self);
+                let target = Rc::downgrade(view);
+                let edited = row.downgrade();
+                apply.connect_clicked(move |_| {
+                    if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
+                        let mut args = args.clone();
+                        args.insert("value".into(), Value::String(color_hex(&widget.rgba())));
+                        page.run_action(&view, action.clone(), args, false, edited.upgrade());
+                    }
+                });
+            }
+            Control::Form {
+                fields,
+                action,
+                args,
+                label: apply_label,
+            } => {
+                // A nested native list keeps related effect/color or DPI stage fields together.
+                let form = gtk::Box::new(gtk::Orientation::Vertical, 8);
+                form.set_hexpand(true);
+                let heading = label(&row.title());
+                heading.add_css_class("heading");
+                row.bind_property("title", &heading, "label")
+                    .sync_create()
+                    .build();
+                form.append(&heading);
+                let description = label(row.subtitle().as_deref().unwrap_or(""));
+                row.bind_property("subtitle", &description, "label")
+                    .sync_create()
+                    .build();
+                description
+                    .set_visible(row.subtitle().is_some_and(|subtitle| !subtitle.is_empty()));
+                form.append(&description);
+                form.set_margin_top(12);
+                form.set_margin_bottom(12);
+                form.set_margin_start(12);
+                form.set_margin_end(12);
+                let list = gtk::ListBox::builder()
+                    .selection_mode(gtk::SelectionMode::None)
+                    .build();
+                list.add_css_class("boxed-list");
+                form.append(&list);
+                let mut inputs = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let target = Rc::downgrade(view);
+                    let edited = row.downgrade();
+                    let changed = move || {
+                        if let (Some(view), Some(row)) = (target.upgrade(), edited.upgrade()) {
+                            mark_edit(&view, &row);
+                        }
+                    };
+                    let input = match field.kind.as_str() {
+                        "number" => {
+                            let step = field.step.expect("validated number step");
+                            let adjustment = gtk::Adjustment::new(
+                                field.value.as_f64().expect("validated number"),
+                                field.min.expect("validated minimum"),
+                                field.max.expect("validated maximum"),
+                                step,
+                                step * 10.0,
+                                0.0,
+                            );
+                            let input = adw::SpinRow::builder()
+                                .use_markup(false)
+                                .adjustment(&adjustment)
+                                .digits(if step.fract() == 0.0 { 0 } else { 6 })
+                                .build();
+                            input.set_title(&field.label);
+                            let changed_value = changed.clone();
+                            input.connect_value_notify(move |_| changed_value());
+                            input.connect_changed(move |_| changed());
+                            list.append(&input);
+                            FormInput::Number(input)
+                        }
+                        "text" => {
+                            let input = adw::EntryRow::builder()
+                                .use_markup(false)
+                                .show_apply_button(false)
+                                .build();
+                            input.set_title(&field.label);
+                            input.set_text(field.value.as_str().expect("validated text"));
+                            input.connect_changed(move |_| changed());
+                            list.append(&input);
+                            FormInput::Text(input)
+                        }
+                        "color" => {
+                            let input =
+                                color_picker(field.value.as_str().expect("validated color"));
+                            input
+                                .update_property(&[gtk::accessible::Property::Label(&field.label)]);
+                            let field_row = action_row(&field.label, "");
+                            field_row.add_suffix(&input);
+                            field_row.set_activatable_widget(Some(&input));
+                            input.connect_rgba_notify(move |_| changed());
+                            list.append(&field_row);
+                            FormInput::Color(input)
+                        }
+                        "choice" => {
+                            let labels: Vec<_> = field
+                                .options
+                                .iter()
+                                .map(|option| option.label.as_str())
+                                .collect();
+                            let model = gtk::StringList::new(&labels);
+                            let input = adw::ComboRow::builder()
+                                .use_markup(false)
+                                .model(&model)
+                                .build();
+                            input.set_title(&field.label);
+                            input.set_selected(
+                                field
+                                    .options
+                                    .iter()
+                                    .position(|option| {
+                                        Some(option.value.as_str()) == field.value.as_str()
+                                    })
+                                    .expect("validated choice")
+                                    as u32,
+                            );
+                            input.connect_selected_notify(move |_| changed());
+                            list.append(&input);
+                            FormInput::Choice(input, field.options)
+                        }
+                        "switch" => {
+                            let input = adw::SwitchRow::builder()
+                                .use_markup(false)
+                                .active(field.value.as_bool().expect("validated boolean"))
+                                .build();
+                            input.set_title(&field.label);
+                            input.connect_active_notify(move |_| changed());
+                            list.append(&input);
+                            FormInput::Switch(input)
+                        }
+                        _ => unreachable!("validated form kind"),
+                    };
+                    inputs.push((field.id, input));
+                }
+                let apply = button(&apply_label);
+                apply.add_css_class("suggested-action");
+                apply.set_halign(gtk::Align::End);
+                form.append(&apply);
+                // Keep related fields full-width even on narrow windows.
+                row.set_child(Some(&form));
+                let weak = Rc::downgrade(self);
+                let target = Rc::downgrade(view);
+                let edited = row.downgrade();
+                apply.connect_clicked(move |_| {
+                    if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
+                        let values: Map<String, Value> = inputs
+                            .iter()
+                            .map(|(id, input)| (id.clone(), input.value()))
+                            .collect();
+                        let mut args = args.clone();
+                        args.insert("value".into(), Value::Object(values));
+                        page.run_action(&view, action.clone(), args, false, edited.upgrade());
                     }
                 });
             }

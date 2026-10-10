@@ -610,6 +610,28 @@ impl Inner {
             }
             return;
         }
+        // Live samples and capability values must not discard an in-progress edit.
+        // Input removal still revokes the action immediately.
+        if control.is_some()
+            && self
+                .shown_control
+                .borrow()
+                .as_ref()
+                .is_some_and(|(old_index, old)| {
+                    *old_index == index
+                        && control.is_some_and(|new| crate::products::compatible_control(old, new))
+                })
+            && self.action_row.borrow().as_ref().is_some_and(|row| {
+                row.has_css_class("hd-pending-edit")
+                    || row
+                        .root()
+                        .and_downcast::<gtk::Window>()
+                        .and_then(|window| gtk::prelude::GtkWindowExt::focus(&window))
+                        .is_some_and(|focus| focus.is_ancestor(row))
+            })
+        {
+            return;
+        }
         // Release sample borrows before invoking the host-provided renderer.
         let next = control.cloned();
         let title = input.map_or(slot.label, |input| &input.label).to_owned();
