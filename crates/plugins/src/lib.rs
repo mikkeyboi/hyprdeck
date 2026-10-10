@@ -1,8 +1,10 @@
 //! External subprocess plugins. No device-specific code or native library loading.
 mod backend;
 mod controller;
+mod illustration;
 mod page;
 mod process;
+mod products;
 mod protocol;
 mod releases;
 

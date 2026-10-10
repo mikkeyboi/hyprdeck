@@ -30,7 +30,7 @@ loads last. Your hand-written config is never rewritten behind your back.
 | **Updates** | Repo and AUR updates in-app: a review screen (unread Arch news, and for every AUR package a PKGBUILD diff plus a security scan you approve), then one password prompt and a progress bar with a live log. AUR packages are built as your user, never as root. Background checks with notifications. Compares detected components (Hyprland, Noctalia, Quickshell, Waybar, hyprlock, …) to their upstream releases, and can switch to or from `-git` packages. Updates Hyprdeck itself (see below). |
 | **Sleep & Wake** | A resume guard saves diagnostics after every wake. If a display comes back dark (for example after an HDMI FRL link-training failure), it resets the display with a DPMS cycle and reload. Also: a "fix black screen" button and optional keybind, journal-based wake history, and GPU power-management checks. |
 | **Tweaks** | Game mode (runtime only), config health (errors, overridden options and binds), Hyprland log viewer. Corsair/OpenLinkHub resume tuning when present. |
-| **Plugins** | Separate trusted subprocess plugins with native controls, live controller diagrams, selectable front/rear inputs, and expandable diagnostics. Mapping controls appear only when supported by the backend. Install/check/apply checksum-verified independent GitHub releases; peripheral backends stay out of the main application. |
+| **Plugins** | Separate trusted integrations with physical-product cards and dedicated device pages. Mouse, receiver and dock components stay together; sensitivity, lighting, buttons/macros and diagnostics have their own sections. Native controller diagrams, color pickers and structured forms use real backend capabilities. Independent checksum-verified plugin releases; no bundled vendor backend. |
 
 Pages and sections adapt to what's installed: missing `ddcutil`, `bluetoothd`, `pacman`, an AUR helper,
 uwsm, Noctalia or an NVIDIA driver hides or explains the related features instead of failing.
@@ -197,10 +197,11 @@ versioned JSON state as native controls and executes actions in a separate proce
 and GitHub release/update instructions. Install and enable plugins under **Plugins**, or use
 `hyprdeck plugins install <folder|owner/repo>` followed by `hyprdeck plugins enable <id>`.
 
-Plugins can declare a native controller visualization with live buttons, stick positions and trigger
-levels. Front/rear selection opens an input inspector; real backend mapping controls can attach to
-the selected input. Missing proprietary mapping/RGB capabilities stay explicitly unavailable, not
-simulated. Technical state and plugin administration remain available under expandable details.
+Plugins can declare physical-product cards with dedicated pages, grouped components, battery
+status, and separate Overview, Sensitivity, Lighting, Buttons & macros and Diagnostics sections.
+Native controller diagrams, color pickers and structured Apply forms expose real capabilities.
+Mouse keyboard-emulation interfaces remain technical diagnostics—not extra hardware cards.
+Unavailable proprietary mapping/RGB controls are identified as missing Linux support, not simulated.
 
 <p align="center">
   <img src="docs/screenshots/controller-front.png" width="49%" alt="Native plugin controller front view in a neutral theme">

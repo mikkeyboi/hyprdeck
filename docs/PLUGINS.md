@@ -182,10 +182,45 @@ Technical groups can set `collapsed: true` to appear under expandable details. V
 refresh in-place, preserving selection and editing. Polling cadence is sampled telemetry, not a
 USB packet-rate guarantee. Hiding the page stops refresh requests.
 
-The host keeps plugin administration under **Manage plugins**, and each installed plugin's
-activation/release controls under **plugin settings**. Controller cards appear first. The rear
-layout is illustrative; displayed readings and mapping availability always come from the plugin.
+The host keeps administration under **Manage plugins**. Plugins declaring products show a gallery
+of hardware cards, each opening a dedicated page. The controller rear layout remains illustrative;
+displayed readings and mapping availability always come from the plugin.
 
+
+### Product cards and device pages
+
+Optional `state.products` groups physical products, not USB interfaces. A Basilisk mouse, receiver
+and associated charging dock can be one product; keyboard-emulation interfaces remain Diagnostics.
+Legacy plugins without products keep their original group view.
+
+```json
+{
+  "id":"basilisk-ultimate",
+  "name":"Basilisk Ultimate",
+  "kind":"mouse",
+  "description":"Mouse, wireless receiver and charging dock",
+  "status":"Connected",
+  "connection":"2.4 GHz USB receiver",
+  "battery":{"percentage":72.0,"charging":false,"source":"OpenRazer"},
+  "sections":[
+    {"id":"overview","title":"Overview","groups":["mouse-overview"]},
+    {"id":"lighting","title":"Lighting","groups":["mouse-lighting","dock-lighting"]},
+    {"id":"diagnostics","title":"Diagnostics","groups":["usb-details"]}
+  ]
+}
+```
+
+Product ids use the same safe-id rules as plugin ids, and must be unique. `kind` is `mouse`,
+`controller`, `dock` or `peripheral`, selecting native artwork—not a plugin-supplied executable or
+remote image. Names and displayed strings are plain text. At most 64 products and 12 sections per
+product; section ids are unique and every group reference must resolve to an existing group.
+Battery can be null; its percentage can be null or finite 0–100, charging can be null or Boolean,
+and source identifies the actual provider. Unknown values are not estimates.
+
+Sections become device-page tabs. Use Overview, Sensitivity, Lighting, Buttons & macros, and
+Diagnostics as appropriate; do not publish unavailable controls as a supported capability. Mouse
+mapping through a Linux remapper must be labeled software remapping, not onboard profile writes.
+Leaving a device page uses Back, Escape or Alt-Left. Device removal disables stale controls.
 
 ## Native declarative controls
 
@@ -201,7 +236,8 @@ Native button; sends exactly its action/args on click. `destructive` defaults to
 {"kind":"switch","value":false,"action":"set","args":{"device":"stable-id","setting":"lighting"}}
 ```
 
-Native switch; after a user toggle the host inserts Boolean `args.value`. The backend's refreshed response determines the displayed value, not an optimistic write.
+Native switch with an explicit Apply button. Apply inserts Boolean `args.value`; changing the
+widget alone never writes the device. Refreshed backend state determines the displayed value.
 
 ```json
 {"kind":"number","value":500,"min":125,"max":1000,"step":125,"action":"set","args":{"device":"stable-id","setting":"polling"}}
@@ -213,13 +249,39 @@ Native spin control and Apply button. Values/bounds/step must be finite; `min <=
 {"kind":"choice","value":"500","options":[{"value":"125","label":"125 Hz"},{"value":"500","label":"500 Hz"}],"action":"set","args":{"device":"stable-id","setting":"polling"}}
 ```
 
-Native dropdown; user selection inserts string `args.value`. There must be 1–256 options, unique option values and a current value present in the options. Labels are plain text.
+Native dropdown with Apply. Apply inserts string `args.value`. There must be 1–256 options, unique
+values and a current value present in the options. Selection alone never writes hardware.
 
 ```json
 {"kind":"text","value":"#00ff00","action":"set","args":{"device":"stable-id","setting":"color"}}
 ```
 
 Native text entry and Apply button; Apply inserts string `args.value`. The backend owns validation (e.g. color syntax). Number/text Apply avoids accidental writes during rendering. `args.value` supplied by a control is overwritten with the user's selected value of the corresponding JSON type. Rendering or refreshing never sends an action.
+
+```json
+{"kind":"color","value":"#00ff80","action":"configure-lighting","args":{"device":"serial","zone":"logo"}}
+```
+
+Native color picker plus Apply; `args.value` is a `#RRGGBB` string. Color selection or refreshing
+does not invoke an action. The backend must validate the target device, zone and supported method.
+
+```json
+{
+  "kind":"form","label":"Apply lighting","action":"configure-lighting","args":{"device":"serial"},
+  "fields":[
+    {"id":"effect","label":"Effect","kind":"choice","value":"static","options":[{"value":"static","label":"Static"}]},
+    {"id":"color","label":"Color","kind":"color","value":"#00ff80"},
+    {"id":"brightness","label":"Brightness","kind":"number","value":50,"min":0,"max":100,"step":1}
+  ]
+}
+```
+
+Forms group related native fields and send one explicit Apply action. `args.value` is an object
+keyed by each field id. Field kinds are `number`, `switch`, `text`, `choice`, and `color`; values
+use their corresponding JSON type. Number fields require finite min/max/step bounds, and choice
+fields require real options/current values. At most 32 fields, unique safe ids. The backend owns
+operation sequencing and capability validation. Pending or focused field edits survive live updates.
+
 
 The mapped Plugins page refreshes after completing its previous request, using the shortest enabled
 plugin interval (default two seconds; validated 250–10,000 ms). Requests/actions remain serialized

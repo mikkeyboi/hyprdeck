@@ -136,6 +136,113 @@ pub struct State {
     pub groups: Vec<Group>,
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval_ms: u64,
+    #[serde(default)]
+    pub products: Vec<Product>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Product {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub description: String,
+    pub status: String,
+    pub connection: String,
+    #[serde(default)]
+    pub battery: Option<Battery>,
+    pub sections: Vec<ProductSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Battery {
+    pub percentage: Option<f64>,
+    pub charging: Option<bool>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProductSection {
+    pub id: String,
+    pub title: String,
+    pub groups: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FormField {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub value: Value,
+    #[serde(default)]
+    pub min: Option<f64>,
+    #[serde(default)]
+    pub max: Option<f64>,
+    #[serde(default)]
+    pub step: Option<f64>,
+    #[serde(default)]
+    pub options: Vec<OptionItem>,
+}
+
+pub fn color_value(value: &str) -> bool {
+    value.len() == 7
+        && value.starts_with('#')
+        && value.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+}
+
+impl FormField {
+    fn validate(&self) -> Result<()> {
+        ensure!(valid_id(&self.id), "invalid form field id");
+        text(&self.label, "form label", true)?;
+        match self.kind.as_str() {
+            "number" => {
+                let value = self.value.as_f64();
+                ensure!(
+                    value.is_some_and(f64::is_finite)
+                        && self.min.is_some_and(f64::is_finite)
+                        && self.max.is_some_and(f64::is_finite)
+                        && self.step.is_some_and(|step| step.is_finite() && step > 0.0),
+                    "invalid form number bounds"
+                );
+                ensure!(
+                    self.min <= value && value <= self.max,
+                    "form number outside bounds"
+                );
+            }
+            "switch" => ensure!(self.value.is_boolean(), "form switch must be boolean"),
+            "text" => text(
+                self.value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("form text must be string"))?,
+                "form value",
+                false,
+            )?,
+            "color" => ensure!(
+                self.value.as_str().is_some_and(color_value),
+                "form color must be #RRGGBB"
+            ),
+            "choice" => {
+                ensure!(
+                    !self.options.is_empty() && self.options.len() <= 256,
+                    "invalid form choices"
+                );
+                let mut values = HashSet::new();
+                for option in &self.options {
+                    text(&option.value, "form option", false)?;
+                    text(&option.label, "form option label", true)?;
+                    ensure!(values.insert(&option.value), "duplicate form option");
+                }
+                ensure!(
+                    self.value.as_str().is_some_and(|value| self
+                        .options
+                        .iter()
+                        .any(|option| option.value == value)),
+                    "form choice absent from options"
+                );
+            }
+            _ => anyhow::bail!("unsupported form field kind"),
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -311,6 +418,24 @@ pub enum Control {
         #[serde(default)]
         args: Map<String, Value>,
     },
+    Color {
+        value: String,
+        action: String,
+        #[serde(default)]
+        args: Map<String, Value>,
+    },
+    Form {
+        fields: Vec<FormField>,
+        action: String,
+        #[serde(default)]
+        args: Map<String, Value>,
+        #[serde(default = "default_apply_label")]
+        label: String,
+    },
+}
+
+fn default_apply_label() -> String {
+    "Apply".into()
 }
 
 pub fn text(value: &str, what: &str, required: bool) -> Result<()> {
@@ -357,6 +482,50 @@ impl State {
                 text(&row.subtitle, "row subtitle", false)?;
                 if let Some(control) = &row.control {
                     control.validate()?;
+                }
+            }
+        }
+        ensure!(self.products.len() <= 64, "too many products");
+        let mut products = HashSet::new();
+        for product in &self.products {
+            ensure!(
+                valid_id(&product.id) && products.insert(&product.id),
+                "invalid or duplicate product id"
+            );
+            ensure!(
+                matches!(
+                    product.kind.as_str(),
+                    "mouse" | "controller" | "dock" | "peripheral"
+                ),
+                "unsupported product depiction"
+            );
+            text(&product.name, "product name", true)?;
+            for value in [&product.description, &product.status, &product.connection] {
+                text(value, "product text", false)?;
+            }
+            if let Some(battery) = &product.battery {
+                ensure!(
+                    battery
+                        .percentage
+                        .is_none_or(|value| value.is_finite() && (0.0..=100.0).contains(&value)),
+                    "invalid battery percentage"
+                );
+                text(&battery.source, "battery source", false)?;
+            }
+            ensure!(product.sections.len() <= 12, "too many product sections");
+            let mut sections = HashSet::new();
+            for section in &product.sections {
+                ensure!(
+                    valid_id(&section.id) && sections.insert(&section.id),
+                    "invalid or duplicate section id"
+                );
+                text(&section.title, "section title", true)?;
+                let mut refs = HashSet::new();
+                for id in &section.groups {
+                    ensure!(
+                        groups.contains(id) && refs.insert(id),
+                        "unknown or duplicate product group reference"
+                    );
                 }
             }
         }
@@ -417,6 +586,28 @@ impl Control {
             }
             Self::Text { value, action, .. } => {
                 text(value, "text value", false)?;
+                action
+            }
+            Self::Color { value, action, .. } => {
+                ensure!(color_value(value), "color must be #RRGGBB");
+                action
+            }
+            Self::Form {
+                fields,
+                action,
+                label,
+                ..
+            } => {
+                ensure!(
+                    !fields.is_empty() && fields.len() <= 32,
+                    "form must have 1..32 fields"
+                );
+                text(label, "form apply label", true)?;
+                let mut ids = HashSet::new();
+                for field in fields {
+                    field.validate()?;
+                    ensure!(ids.insert(&field.id), "duplicate form field id");
+                }
                 action
             }
         };
@@ -506,5 +697,50 @@ mod tests {
         let mut invalid = input;
         invalid.x = Some(-1.1);
         assert!(visualization(vec![invalid]).validate().is_err());
+    }
+
+    #[test]
+    fn product_references_and_battery_bounds_are_validated() {
+        let base = serde_json::json!({"title":"Devices","groups":[{"id":"overview","title":"Overview","rows":[]}],"products":[{"id":"mouse","name":"Mouse","kind":"mouse","description":"","status":"Connected","connection":"USB","battery":{"percentage":75.0,"charging":false,"source":"device"},"sections":[{"id":"overview","title":"Overview","groups":["overview"]}]}]});
+        let mut missing = base.clone();
+        missing["products"][0]["sections"][0]["groups"] = serde_json::json!(["missing"]);
+        assert!(
+            serde_json::from_value::<State>(missing)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        let mut invalid = base.clone();
+        invalid["products"][0]["battery"]["percentage"] = serde_json::json!(101.0);
+        assert!(
+            serde_json::from_value::<State>(invalid)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        let mut duplicate = base.clone();
+        duplicate["products"][0]["sections"]
+            .as_array_mut()
+            .unwrap()
+            .push(base["products"][0]["sections"][0].clone());
+        assert!(
+            serde_json::from_value::<State>(duplicate)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn structured_controls_reject_invalid_colors_and_field_values() {
+        let invalid: Control = serde_json::from_value(
+            serde_json::json!({"kind":"color","value":"red","action":"set"}),
+        )
+        .unwrap();
+        assert!(invalid.validate().is_err());
+        let invalid: Control = serde_json::from_value(serde_json::json!({"kind":"form","action":"set","fields":[{"id":"dpi","label":"DPI","kind":"number","value":900,"min":100,"max":800,"step":100}]})).unwrap();
+        assert!(invalid.validate().is_err());
+        let invalid: Control = serde_json::from_value(serde_json::json!({"kind":"form","action":"set","fields":[{"id":"effect","label":"Effect","kind":"choice","value":"missing","options":[{"value":"static","label":"Static"}]}]})).unwrap();
+        assert!(invalid.validate().is_err());
     }
 }
