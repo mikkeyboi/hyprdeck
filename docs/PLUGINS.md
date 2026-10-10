@@ -136,6 +136,57 @@ Each request has a **15-second** deadline. Stdout is bounded to 1 MiB and stderr
 
 State supports at most 128 groups and 1,024 total rows. Group ids must be unique in a state; row ids must be unique within a group. Keep ids stable across refreshes and hardware enumeration changes. Group/row titles and ids must be nonempty. Dynamic strings are displayed literally, including `<`, `>` and `&`.
 
+### Peripheral visualization
+
+API 1 also accepts optional `state.refresh_interval_ms` (250–10,000 ms, default 2,000),
+`group.collapsed` (default false), and `group.visualization`. These are additive: older hosts
+still show the group's ordinary rows. Always provide useful rows as a fallback.
+
+The native controller card has front/rear views, live input highlights, stick positions and trigger
+levels. Click a hotspot or use its keyboard-accessible selector to inspect an input. An optional
+declarative `control` on that input provides real mapping/configuration UI; absence means inspection
+only. The host never infers that a controller supports onboard remapping or RGB writes.
+
+```json
+{
+  "id": "controller",
+  "title": "Controller",
+  "description": "Live input",
+  "collapsed": false,
+  "rows": [],
+  "visualization": {
+    "kind": "controller",
+    "name": "Controller",
+    "connection": "USB receiver",
+    "status": "Sampled live input; onboard mapping unavailable",
+    "inputs": [
+      {"id":"a","label":"A","detail":"Standard input","pressed":false},
+      {"id":"left_stick","label":"Left stick","detail":"Normalized position","x":0.0,"y":0.0},
+      {"id":"lt","label":"Left trigger","detail":"Analog travel","value":0.0},
+      {"id":"m3","label":"M3","detail":"Independent paddle state unavailable","pressed":null}
+    ]
+  }
+}
+```
+
+Input ids are `a`, `b`, `x`, `y`, `lb`, `rb`, `lt`, `rt`, `left_stick`, `right_stick`,
+`dpad_up`, `dpad_down`, `dpad_left`, `dpad_right`, `view`, `menu`, `guide`, and `m1`–`m6`.
+Ids must be unique, with at most 32 inputs. `label` is nonempty; `detail` is plain text.
+`pressed` is Boolean or null (unavailable), `value` is a finite 0–1 trigger level, and `x`/`y`
+are finite −1–1 stick positions. Missing readings are unavailable, not released/centered claims.
+`control` uses the existing native control schema below and must correspond to an actual backend
+capability. Different peripheral layouts can be added as new validated visualization kinds without
+bundling vendor backends. Arbitrary plugin SVG, HTML or executable UI scripts are not accepted.
+
+Technical groups can set `collapsed: true` to appear under expandable details. Visualization values
+refresh in-place, preserving selection and editing. Polling cadence is sampled telemetry, not a
+USB packet-rate guarantee. Hiding the page stops refresh requests.
+
+The host keeps plugin administration under **Manage plugins**, and each installed plugin's
+activation/release controls under **plugin settings**. Controller cards appear first. The rear
+layout is illustrative; displayed readings and mapping availability always come from the plugin.
+
+
 ## Native declarative controls
 
 A row's `control` is null for information or one of the following objects. `action` is a nonempty backend-defined string (at most 128 bytes); `args` defaults to `{}`. The host interprets **no commands or device protocols**. The plugin must validate every action and argument against its real capabilities and report errors for missing devices, unsupported writes or permissions.
@@ -170,7 +221,12 @@ Native dropdown; user selection inserts string `args.value`. There must be 1–2
 
 Native text entry and Apply button; Apply inserts string `args.value`. The backend owns validation (e.g. color syntax). Number/text Apply avoids accidental writes during rendering. `args.value` supplied by a control is overwritten with the user's selected value of the corresponding JSON type. Rendering or refreshing never sends an action.
 
-The mapped Plugins page refreshes state with a two-second interval after completing its last refresh. Requests/actions are serialized without overlaps, including across host CLI processes through a file lock; no process, network request or blocking lock acquisition runs on GTK's main thread. Information-only changes update existing labels/rows rather than rebuilding controls. Unchanged state does not rebuild. Pending number/text edits are preserved until Apply or Reload; focus in an editable control also prevents rebuilding it, while other same-shape labels still refresh. Backend failures disable stale controls, display the error and retry while mapped; successful recovery re-enables them. Closing/hiding the page stops starting refreshes (an already-started request finishes under its deadline).
+The mapped Plugins page refreshes after completing its previous request, using the shortest enabled
+plugin interval (default two seconds; validated 250–10,000 ms). Requests/actions remain serialized
+across GUI and CLI through a file lock. Blocking work never runs on GTK's main thread. Same-shape
+information and controller readings update existing widgets; pending edits and selected inputs are
+preserved. Backend failures disable stale controls, show the error, and retry while mapped. Hiding
+the page stops new refreshes; an already-started request may finish under its deadline.
 
 ## A complete minimal plugin
 

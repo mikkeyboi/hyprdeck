@@ -30,7 +30,7 @@ loads last. Your hand-written config is never rewritten behind your back.
 | **Updates** | Repo and AUR updates in-app: a review screen (unread Arch news, and for every AUR package a PKGBUILD diff plus a security scan you approve), then one password prompt and a progress bar with a live log. AUR packages are built as your user, never as root. Background checks with notifications. Compares detected components (Hyprland, Noctalia, Quickshell, Waybar, hyprlock, …) to their upstream releases, and can switch to or from `-git` packages. Updates Hyprdeck itself (see below). |
 | **Sleep & Wake** | A resume guard saves diagnostics after every wake. If a display comes back dark (for example after an HDMI FRL link-training failure), it resets the display with a DPMS cycle and reload. Also: a "fix black screen" button and optional keybind, journal-based wake history, and GPU power-management checks. |
 | **Tweaks** | Game mode (runtime only), config health (errors, overridden options and binds), Hyprland log viewer. Corsair/OpenLinkHub resume tuning when present. |
-| **Plugins** | Install separately released subprocess plugins, explicitly enable trusted code, view live state and native controls, and check/apply checksum-verified GitHub release updates. Peripheral integrations stay out of the main application. |
+| **Plugins** | Separate trusted subprocess plugins with native controls, live controller diagrams, selectable front/rear inputs, and expandable diagnostics. Mapping controls appear only when supported by the backend. Install/check/apply checksum-verified independent GitHub releases; peripheral backends stay out of the main application. |
 
 Pages and sections adapt to what's installed: missing `ddcutil`, `bluetoothd`, `pacman`, an AUR helper,
 uwsm, Noctalia or an NVIDIA driver hides or explains the related features instead of failing.
@@ -196,6 +196,11 @@ versioned JSON state as native controls and executes actions in a separate proce
 **[docs/PLUGINS.md](docs/PLUGINS.md)** for the complete protocol, build/install examples, trust model,
 and GitHub release/update instructions. Install and enable plugins under **Plugins**, or use
 `hyprdeck plugins install <folder|owner/repo>` followed by `hyprdeck plugins enable <id>`.
+
+Plugins can declare a native controller visualization with live buttons, stick positions and trigger
+levels. Front/rear selection opens an input inspector; real backend mapping controls can attach to
+the selected input. Missing proprietary mapping/RGB capabilities stay explicitly unavailable, not
+simulated. Technical state and plugin administration remain available under expandable details.
 
 Plugins execute as your user and are not sandboxed. Installing is not enabling; only enable code
 and release repositories you trust. Firmware operations, where a plugin genuinely supports them,
