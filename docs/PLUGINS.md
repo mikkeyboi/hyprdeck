@@ -18,7 +18,11 @@ Only install compatible Linux assets for the host architecture. The executable a
 
 ## Install, run, and manage
 
-Open **Plugins** in the sidebar (`hyprdeck --page plugins`). Enter an existing local folder or `owner/repo`, click Install, then review the plugin and explicitly enable it. Each installed plugin shows its identity/version/repository, enable/disable, backend diagnostics, state groups/controls, and release check/update buttons. Failed manifests remain visible with a useful error instead of disappearing. Reload installed plugins picks up changes made by the CLI and discards pending edits.
+Open **Plugins** in the sidebar (`hyprdeck --page plugins`) to manage installation, trust,
+activation and independent releases. Installed integrations appear as indented child entries;
+select one, or run `hyprdeck --page plugin:<id>`, for its product experience. Management and
+device controls are separate pages. The manager does not poll device backends. Disabled and
+invalid installations show explicit status; enabling still requires trust and an API handshake.
 
 Headless commands:
 
@@ -182,9 +186,10 @@ Technical groups can set `collapsed: true` to appear under expandable details. V
 refresh in-place, preserving selection and editing. Polling cadence is sampled telemetry, not a
 USB packet-rate guarantee. Hiding the page stops refresh requests.
 
-The host keeps administration under **Manage plugins**. Plugins declaring products show a gallery
-of hardware cards, each opening a dedicated page. The controller rear layout remains illustrative;
-displayed readings and mapping availability always come from the plugin.
+The **Plugins** manager handles installation, activation and updates separately. Installed
+integrations have nested sidebar entries leading to their product cards and device pages.
+The controller rear layout remains illustrative; readings and mapping availability come from
+the backend rather than a claim that the host can configure every physical control.
 
 
 ### Product cards and device pages
@@ -281,6 +286,37 @@ keyed by each field id. Field kinds are `number`, `switch`, `text`, `choice`, an
 use their corresponding JSON type. Number fields require finite min/max/step bounds, and choice
 fields require real options/current values. At most 32 fields, unique safe ids. The backend owns
 operation sequencing and capability validation. Pending or focused field edits survive live updates.
+
+### DPI editor
+
+```json
+{
+  "kind":"dpi","x":800,"y":800,"min":100,"max":20000,"step":50,"linked":true,
+  "storage":"host","active":"stage-2",
+  "stages":[
+    {"id":"stage-1","label":"400 DPI","x":400,"y":400},
+    {"id":"stage-2","label":"800 DPI","x":800,"y":800},
+    {"id":"stage-3","label":"1600 DPI","x":1600,"y":1600}
+  ],
+  "action":"dpi-presets","args":{"device":"serial"}
+}
+```
+
+The native editor links horizontal/vertical values, provides explicit Apply, editable named
+presets, sample stages, and Previous/Next selection. It sends an object in `args.value`:
+`{"operation":"apply","x":800,"y":800,"linked":true}`, or
+`{"operation":"save","linked":true,"stages":[...]}`. Stage Use applies visible values;
+Previous/Next operate on saved presets. The backend owns persistence and hardware calls.
+Saving host presets must not write the mouse; hardware configuration always requires explicit
+application. `storage` is `host` or `device` and must describe the actual implementation.
+
+`x`/`y` can be null when readback is unavailable; the editor labels manual pending values rather
+than inventing current state. Present values and all stage values must be finite integers within
+min/max (1–65535); step is a positive finite UI increment, not a hardware protocol guarantee.
+There are 1–8 unique safe stage ids, with nonempty labels. `active` is null or an existing stage id
+and must reflect actual readback. Host presets are not silently synced to onboard memory or the
+mouse's physical DPI-cycle button. A backend should expose onboard stages only with a verified API.
+
 
 
 The mapped Plugins page refreshes after completing its previous request, using the shortest enabled
@@ -468,15 +504,20 @@ An interrupted staging/download leaves the previous installation intact. Cancell
 
 ## Host integration and regression checks
 
-The `hd-plugins` feature crate exports the same interfaces as existing features:
+The `hd-plugins` crate exports the existing feature interfaces plus metadata-only integration pages:
 
 ```rust
 pub fn pages() -> Vec<hyprdeck_core::ui::PageInfo>;
 pub fn start_background();
 pub fn cli(args: &[String]) -> Option<anyhow::Result<()>>;
+pub fn installed_pages() -> anyhow::Result<Vec<PluginPage>>;
+pub fn build_plugin(ctx: &hyprdeck_core::ui::Ctx, id: &str) -> gtk::Widget;
 ```
 
-`pages()` contributes sidebar id `plugins`; no `PageInfo` API changes are needed. CLI dispatch takes the full feature argument list beginning with `plugins`.
+`pages()` contributes manager id `plugins`; `PluginPage` owns `id`, `name` and `enabled` metadata
+for valid installations. The shell polls inventory without executing backends, preserves selected
+pages and widgets, and routes `plugin:<id>` to `build_plugin`. Builtin `PageInfo` is unchanged.
+CLI dispatch still takes the full argument list beginning with `plugins`.
 
 Permanent regression coverage targets safe paths/symlink rejection, API/architecture/version/repository identity, exact checksum assets, bounded stdout/deadline handling, malformed response/backend error boundaries, atomic exchange failure, enabled handshake rollback retaining the old runnable manifest/binary, and disabled updates not executing a candidate. Run from the host workspace:
 

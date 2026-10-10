@@ -531,6 +531,21 @@ impl ControllerView {
             self.inner.refresh_inspector();
         }
     }
+
+    pub(crate) fn show_header(&self, visible: bool) {
+        if self.inner.name.is_visible() == visible {
+            return;
+        }
+        self.inner.name.set_visible(visible);
+        self.inner.connection.set_visible(visible);
+        let mut child = self.widget.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            if widget.has_css_class("hd-controller-eyebrow") {
+                widget.set_visible(visible);
+            }
+        }
+    }
 }
 
 impl Inner {

@@ -8,7 +8,7 @@ use gtk::glib;
 
 use crate::controller::ControllerView;
 use crate::illustration;
-use crate::protocol::{Control, Group, Product, State};
+use crate::protocol::{Control, Group, Product, State, Visualization};
 
 type ControlRenderer = Rc<dyn Fn(&adw::ActionRow, Control)>;
 
@@ -92,6 +92,7 @@ fn control_target(control: &Control) -> (&str, &serde_json::Map<String, serde_js
         | Control::Choice { action, args, .. }
         | Control::Text { action, args, .. }
         | Control::Color { action, args, .. }
+        | Control::Dpi { action, args, .. }
         | Control::Form { action, args, .. } => (action, args),
     }
 }
@@ -117,6 +118,29 @@ pub(crate) fn compatible_control(old: &Control, new: &Control) -> bool {
                 ..
             },
         ) => (a, b, c) == (x, y, z),
+        (
+            Control::Dpi {
+                min: a,
+                max: b,
+                step: c,
+                stages: old,
+                storage: old_storage,
+                ..
+            },
+            Control::Dpi {
+                min: x,
+                max: y,
+                step: z,
+                stages: new,
+                storage: new_storage,
+                ..
+            },
+        ) => {
+            (a, b, c) == (x, y, z)
+                && old_storage == new_storage
+                && old.len() == new.len()
+                && old.iter().zip(new).all(|(a, b)| a.id == b.id)
+        }
         (Control::Choice { options: a, .. }, Control::Choice { options: b, .. }) => a == b,
         (Control::Form { fields: a, .. }, Control::Form { fields: b, .. }) => {
             a.len() == b.len()
@@ -173,6 +197,7 @@ impl Products {
                     view.sections.remove(&section);
                 }
                 view.connection.set_text("Disconnected");
+                view.name.set_visible(true);
                 view.battery.set_visible(false);
                 view.tabs.set_visible(false);
                 view.body.append(&text("This product is no longer available. Return to Products to choose a connected device.", "dim-label"));
@@ -467,17 +492,37 @@ impl ProductView {
                     section_box.remove(&group.widget);
                 }
             }
-            for id in &section.groups {
-                let Some(group) = state.groups.iter().find(|group| &group.id == id) else {
-                    continue;
-                };
-                if !groups.contains_key(id) {
+            let prioritize_diagram = section.id == "overview" && product.kind == "controller";
+            let assigned = || {
+                section
+                    .groups
+                    .iter()
+                    .filter_map(|id| state.groups.iter().find(|group| &group.id == id))
+            };
+            let ordered = assigned()
+                .filter(|group| prioritize_diagram && group.visualization.is_some())
+                .chain(
+                    assigned().filter(|group| !prioritize_diagram || group.visualization.is_none()),
+                );
+            let mut previous: Option<gtk::Widget> = None;
+            for group in ordered {
+                if !groups.contains_key(&group.id) {
                     let rendered = GroupView::new(group, render);
                     section_box.append(&rendered.widget);
-                    groups.insert(id.clone(), rendered);
+                    groups.insert(group.id.clone(), rendered);
                 }
-                let rendered = groups.get_mut(id).expect("group inserted");
+                let rendered = groups.get_mut(&group.id).expect("group inserted");
                 rendered.update(group, render, preserve, focus);
+                if let Some(controller) = &rendered.controller {
+                    let duplicate = matches!(&group.visualization, Some(Visualization::Controller { name, .. }) if name == &product.name);
+                    controller.show_header(!duplicate);
+                }
+                if prioritize_diagram {
+                    if rendered.widget.prev_sibling() != previous {
+                        section_box.reorder_child_after(&rendered.widget, previous.as_ref());
+                    }
+                    previous = Some(rendered.widget.clone().upcast());
+                }
             }
         }
     }
@@ -624,6 +669,12 @@ impl GroupView {
                 (None, None) => true,
                 _ => false,
             };
+            if editing
+                && same_action
+                && let Some(control @ Control::Dpi { .. }) = &item.control
+            {
+                crate::dpi::update(row.upcast_ref(), control);
+            }
             if self.state.rows[index].control != item.control && (!editing || !same_action) {
                 let replacement = adw::ActionRow::builder().use_markup(false).build();
                 replacement.set_title(&item.title);

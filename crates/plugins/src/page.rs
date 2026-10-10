@@ -21,28 +21,42 @@ type PageRef = Rc<Page>;
 struct Page {
     ctx: Ctx,
     root: glib::WeakRef<gtk::ScrolledWindow>,
-    inventory: gtk::Box,
     navigation: gtk::Stack,
+    status: gtk::Label,
+    manager: gtk::Button,
+    refresh_interval_ms: Cell<u64>,
+    busy: Cell<bool>,
+    loop_started: Cell<bool>,
+    view: Rc<PluginView>,
+}
+struct PluginView {
+    id: String,
+    state: gtk::Box,
+    diagnostics: gtk::Label,
+    dirty: Cell<bool>,
+    rendered: RefCell<Option<Rendered>>,
+    products: RefCell<Option<Products>>,
+}
+
+type ManagerRef = Rc<Manager>;
+struct Manager {
+    ctx: Ctx,
+    root: glib::WeakRef<gtk::ScrolledWindow>,
     integrations: gtk::Box,
     status: gtk::Label,
     source: adw::EntryRow,
     install: gtk::Button,
     reload: gtk::Button,
-    refresh_interval_ms: Cell<u64>,
     busy: Cell<bool>,
     loop_started: Cell<bool>,
-    plugins: RefCell<Vec<Rc<PluginView>>>,
+    installed: RefCell<Vec<Installed>>,
 }
-struct PluginView {
+
+struct InstalledView {
     id: String,
     enabled: bool,
-    state: gtk::Box,
-    diagnostics: gtk::Label,
     release: gtk::Label,
-    update: gtk::Button,
-    dirty: Cell<bool>,
-    rendered: RefCell<Option<Rendered>>,
-    products: RefCell<Option<Products>>,
+    update: glib::WeakRef<gtk::Button>,
 }
 struct Rendered {
     state: State,
@@ -134,53 +148,40 @@ fn button(text: &str) -> gtk::Button {
 
 pub fn build(ctx: &Ctx) -> gtk::Widget {
     let (root, content) = ui::page_scaffold();
-    let management = group("External plugins", backend::TRUST);
+    let management = group(
+        "Install a plugin",
+        "Installing copies files without running the plugin. Activate installed plugins separately after reviewing their publisher.",
+    );
     let source = adw::EntryRow::builder()
         .use_markup(false)
         .show_apply_button(false)
         .build();
     source.set_title("Local folder or GitHub owner/repo");
-    let install = button("Install");
-    source.add_suffix(&install);
     management.add(&source);
-    let reload = button("Reload installed plugins");
-    let row = action_row(
-        "Installed plugins",
-        "Install first, then explicitly enable code you trust. Updates never enable disabled plugins.",
+    let install = button("Install");
+    let install_row = action_row(
+        "Install without executing",
+        "Stable binary releases are verified with SHA256.",
     );
-    row.add_suffix(&reload);
-    management.add(&row);
-    let administration = gtk::Expander::builder()
-        .label("Manage plugins")
-        .child(&management)
-        .build();
+    install_row.add_suffix(&install);
+    management.add(&install_row);
+    content.append(&management);
+    content.append(&group("Trust and activation", backend::TRUST));
+    let installed = group(
+        "Installed plugins",
+        "Enabled and disabled plugins have their own pages in the sidebar. This manager reads installation metadata only; it does not poll device state.",
+    );
+    let reload = button("Refresh inventory");
+    installed.set_header_suffix(Some(&reload));
+    content.append(&installed);
     let status = label("");
     content.append(&status);
     status.set_visible(false);
-    let integrations = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    let installed_heading = label("Installed integrations");
-    installed_heading.add_css_class("title-3");
-    let navigation = gtk::Stack::builder()
-        .hhomogeneous(false)
-        .vhomogeneous(false)
-        .transition_type(gtk::StackTransitionType::SlideLeftRight)
-        .build();
-    let home = gtk::Box::new(gtk::Orientation::Vertical, 18);
-    home.append(&administration);
-    home.append(&installed_heading);
-    home.append(&integrations);
-    let products_heading = label("Your products");
-    products_heading.add_css_class("title-1");
-    home.append(&products_heading);
-    let inventory = gtk::Box::new(gtk::Orientation::Vertical, 24);
-    home.append(&inventory);
-    navigation.add_named(&home, Some("products"));
-    content.append(&navigation);
-    let page = Rc::new(Page {
+    let integrations = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    content.append(&integrations);
+    let page = Rc::new(Manager {
         ctx: ctx.clone(),
         root: root.downgrade(),
-        inventory,
-        navigation,
         integrations,
         status,
         source,
@@ -188,14 +189,7 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         reload,
         busy: Cell::new(false),
         loop_started: Cell::new(false),
-        refresh_interval_ms: Cell::new(2000),
-        plugins: RefCell::new(Vec::new()),
-    });
-    let scroller = root.downgrade();
-    page.navigation.connect_visible_child_notify(move |_| {
-        if let Some(root) = scroller.upgrade() {
-            root.vadjustment().set_value(0.0);
-        }
+        installed: RefCell::new(Vec::new()),
     });
     let weak = Rc::downgrade(&page);
     page.install.connect_clicked(move |_| {
@@ -261,9 +255,78 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
                 };
                 if root.is_mapped() && !page.busy.get() {
                     page.begin("Refreshing…");
-                    if page.plugins.borrow().is_empty() {
-                        page.load().await;
-                    }
+                    page.load().await;
+                    page.end();
+                }
+                drop(root);
+                glib::timeout_future(Duration::from_secs(3)).await;
+            }
+        });
+    });
+    root.upcast()
+}
+
+pub fn build_plugin(ctx: &Ctx, id: &str) -> gtk::Widget {
+    let (root, content) = ui::page_scaffold();
+    let status = label("");
+    status.set_visible(false);
+    content.append(&status);
+    let diagnostics = label("Reading plugin installation…");
+    diagnostics.add_css_class("dim-label");
+    content.append(&diagnostics);
+    let navigation = gtk::Stack::builder()
+        .hhomogeneous(false)
+        .vhomogeneous(false)
+        .transition_type(gtk::StackTransitionType::SlideLeftRight)
+        .build();
+    let state = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    navigation.add_named(&state, Some("products"));
+    content.append(&navigation);
+    let manage = button("Open plugin manager");
+    manage.set_halign(gtk::Align::Start);
+    manage.set_visible(false);
+    manage.connect_clicked(|_| {
+        hyprdeck_core::events::send(hyprdeck_core::events::AppEvent::ShowPage("plugins".into()));
+    });
+    content.append(&manage);
+    let page = Rc::new(Page {
+        ctx: ctx.clone(),
+        root: root.downgrade(),
+        navigation,
+        status,
+        manager: manage,
+        refresh_interval_ms: Cell::new(2000),
+        busy: Cell::new(false),
+        loop_started: Cell::new(false),
+        view: Rc::new(PluginView {
+            id: id.to_owned(),
+            state,
+            diagnostics,
+            dirty: Cell::new(false),
+            rendered: RefCell::new(None),
+            products: RefCell::new(None),
+        }),
+    });
+    let scroller = root.downgrade();
+    page.navigation.connect_visible_child_notify(move |_| {
+        if let Some(root) = scroller.upgrade() {
+            root.vadjustment().set_value(0.0);
+        }
+    });
+    let page_on_map = page.clone();
+    root.connect_map(move |_| {
+        if page_on_map.loop_started.replace(true) {
+            return;
+        }
+        let page = page_on_map.clone();
+        let ctx = page.ctx.clone();
+        ctx.spawn(async move {
+            loop {
+                let Some(root) = page.root.upgrade() else {
+                    break;
+                };
+                if root.is_mapped() && !page.busy.get() {
+                    page.begin("Refreshing…");
                     page.refresh().await;
                     page.end();
                 }
@@ -275,7 +338,7 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     root.upcast()
 }
 
-impl Page {
+impl Manager {
     fn begin(&self, message: &str) -> bool {
         if self.busy.replace(true) {
             self.ctx
@@ -311,40 +374,59 @@ impl Page {
         self.status.set_visible(true);
         self.ctx.error(what, error);
     }
-    async fn load(self: &PageRef) {
-        let result = rt::blocking(backend::list).await;
-        match result {
+    async fn load(self: &ManagerRef) {
+        match rt::blocking(backend::list).await {
             Ok(plugins) => {
-                while let Some(child) = self.inventory.first_child() {
-                    self.inventory.remove(&child);
+                let unchanged = {
+                    let old = self.installed.borrow();
+                    old.len() == plugins.len()
+                        && old.iter().zip(&plugins).all(|(a, b)| {
+                            a.id == b.id
+                                && a.enabled == b.enabled
+                                && a.error == b.error
+                                && a.manifest.as_ref().map(|m| {
+                                    (
+                                        &m.id,
+                                        &m.name,
+                                        &m.description,
+                                        &m.version,
+                                        &m.executable,
+                                        &m.update_repo,
+                                        &m.asset,
+                                        m.api_version,
+                                    )
+                                }) == b.manifest.as_ref().map(|m| {
+                                    (
+                                        &m.id,
+                                        &m.name,
+                                        &m.description,
+                                        &m.version,
+                                        &m.executable,
+                                        &m.update_repo,
+                                        &m.asset,
+                                        m.api_version,
+                                    )
+                                })
+                        })
+                };
+                if unchanged && self.integrations.first_child().is_some() {
+                    return;
                 }
                 while let Some(child) = self.integrations.first_child() {
                     self.integrations.remove(&child);
                 }
-                self.navigation.set_visible_child_name("products");
-                let pages: Vec<_> = self
-                    .navigation
-                    .pages()
-                    .iter::<gtk::StackPage>()
-                    .filter_map(Result::ok)
-                    .filter(|page| page.name().as_deref() != Some("products"))
-                    .map(|page| page.child())
-                    .collect();
-                for child in pages {
-                    self.navigation.remove(&child);
-                }
-                self.plugins.borrow_mut().clear();
                 if plugins.is_empty() {
-                    self.inventory.append(&label("No plugins installed. Install a local folder or a repository with a stable binary release."));
+                    self.integrations.append(&label("No plugins installed. Install a local folder or a repository with a stable binary release."));
                 }
-                for installed in plugins {
-                    self.add_plugin(installed);
+                for installed in &plugins {
+                    self.add_plugin(installed.clone());
                 }
+                *self.installed.borrow_mut() = plugins;
             }
             Err(error) => self.fail("Cannot read plugin configuration", &error),
         }
     }
-    fn add_plugin(self: &PageRef, installed: Installed) {
+    fn add_plugin(self: &ManagerRef, installed: Installed) {
         let name = installed
             .manifest
             .as_ref()
@@ -360,7 +442,6 @@ impl Page {
                 )
             })
             .unwrap_or_else(|| "Invalid or missing installation; execution is blocked.".into());
-        let container = gtk::Box::new(gtk::Orientation::Vertical, 12);
         let management = group(name, &description);
         let row = action_row(
             if installed.enabled {
@@ -383,26 +464,35 @@ impl Page {
         update.set_sensitive(false);
         check.set_sensitive(installed.manifest.is_some());
         let updates = action_row(
-            "Independent binary releases",
-            "SHA256 verified; incompatible, mismatched or older releases are rejected.",
+            "Release updates",
+            "Check compatible stable releases without executing the plugin.",
         );
         updates.add_suffix(&check);
-        updates.add_suffix(&update);
         management.add(&updates);
-        let settings = gtk::Expander::builder()
-            .label(format!(
-                "{name} · {}",
-                if installed.enabled {
-                    "Enabled"
-                } else {
-                    "Disabled"
-                }
-            ))
-            .child(&management)
-            .build();
-        self.integrations.append(&settings);
+        let apply = action_row(
+            "Apply a verified update",
+            "Activation is preserved. Updating enabled code requires trust in the release publisher.",
+        );
+        apply.add_suffix(&update);
+        management.add(&apply);
+        if installed.manifest.is_some() {
+            let open = button("Open plugin");
+            let row = action_row(
+                "Products and device settings",
+                "Open this plugin's separate page.",
+            );
+            row.add_suffix(&open);
+            management.add(&row);
+            let id = installed.id.clone();
+            open.connect_clicked(move |_| {
+                hyprdeck_core::events::send(hyprdeck_core::events::AppEvent::ShowPage(format!(
+                    "plugin:{id}"
+                )));
+            });
+        }
+        self.integrations.append(&management);
         let diagnostics = label(installed.error.as_deref().unwrap_or(if installed.enabled {
-            "Waiting for state…"
+            "Enabled: trusted code may execute when its product page is open."
         } else {
             "Disabled: no backend has been executed."
         }));
@@ -410,21 +500,12 @@ impl Page {
         diagnostics.add_css_class("dim-label");
         let release = label("");
         management.add(&release);
-        let state = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        container.prepend(&state);
-        self.inventory.append(&container);
-        let view = Rc::new(PluginView {
+        let view = Rc::new(InstalledView {
             id: installed.id.clone(),
             enabled: installed.enabled,
-            state,
-            diagnostics,
             release,
-            update: update.clone(),
-            dirty: Cell::new(false),
-            rendered: RefCell::new(None),
-            products: RefCell::new(None),
+            update: update.downgrade(),
         });
-        self.plugins.borrow_mut().push(view.clone());
         let weak = Rc::downgrade(self);
         let id = installed.id;
         let enabled = installed.enabled;
@@ -467,9 +548,10 @@ impl Page {
             }
         });
         let weak = Rc::downgrade(self);
-        let target = Rc::downgrade(&view);
+        let checked = view.clone();
         check.connect_clicked(move |_| {
-            if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
+            let view = checked.clone();
+            if let Some(page) = weak.upgrade() {
                 if !page.begin("Checking release…") {
                     return;
                 }
@@ -489,12 +571,16 @@ impl Page {
                                 },
                                 check.url
                             ));
-                            view.update.set_sensitive(check.update_available);
+                            if let Some(update) = view.update.upgrade() {
+                                update.set_sensitive(check.update_available);
+                            }
                         }
                         Err(error) => {
                             view.release
                                 .set_text(&format!("Release check failed: {error:#}"));
-                            view.update.set_sensitive(false);
+                            if let Some(update) = view.update.upgrade() {
+                                update.set_sensitive(false);
+                            }
                             page.ctx.error("Release check failed", &error);
                         }
                     }
@@ -503,8 +589,8 @@ impl Page {
             }
         });
         let weak = Rc::downgrade(self);
-        let target = Rc::downgrade(&view);
-        update.connect_clicked(move |_| if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
+        update.connect_clicked(move |_| if let Some(page) = weak.upgrade() {
+            let view = view.clone();
             if !page.begin("Applying verified update…") { return; }
             let ctx = page.ctx.clone(); ctx.spawn(async move {
                 let body = if view.enabled { "Download and SHA256-verify the latest compatible stable release, then run its state handshake. The plugin stays enabled. A failed handshake restores the previous version. Only continue if you trust this release publisher." } else { "Download and SHA256-verify the latest compatible stable release. The plugin stays disabled and the new executable is not run until you explicitly enable it." };
@@ -518,30 +604,75 @@ impl Page {
             });
         });
     }
+}
+
+impl Page {
+    fn begin(&self, message: &str) -> bool {
+        if self.busy.replace(true) {
+            self.ctx
+                .toast("A plugin operation is in progress. Please wait.");
+            return false;
+        }
+        self.status.set_text(message);
+        self.status.set_visible(message != "Refreshing…");
+        true
+    }
+    fn end(&self) {
+        self.busy.set(false);
+        if matches!(
+            self.status.text().as_str(),
+            "Refreshing…" | "Running plugin action…"
+        ) {
+            self.status.set_text("");
+            self.status.set_visible(false);
+        }
+    }
     async fn refresh(self: &PageRef) {
-        let plugins = self.plugins.borrow().clone();
         self.refresh_interval_ms.set(2000);
-        for view in plugins {
-            if !view.enabled {
-                continue;
+        let view = &self.view;
+        let inventory = rt::blocking(backend::list).await;
+        let unavailable = match &inventory {
+            Ok(installed) => match installed.iter().find(|plugin| plugin.id == view.id) {
+                Some(plugin) if plugin.manifest.is_none() => Some(format!(
+                    "This plugin cannot run: {}. Open the plugin manager to review diagnostics or reinstall it.",
+                    plugin.error.as_deref().unwrap_or("invalid installation")
+                )),
+                Some(plugin) if !plugin.enabled => Some("This plugin is disabled. No backend is executing. Open the plugin manager to review trust and activate it.".into()),
+                Some(_) => None,
+                None => Some("This plugin is not installed. Open the plugin manager to install it.".into()),
+            },
+            Err(error) => Some(format!("Cannot read plugin configuration: {error:#}")),
+        };
+        if let Some(message) = unavailable {
+            view.diagnostics.set_text(&message);
+            view.diagnostics.set_visible(true);
+            self.manager.set_visible(true);
+            view.state.set_sensitive(false);
+            if let Some(products) = view.products.borrow().as_ref() {
+                products.disconnect();
             }
-            if !self.root.upgrade().is_some_and(|root| root.is_mapped()) {
-                break;
+            return;
+        }
+        if !self.root.upgrade().is_some_and(|root| root.is_mapped()) {
+            return;
+        }
+        let id = view.id.clone();
+        match rt::run(async move { backend::request(&id, None, Map::new()).await }).await {
+            Ok(state) => {
+                view.diagnostics.set_visible(false);
+                self.manager.set_visible(false);
+                view.state.set_sensitive(true);
+                self.render(view, state);
             }
-            let id = view.id.clone();
-            match rt::run(async move { backend::request(&id, None, Map::new()).await }).await {
-                Ok(state) => {
-                    view.diagnostics.set_text(if view.dirty.get() { "Live state received. Pending edits are preserved; Apply to send, or Reload to discard." } else { "Backend connected. State refreshes while this page is visible." });
-                    view.state.set_sensitive(true);
-                    self.render(&view, state);
-                }
-                Err(error) => {
-                    view.diagnostics
-                        .set_text(&format!("Backend error (will retry): {error:#}"));
-                    view.state.set_sensitive(false);
-                    if let Some(products) = view.products.borrow().as_ref() {
-                        products.disconnect();
-                    }
+            Err(error) => {
+                view.diagnostics.set_text(&format!(
+                    "Backend unavailable; controls are paused. {error:#}"
+                ));
+                view.diagnostics.set_visible(true);
+                self.manager.set_visible(true);
+                view.state.set_sensitive(false);
+                if let Some(products) = view.products.borrow().as_ref() {
+                    products.disconnect();
                 }
             }
         }
@@ -570,10 +701,16 @@ impl Page {
                 Ok(state) => {
                     if let Some(row) = submitted { row.remove_css_class("hd-pending-edit"); }
                     view.dirty.set(false);
-                    view.diagnostics.set_text("Action completed; refreshed state received.");
+                    view.diagnostics.set_visible(false);
+                    page.manager.set_visible(false);
                     page.render(&view, state);
                 }
-                Err(error) => { view.diagnostics.set_text(&format!("Action failed: {error:#}")); page.ctx.error("Plugin action failed", &error); }
+                Err(error) => {
+                    view.diagnostics.set_text(&format!("Action failed: {error:#}"));
+                    view.diagnostics.set_visible(true);
+                    page.manager.set_visible(true);
+                    page.ctx.error("Plugin action failed", &error);
+                }
             }
             view.state.set_sensitive(true); page.end();
             if let Some(products) = view.products.borrow().as_ref() { products.set_sensitive(true); }
@@ -942,6 +1079,43 @@ impl Page {
                         page.run_action(&view, action.clone(), args, false, edited.upgrade());
                     }
                 });
+            }
+            control @ Control::Dpi { .. } => {
+                let Control::Dpi { action, args, .. } = &control else {
+                    unreachable!()
+                };
+                let action = action.clone();
+                let args = args.clone();
+                let target = Rc::downgrade(view);
+                let edited = row.downgrade();
+                let weak = Rc::downgrade(self);
+                let submitted = Rc::downgrade(view);
+                let submitted_row = row.downgrade();
+                let widget = crate::dpi::build(
+                    &control,
+                    row,
+                    move || {
+                        if let (Some(view), Some(row)) = (target.upgrade(), edited.upgrade()) {
+                            mark_edit(&view, &row);
+                        }
+                    },
+                    move |value| {
+                        if let (Some(page), Some(view)) = (weak.upgrade(), submitted.upgrade()) {
+                            let applied_row = if matches!(
+                                value.get("operation").and_then(Value::as_str),
+                                Some("save")
+                            ) {
+                                submitted_row.upgrade()
+                            } else {
+                                None
+                            };
+                            let mut args = args.clone();
+                            args.insert("value".into(), value);
+                            page.run_action(&view, action.clone(), args, false, applied_row);
+                        }
+                    },
+                );
+                row.set_child(Some(&widget));
             }
             Control::Form {
                 fields,
