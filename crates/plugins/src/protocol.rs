@@ -380,6 +380,14 @@ pub struct OptionItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DpiStage {
+    pub id: String,
+    pub label: String,
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Control {
     Button {
@@ -420,6 +428,20 @@ pub enum Control {
     },
     Color {
         value: String,
+        action: String,
+        #[serde(default)]
+        args: Map<String, Value>,
+    },
+    Dpi {
+        x: Option<f64>,
+        y: Option<f64>,
+        min: f64,
+        max: f64,
+        step: f64,
+        linked: bool,
+        stages: Vec<DpiStage>,
+        active: Option<String>,
+        storage: String,
         action: String,
         #[serde(default)]
         args: Map<String, Value>,
@@ -610,6 +632,58 @@ impl Control {
                 }
                 action
             }
+            Self::Dpi {
+                x,
+                y,
+                min,
+                max,
+                step,
+                stages,
+                active,
+                storage,
+                action,
+                ..
+            } => {
+                ensure!(
+                    min.is_finite()
+                        && max.is_finite()
+                        && min <= max
+                        && *min >= 1.0
+                        && *max <= 65535.0
+                        && step.is_finite()
+                        && *step > 0.0,
+                    "invalid DPI bounds"
+                );
+                let valid = |value: f64| {
+                    value.is_finite() && value.fract() == 0.0 && (*min..=*max).contains(&value)
+                };
+                ensure!(
+                    x.is_none_or(valid) && y.is_none_or(valid),
+                    "invalid current DPI"
+                );
+                ensure!(
+                    matches!(storage.as_str(), "host" | "device"),
+                    "invalid DPI preset storage"
+                );
+                ensure!(
+                    !stages.is_empty() && stages.len() <= 8,
+                    "DPI editor requires 1..8 stages"
+                );
+                let mut ids = HashSet::new();
+                for stage in stages {
+                    ensure!(
+                        valid_id(&stage.id) && ids.insert(&stage.id),
+                        "invalid or duplicate DPI stage id"
+                    );
+                    text(&stage.label, "DPI stage label", true)?;
+                    ensure!(valid(stage.x) && valid(stage.y), "invalid DPI stage values");
+                }
+                ensure!(
+                    active.as_ref().is_none_or(|id| ids.contains(id)),
+                    "active DPI stage is missing"
+                );
+                action
+            }
         };
         action_name(action)
     }
@@ -742,5 +816,45 @@ mod tests {
         assert!(invalid.validate().is_err());
         let invalid: Control = serde_json::from_value(serde_json::json!({"kind":"form","action":"set","fields":[{"id":"effect","label":"Effect","kind":"choice","value":"missing","options":[{"value":"static","label":"Static"}]}]})).unwrap();
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn dpi_presets_require_valid_identity_and_real_value_bounds() {
+        let base = serde_json::json!({"kind":"dpi","x":null,"y":null,"min":100,"max":20000,"step":50,"linked":true,"stages":[{"id":"stage-1","label":"800 DPI","x":800,"y":800}],"active":null,"storage":"host","action":"dpi-presets"});
+        let mut invalid = base.clone();
+        invalid["stages"][0]["x"] = serde_json::json!(0);
+        assert!(
+            serde_json::from_value::<Control>(invalid)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        let mut invalid = base.clone();
+        invalid["active"] = serde_json::json!("missing");
+        assert!(
+            serde_json::from_value::<Control>(invalid)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        let mut invalid = base.clone();
+        invalid["stages"]
+            .as_array_mut()
+            .unwrap()
+            .push(base["stages"][0].clone());
+        assert!(
+            serde_json::from_value::<Control>(invalid)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        let mut invalid = base;
+        invalid["x"] = serde_json::json!(400.5);
+        assert!(
+            serde_json::from_value::<Control>(invalid)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 }

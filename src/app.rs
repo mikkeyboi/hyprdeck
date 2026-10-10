@@ -66,10 +66,67 @@ fn start_background_services() {
     hd_plugins::start_background();
 }
 
+#[derive(Clone)]
+enum NavigationTarget {
+    Builtin(PageInfo),
+    Plugin(hd_plugins::PluginPage),
+}
+
+struct NavigationRow {
+    id: String,
+    title: String,
+    target: NavigationTarget,
+    row: gtk::ListBoxRow,
+}
+
 struct Shell {
     ctx: Ctx,
-    pages: Vec<PageInfo>,
     sidebar: gtk::ListBox,
+    rows: RefCell<Vec<NavigationRow>>,
+    stack: gtk::Stack,
+    title: adw::WindowTitle,
+    split: adw::NavigationSplitView,
+    updating_sidebar: Cell<bool>,
+    installed: RefCell<Vec<hd_plugins::PluginPage>>,
+}
+
+fn navigation_row(title: &str, icon: &str, nested: bool, disabled: bool) -> gtk::ListBoxRow {
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    content.set_margin_top(6);
+    content.set_margin_bottom(6);
+    content.set_margin_start(if nested { 30 } else { 6 });
+    content.set_margin_end(6);
+    content.append(&gtk::Image::from_icon_name(icon));
+    content.append(
+        &gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .hexpand(true)
+            .build(),
+    );
+    if nested {
+        let state = gtk::Label::new(Some(if disabled { "Disabled" } else { "Enabled" }));
+        state.add_css_class("caption");
+        state.add_css_class("dim-label");
+        content.append(&state);
+    }
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&content));
+    row
+}
+
+fn navigation_heading(sidebar: &gtk::ListBox, title: &str) {
+    let label = gtk::Label::builder().label(title).xalign(0.0).build();
+    label.add_css_class("heading");
+    label.add_css_class("dim-label");
+    label.set_margin_top(18);
+    label.set_margin_bottom(6);
+    label.set_margin_start(12);
+    let row = gtk::ListBoxRow::new();
+    row.set_selectable(false);
+    row.set_activatable(false);
+    row.set_child(Some(&label));
+    sidebar.append(&row);
 }
 
 impl Shell {
@@ -91,14 +148,36 @@ impl Shell {
         // Sidebar.
         let sidebar = gtk::ListBox::new();
         sidebar.add_css_class("navigation-sidebar");
-        for p in &pages {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-            row.set_margin_top(6);
-            row.set_margin_bottom(6);
-            row.set_margin_start(6);
-            row.append(&gtk::Image::from_icon_name(p.icon));
-            row.append(&gtk::Label::builder().label(p.title).xalign(0.0).build());
+        let mut rows = Vec::new();
+        for (heading, ids) in [
+            ("Hardware", &["display", "input", "audio", "bluetooth"][..]),
+            ("Desktop", &["startup", "keybinds", "defaults"][..]),
+            ("System", &["updates", "sleep", "tweaks"][..]),
+        ] {
+            navigation_heading(&sidebar, heading);
+            for id in ids {
+                if let Some(page) = pages.iter().find(|page| page.id == *id) {
+                    let row = navigation_row(page.title, page.icon, false, false);
+                    sidebar.append(&row);
+                    rows.push(NavigationRow {
+                        id: page.id.into(),
+                        title: page.title.into(),
+                        target: NavigationTarget::Builtin(*page),
+                        row,
+                    });
+                }
+            }
+        }
+        if let Some(page) = pages.iter().find(|page| page.id == "plugins") {
+            let row = navigation_row(page.title, page.icon, false, false);
+            row.set_margin_top(12);
             sidebar.append(&row);
+            rows.push(NavigationRow {
+                id: page.id.into(),
+                title: page.title.into(),
+                target: NavigationTarget::Builtin(*page),
+                row,
+            });
         }
         let menu = gio::Menu::new();
         menu.append(Some("Preferences"), Some("app.preferences"));
@@ -144,31 +223,6 @@ impl Shell {
         toasts.set_child(Some(&split));
         window.set_content(Some(&toasts));
 
-        // Lazy page construction on selection.
-        let built: Rc<RefCell<Vec<&'static str>>> = Rc::default();
-        {
-            let pages = pages.clone();
-            let ctx = ctx.clone();
-            let split = split.clone();
-            sidebar.connect_row_selected(move |_, row| {
-                let Some(row) = row else { return };
-                let Some(p) = pages.get(row.index() as usize) else {
-                    return;
-                };
-                if !built.borrow().contains(&p.id) {
-                    let widget = (p.build)(&ctx);
-                    stack.add_named(&widget, Some(p.id));
-                    built.borrow_mut().push(p.id);
-                }
-                stack.set_visible_child_name(p.id);
-                title.set_title(p.title);
-                if let Some(content) = split.content() {
-                    content.set_title(p.title);
-                }
-                split.set_show_content(true);
-            });
-        }
-
         // Close → hide to tray (when available and enabled) or quit.
         {
             let app = app.clone();
@@ -183,21 +237,155 @@ impl Shell {
         }
         window.connect_visible_notify(|w| hyprdeck_core::ui::set_window_visible(w.is_visible()));
 
-        Rc::new(Shell {
+        let shell = Rc::new(Shell {
             ctx,
-            pages,
             sidebar,
-        })
+            rows: RefCell::new(rows),
+            stack,
+            title,
+            split,
+            updating_sidebar: Cell::new(false),
+            installed: RefCell::new(Vec::new()),
+        });
+        let weak = Rc::downgrade(&shell);
+        shell.sidebar.connect_row_selected(move |_, row| {
+            if let (Some(shell), Some(row)) = (weak.upgrade(), row)
+                && !shell.updating_sidebar.get()
+            {
+                shell.select(row);
+            }
+        });
+        match hd_plugins::installed_pages() {
+            Ok(installed) => shell.refresh_inventory(installed),
+            Err(error) => tracing::warn!("cannot read installed plugin pages: {error:#}"),
+        }
+        let weak = Rc::downgrade(&shell);
+        glib::spawn_future_local(async move {
+            loop {
+                glib::timeout_future(std::time::Duration::from_secs(3)).await;
+                let Some(shell) = weak.upgrade() else { break };
+                if !shell.ctx.window.is_visible() {
+                    continue;
+                }
+                match rt::blocking(hd_plugins::installed_pages).await {
+                    Ok(installed) => shell.refresh_inventory(installed),
+                    Err(error) => {
+                        tracing::warn!("cannot refresh installed plugin pages: {error:#}")
+                    }
+                }
+            }
+        });
+        shell
+    }
+
+    fn select(&self, row: &gtk::ListBoxRow) {
+        let selected = self
+            .rows
+            .borrow()
+            .iter()
+            .find(|entry| &entry.row == row)
+            .map(|entry| (entry.id.clone(), entry.title.clone(), entry.target.clone()));
+        let Some((id, title, target)) = selected else {
+            return;
+        };
+        if self.stack.child_by_name(&id).is_none() {
+            let widget = match target {
+                NavigationTarget::Builtin(page) => (page.build)(&self.ctx),
+                NavigationTarget::Plugin(page) => hd_plugins::build_plugin(&self.ctx, &page.id),
+            };
+            self.stack.add_named(&widget, Some(&id));
+        }
+        self.stack.set_visible_child_name(&id);
+        self.title.set_title(&title);
+        if let Some(content) = self.split.content() {
+            content.set_title(&title);
+        }
+        self.split.set_show_content(true);
+    }
+
+    fn refresh_inventory(&self, installed: Vec<hd_plugins::PluginPage>) {
+        if *self.installed.borrow() == installed {
+            return;
+        }
+        let selected = self.stack.visible_child_name().map(|id| id.to_string());
+        self.updating_sidebar.set(true);
+        {
+            let mut rows = self.rows.borrow_mut();
+            rows.retain(|entry| {
+                if matches!(&entry.target, NavigationTarget::Plugin(_)) {
+                    self.sidebar.remove(&entry.row);
+                    false
+                } else {
+                    true
+                }
+            });
+            for page in &installed {
+                let row = navigation_row(
+                    &page.name,
+                    "application-x-addon-symbolic",
+                    true,
+                    !page.enabled,
+                );
+                self.sidebar.append(&row);
+                rows.push(NavigationRow {
+                    id: format!("plugin:{}", page.id),
+                    title: page.name.clone(),
+                    target: NavigationTarget::Plugin(page.clone()),
+                    row,
+                });
+            }
+        }
+        *self.installed.borrow_mut() = installed;
+        let row = selected.as_deref().and_then(|id| {
+            let rows = self.rows.borrow();
+            rows.iter()
+                .find(|entry| entry.id == id)
+                .or_else(|| rows.iter().find(|entry| entry.id == "plugins"))
+                .map(|entry| entry.row.clone())
+        });
+        if let Some(row) = &row {
+            self.sidebar.select_row(Some(row));
+        }
+        self.updating_sidebar.set(false);
+        if let Some(row) = row {
+            self.select(&row);
+        }
     }
 
     fn present(&self, page: Option<&str>) {
-        let index = page
-            .and_then(|id| self.pages.iter().position(|p| p.id == id))
-            .or_else(|| self.sidebar.selected_row().is_none().then_some(0));
-        if let Some(i) = index
-            && let Some(row) = self.sidebar.row_at_index(i as i32)
-        {
+        if page.is_some_and(|id| id == "plugins" || id.starts_with("plugin:")) {
+            match hd_plugins::installed_pages() {
+                Ok(installed) => self.refresh_inventory(installed),
+                Err(error) => tracing::warn!("cannot read installed plugin pages: {error:#}"),
+            }
+        }
+        let row = {
+            let rows = self.rows.borrow();
+            page.and_then(|id| rows.iter().find(|entry| entry.id == id))
+                .or_else(|| {
+                    (self.stack.visible_child_name().is_none()
+                        && !page.is_some_and(|id| id.starts_with("plugin:")))
+                    .then(|| rows.first())
+                    .flatten()
+                })
+                .map(|entry| entry.row.clone())
+        };
+        if let Some(row) = row {
             self.sidebar.select_row(Some(&row));
+        } else if let Some((page, id)) =
+            page.and_then(|page| page.strip_prefix("plugin:").map(|id| (page, id)))
+        {
+            if self.stack.child_by_name(page).is_none() {
+                self.stack
+                    .add_named(&hd_plugins::build_plugin(&self.ctx, id), Some(page));
+            }
+            self.sidebar.unselect_all();
+            self.stack.set_visible_child_name(page);
+            self.title.set_title("Plugin unavailable");
+            if let Some(content) = self.split.content() {
+                content.set_title("Plugin unavailable");
+            }
+            self.split.set_show_content(true);
         }
         self.ctx.window.set_visible(true);
         self.ctx.window.present();

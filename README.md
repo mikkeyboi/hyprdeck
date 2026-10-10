@@ -35,6 +35,11 @@ loads last. Your hand-written config is never rewritten behind your back.
 Pages and sections adapt to what's installed: missing `ddcutil`, `bluetoothd`, `pacman`, an AUR helper,
 uwsm, Noctalia or an NVIDIA driver hides or explains the related features instead of failing.
 
+The sidebar groups **Hardware** (displays, input, audio, Bluetooth), **Desktop** (startup, keybinds,
+default apps), and **System** (updates, sleep/wake, tweaks). **Plugins** is a dedicated manager;
+installed integrations appear beneath it and open their own product experiences, without crowded
+management controls on device pages. Existing page ids and CLI commands stay unchanged.
+
 ## Requirements
 
 - Hyprland **0.56+** with a Lua config (`~/.config/hypr/hyprland.lua`)
@@ -143,6 +148,7 @@ hyprdeck system diagnose
 hyprdeck plugins list
 hyprdeck plugins install owner/repository
 hyprdeck plugins enable plugin-id     # explicitly trust and activate installed user-code
+hyprdeck --page plugin:razer          # open an installed integration, not the plugin manager
 ```
 
 ## Files
@@ -202,15 +208,23 @@ status, and separate Overview, Sensitivity, Lighting, Buttons & macros and Diagn
 Native controller diagrams, color pickers and structured Apply forms expose real capabilities.
 Mouse keyboard-emulation interfaces remain technical diagnostics—not extra hardware cards.
 Unavailable proprietary mapping/RGB controls are identified as missing Linux support, not simulated.
+The DPI editor can link X/Y sensitivity and edit desktop presets with explicit Apply/Save and
+Previous/Next selection. Host presets are separate from onboard stages and physical DPI buttons;
+unavailable readback is labeled, not guessed. Polling controls use actual advertised rates or an
+exact model's documented backend limits.
 
 <p align="center">
-  <img src="docs/screenshots/controller-front.png" width="49%" alt="Native plugin controller front view in a neutral theme">
-  <img src="docs/screenshots/controller-rear.png" width="49%" alt="Native plugin controller rear input inspector in a neutral theme">
+  <img src="docs/screenshots/razer-products.png" width="49%" alt="Detected Razer products beneath a nested plugin sidebar entry">
+  <img src="docs/screenshots/plugin-manager.png" width="49%" alt="Separate plugin installation, activation and update manager">
+  <img src="docs/screenshots/basilisk-sensitivity.png" width="49%" alt="Linked X/Y DPI, editable desktop presets and polling settings">
+  <img src="docs/screenshots/basilisk-lighting.png" width="49%" alt="Basilisk RGB effect and color settings">
+  <img src="docs/screenshots/wolverine-overview.png" width="49%" alt="Wolverine controller overview and live input inspector">
 </p>
 
-Native controller view with a neutral libadwaita theme and a captured real Wolverine input
-snapshot from the separate [Razer plugin](https://github.com/mikkeyboi/hyprdeck-razer). Rear
-artwork is illustrative; unavailable proprietary mapping and paddle state are labeled explicitly.
+Neutral libadwaita captures of the actual application with the separate
+[Razer plugin](https://github.com/mikkeyboi/hyprdeck-razer), using live OpenRazer and controller
+readings. Desktop DPI samples are labeled host presets, not onboard stage readback. Controller
+mapping, lighting and battery limits stay explicit; no device state was fabricated.
 
 Plugins execute as your user and are not sandboxed. Installing is not enabling; only enable code
 and release repositories you trust. Firmware operations, where a plugin genuinely supports them,

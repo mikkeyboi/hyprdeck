@@ -1,6 +1,7 @@
 //! External subprocess plugins. No device-specific code or native library loading.
 mod backend;
 mod controller;
+mod dpi;
 mod illustration;
 mod page;
 mod process;
@@ -11,7 +12,10 @@ mod releases;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail};
-use hyprdeck_core::{rt, ui::PageInfo};
+use hyprdeck_core::{
+    rt,
+    ui::{Ctx, PageInfo},
+};
 use serde_json::Map;
 
 pub fn pages() -> Vec<PageInfo> {
@@ -21,6 +25,32 @@ pub fn pages() -> Vec<PageInfo> {
         icon: "application-x-addon-symbolic",
         build: page::build,
     }]
+}
+
+/// Installed, validated plugin metadata. Reading this inventory never executes a backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginPage {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+}
+
+pub fn installed_pages() -> Result<Vec<PluginPage>> {
+    Ok(backend::list()?
+        .into_iter()
+        .filter_map(|installed| {
+            installed.manifest.map(|manifest| PluginPage {
+                id: installed.id,
+                name: manifest.name,
+                enabled: installed.enabled,
+            })
+        })
+        .collect())
+}
+
+/// Build one plugin's product page, independently of the installation manager.
+pub fn build_plugin(ctx: &Ctx, id: &str) -> gtk::Widget {
+    page::build_plugin(ctx, id)
 }
 
 /// Release metadata only: does not launch plugins, download binaries, or install updates.
