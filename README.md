@@ -22,6 +22,7 @@ loads last. Your hand-written config is never rewritten behind your back.
 | --- | --- |
 | **Startup Apps** | XDG autostart entries, systemd user services and `hl.on("hyprland.start")` commands in one list. Enable/disable for the next login, start/stop/restart now, view logs, add apps, and delete entries you own (with a preview of every file removed). |
 | **Displays** | Drag-to-arrange layout. Resolution, refresh rate, scale (only values Hyprland accepts), rotation, VRR, mirroring, color management and HDR (SDR brightness/saturation/luminance, EOTF, bit depth, ICC). Changes apply behind a 15 s keep-or-revert countdown. Brightness, contrast and input source over DDC/CI via `ddcutil`. |
+| **Gaming** | Launch Steam Big Picture inside native Wayland Gamescope with Steam Input/overlay integration. Detect the focused or selected output’s physical resolution, refresh rate, HDR preset and VRR policy; override rendering, presentation and frame-rate settings. Preview/copy the command, save a profile, and reopen an existing session without duplicates. Desktop Steam restarts only after confirmation. |
 | **Input Devices** | Keyboard layouts, options and repeat; pointer, focus and touchpad behaviour; cursor; overrides per physical device. Every value shows where it comes from: config file:line, hyprdeck, or default. |
 | **Keybinds** | Every effective bind in readable form, grouped and searchable. Add, edit, disable and restore binds. Record key combos (even ones Hyprland already grabs). Pick an app, a shell action, a window/workspace action or any dispatcher. Warns before replacing an existing bind. |
 | **Audio** | Play through several outputs at once (a PipeWire combine sink) and route specific apps to specific outputs. Includes volumes, default output, a "what's playing where" overview, and a tray submenu. |
@@ -36,7 +37,7 @@ Pages and sections adapt to what's installed: missing `ddcutil`, `bluetoothd`, `
 uwsm, Noctalia or an NVIDIA driver hides or explains the related features instead of failing.
 
 The sidebar groups **Hardware** (displays, input, audio, Bluetooth), **Desktop** (startup, keybinds,
-default apps), and **System** (updates, sleep/wake, tweaks). **Plugins** is a dedicated manager;
+default apps, Gaming), and **System** (updates, sleep/wake, tweaks). **Plugins** is a dedicated manager;
 installed integrations appear beneath it and open their own product experiences, without crowded
 management controls on device pages. Existing page ids and CLI commands stay unchanged.
 
@@ -48,9 +49,10 @@ management controls on device pages. Existing page ids and CLI commands stay unc
   - PipeWire + `pipewire-pulse` (`pactl`) for audio
   - BlueZ for Bluetooth
   - `ddcutil` with i2c access for monitor brightness
+  - Native Steam, Gamescope and a systemd user manager (systemd 254+) for the Gaming launcher
   - For the Updates page: Arch Linux or an Arch-based distro with `pacman-contrib`, a polkit agent (most shells
     include one), and `base-devel` + `git` for AUR packages. No AUR helper is needed.
-- Building from source: Rust 1.88+, GTK ≥ 4.20, libadwaita ≥ 1.8
+- Building from source: Rust 1.89+, GTK ≥ 4.20, libadwaita ≥ 1.8
 
 ## Install
 
@@ -133,13 +135,73 @@ audio = "off"
 package_updates = "in_app"
 ```
 
+## Steam Big Picture / Gamescope
+
+Open **Gaming** in the sidebar, the tray’s **Steam Big Picture / Gamescope…** shortcut, or the
+desktop entry’s **Steam Big Picture / Gamescope** action. `hyprdeck --page gamescope` opens the same page.
+This launches a nested native Wayland window; it does not log out of Hyprland or enter a DRM session.
+Steam itself runs inside Gamescope (`-e -- steam -gamepadui`) so its games, overlay and Steam Input
+share the nested environment.
+
+Automatic settings use the focused display at launch, or a saved explicit output. Physical pixels
+are not divided by desktop scale; rotated outputs swap axes. HDR follows the display’s current
+`hdr`/`hdredid` preset, and adaptive sync follows the runtime Hyprland VRR policy rather than its
+momentary active state. Gamescope 3.16.25 accepts integer refresh rates: for example, 119.88 Hz is
+rounded to 120 Hz with a visible warning. The desktop display mode is never changed. Explicit output
+placement is handled by Hyprdeck; a copied raw Gamescope command follows compositor placement rules.
+
+Settings live in `~/.config/hyprdeck/gamescope.toml`. Use **Save settings** or launch to persist them.
+The login launcher reads this same saved profile: unsaved UI edits do not change the next login.
+Custom output/render resolutions, fullscreen/borderless/windowed presentation, HDR/adaptive-sync
+Auto/On/Off, scaling filter, frame-rate cap and keyboard-grab request are configurable. Native
+Wayland fullscreen ultimately uses the compositor’s output size; use render resolution to lower
+game rendering resolution. The native backend’s keyboard-grab option does not suppress Hyprland
+shortcuts, and Gamescope’s frame-rate cap uses refresh-rate divisors; both limitations are shown.
+
+If Steam is already nested, **Open existing session** focuses it without saving drafts or restarting.
+If desktop Steam is running, launch asks before a normal shutdown/restart; games can close and
+downloads can be interrupted. Nothing is force-killed. A named transient user service keeps the
+gaming session alive after Hyprdeck closes and prevents concurrent duplicate launches. Failed or
+incomplete launches show diagnostics from `journalctl --user -u hyprdeck-gamescope.service -b`.
+
+For a Hyprland keybind, use `hyprdeck gamescope launch`. It uses saved settings and focuses an
+existing session; desktop Steam must be exited normally first. `--restart-steam` explicitly permits
+normal Steam shutdown without a GUI confirmation, so do not put it on an accidental hotkey.
+
+**Gaming → Launch Steam Big Picture at login** is off by default. The switch immediately schedules
+or unschedules the saved launcher for the next login; it does not start, stop or restart Steam.
+Its XDG entry is `~/.config/autostart/io.github.mikkeyboi.Hyprdeck.Gamescope.desktop`, so the Gaming
+switch and Startup Apps show the same enabled state. Launch parameters remain in `gamescope.toml`
+and are resolved afresh at login; there is no second profile or separate hard-coded wrapper.
+
+Headless scheduling is also available:
+
+```sh
+hyprdeck gamescope autostart status
+hyprdeck gamescope autostart on
+hyprdeck gamescope autostart off
+```
+
+Controller input does not reset Hyprland’s keyboard/pointer idle timer. For fullscreen gaming,
+add this rule to your existing window rules if you use automatic desktop locking:
+
+```lua
+hl.window_rule({ match = { class = "^(gamescope)$" }, idle_inhibit = "fullscreen" })
+```
+
+It protects visible fullscreen Gamescope, including an unattended Big Picture menu, but not
+windowed play or manual locks. The launcher does not disable desktop idle globally or edit these rules.
+
 ## Command line
 
 ```
 hyprdeck --help
-hyprdeck --page display               # open on a page (startup, display, input, keybinds, audio,
-                                      #   bluetooth, defaults, updates, sleep, tweaks, plugins)
+hyprdeck --page display               # open on a page (startup, display, gamescope, input, keybinds,
+                                      #   audio, bluetooth, defaults, updates, sleep, tweaks, plugins)
 hyprdeck display rescue               # DPMS off/on + reload: recovers a black screen after wake
+hyprdeck --page gamescope             # Gaming settings and launcher
+hyprdeck gamescope plan               # show the resolved display settings and command without launching
+hyprdeck gamescope launch             # launch from saved settings, or focus existing Big Picture
 hyprdeck audio toggle                 # simultaneous output on/off
 hyprdeck defaults set browser firefox.desktop
 hyprdeck tweaks gamemode toggle
@@ -172,8 +234,8 @@ The project is a Cargo workspace:
 
 - `crates/core`: tokio↔GTK bridge, `hyprctl` wrappers, the Lua config model, the managed Lua module, the
   option schema (parsed from Hyprland's `hl.meta.lua` stubs), the tray registry and UI helpers.
-- `crates/<feature>` (`startup`, `display`, `input`, `audio`, `bluetooth`, `defaults`, `updates`, `system`):
-  each exports `pages()`, `start_background()` and `cli()`.
+- `crates/<feature>` (`startup`, `display`, `gamescope`, `input`, `audio`, `bluetooth`, `defaults`, `updates`, `system`):
+  each exports `pages()` and `cli()`, plus `start_background()` where a background provider is needed.
 - `crates/plugins`: external plugin protocol, trusted activation, native control rendering, and
   checksum-verified independent GitHub release installation/updates. No peripheral backend is bundled.
 - `src/`: window shell, tray host, CLI router.

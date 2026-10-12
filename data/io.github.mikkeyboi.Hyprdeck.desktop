@@ -2,11 +2,17 @@
 Type=Application
 Name=Hyprdeck
 GenericName=Desktop Settings
-Comment=Startup apps, displays, input, keybinds, audio, Bluetooth, updates and sleep/wake for Hyprland
+Comment=Startup apps, displays, gaming, input, keybinds, audio, Bluetooth, updates and sleep/wake for Hyprland
 Exec=hyprdeck
 Icon=io.github.mikkeyboi.Hyprdeck
 Terminal=false
 Categories=Settings;DesktopSettings;GTK;
-Keywords=hyprland;monitor;display;keybind;startup;autostart;audio;bluetooth;updates;
+Keywords=hyprland;monitor;display;gamescope;steam;gaming;controller;keybind;startup;autostart;audio;bluetooth;updates;
 StartupNotify=true
 StartupWMClass=io.github.mikkeyboi.Hyprdeck
+Actions=Gaming;
+
+[Desktop Action Gaming]
+Name=Steam Big Picture / Gamescope
+Exec=hyprdeck --page gamescope
+Icon=input-gaming-symbolic

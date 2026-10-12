@@ -7,7 +7,7 @@ mod entries;
 mod hypr;
 mod ui;
 mod units;
-mod xdg;
+pub mod xdg;
 
 use anyhow::{Result, bail};
 use hyprdeck_core::ui::PageInfo;

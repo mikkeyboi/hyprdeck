@@ -42,6 +42,7 @@ fn all_pages() -> Vec<PageInfo> {
     let mut pages = Vec::new();
     pages.extend(hd_startup::pages());
     pages.extend(hd_display::pages());
+    pages.extend(hd_gamescope::pages());
     pages.extend(hd_input::pages());
     pages.extend(hd_audio::pages());
     pages.extend(hd_bluetooth::pages());
@@ -151,7 +152,10 @@ impl Shell {
         let mut rows = Vec::new();
         for (heading, ids) in [
             ("Hardware", &["display", "input", "audio", "bluetooth"][..]),
-            ("Desktop", &["startup", "keybinds", "defaults"][..]),
+            (
+                "Desktop",
+                &["startup", "keybinds", "defaults", "gamescope"][..],
+            ),
             ("System", &["updates", "sleep", "tweaks"][..]),
         ] {
             navigation_heading(&sidebar, heading);

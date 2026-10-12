@@ -11,8 +11,9 @@
   <description>
     <p>
       Hyprdeck manages a Hyprland desktop from one place: startup apps, displays,
-      input devices and keybinds, simultaneous audio output and per-app routing,
-      Bluetooth, default apps, package updates, and sleep/wake recovery. It reads
+      input devices and keybinds, Steam Big Picture inside Gamescope,
+      simultaneous audio output and per-app routing, Bluetooth, default apps,
+      package updates, and sleep/wake recovery. It reads
       the Lua configuration of Hyprland 0.56+ and writes its own settings to a
       separate generated file.
     </p>

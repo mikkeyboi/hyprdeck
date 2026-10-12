@@ -48,6 +48,13 @@ impl ksni::Tray for HyprdeckTray {
                 ..Default::default()
             }
             .into(),
+            StandardItem {
+                label: "Steam Big Picture / Gamescope…".into(),
+                icon_name: "input-gaming-symbolic".into(),
+                activate: Box::new(|_| events::send(AppEvent::ShowPage("gamescope".into()))),
+                ..Default::default()
+            }
+            .into(),
         ];
         for provider in tray::providers() {
             let items = provider.items();

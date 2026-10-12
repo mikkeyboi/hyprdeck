@@ -14,6 +14,8 @@ USAGE:
   hyprdeck <command> …            headless commands:
       startup   list | enable <id> | disable <id>
       display   list | rescue | brightness <0-100> [output]
+      gamescope plan | launch [--restart-steam]
+                autostart status | on | off
       input     binds | devices
       audio     enable | off | toggle | status | list-devices | list-streams | route … | unroute …
       bluetooth list | connect <addr|name> | disconnect <addr|name>
@@ -25,7 +27,7 @@ USAGE:
       plugins   list | install <folder|owner/repo> | enable <id> | disable <id>
                 state <id> | action <id> <action> [JSON args] | check [id] | update <id>
 
-Pages: startup, display, input, keybinds, audio, bluetooth, defaults, updates, sleep, tweaks, plugins
+Pages: startup, display, gamescope, input, keybinds, audio, bluetooth, defaults, updates, sleep, tweaks, plugins
        plugin:<id> opens an installed integration";
 
 type Cli = fn(&[String]) -> Option<anyhow::Result<()>>;
@@ -52,9 +54,10 @@ fn main() -> ExitCode {
         println!("hyprdeck {}", hyprdeck_core::version_string());
         return ExitCode::SUCCESS;
     }
-    let clis: [Cli; 9] = [
+    let clis: [Cli; 10] = [
         hd_startup::cli,
         hd_display::cli,
+        hd_gamescope::cli,
         hd_input::cli,
         hd_audio::cli,
         hd_bluetooth::cli,

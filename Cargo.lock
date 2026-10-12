@@ -836,6 +836,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hd-gamescope"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gtk4",
+ "hd-startup",
+ "hyprdeck-core",
+ "libadwaita",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hd-input"
 version = "0.1.0"
 dependencies = [
@@ -931,6 +946,7 @@ dependencies = [
  "hd-bluetooth",
  "hd-defaults",
  "hd-display",
+ "hd-gamescope",
  "hd-input",
  "hd-plugins",
  "hd-startup",
