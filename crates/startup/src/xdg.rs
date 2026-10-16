@@ -236,13 +236,25 @@ pub fn set_enabled_text(file: &mut DesktopFile, enabled: bool) {
     }
 }
 
+fn configure_text(file: &mut DesktopFile, enabled: bool, command: Option<&str>) {
+    set_enabled_text(file, enabled);
+    if let Some(command) = command {
+        file.set("Exec", &command_value(command));
+    }
+}
+
 /// Enable or disable `id` for the next login (edits/creates the user copy;
 /// a user copy that ends up identical to the system file is removed).
 pub fn set_enabled(id: &str, enabled: bool) -> Result<()> {
+    configure(id, enabled, None)
+}
+
+/// Update the login flag and optionally Exec, preserving all other properties.
+pub fn configure(id: &str, enabled: bool, command: Option<&str>) -> Result<()> {
     let entry = find(id)?;
     let user = user_dir().join(&entry.id);
     let mut file = entry.file.clone();
-    set_enabled_text(&mut file, enabled);
+    configure_text(&mut file, enabled, command);
     let text = file.render();
     if let Some(sys) = &entry.system_path
         && std::fs::read_to_string(sys).is_ok_and(|s| s == text)
@@ -303,10 +315,14 @@ pub fn add_app(source: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn command_value(command: &str) -> String {
+    desktop::escape(command.trim()).replace('%', "%%")
+}
+
 /// Render a new autostart entry for a custom command.
 pub fn custom_entry(name: &str, command: &str) -> String {
     // Exec is a string value: escape backslashes first, then literal `%`.
-    let exec = desktop::escape(command.trim()).replace('%', "%%");
+    let exec = command_value(command);
     format!(
         "[Desktop Entry]\nType=Application\nName={}\nComment=Added by hyprdeck\nExec={exec}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
         desktop::escape(name.trim())
@@ -340,6 +356,34 @@ mod tests {
     }
 
     const BASE: &str = "[Desktop Entry]\nType=Application\nName=X\nExec=x %U\n";
+
+    #[test]
+    fn updating_login_command_preserves_session_restrictions() {
+        let mut file = DesktopFile::parse(&format!(
+            "{BASE}Hidden=true\nOnlyShowIn=GNOME;\nNotShowIn=Hyprland;\nTryExec=/bin/other\nX-systemd-skip=true\nX-Vendor-Setting=retained\n"
+        ));
+        configure_text(
+            &mut file,
+            true,
+            Some("\"/opt/user space/hyprdeck\" gamescope launch"),
+        );
+        assert!(evaluate(&file, &["Hyprland".into()], |_| true).enabled);
+        assert!(
+            evaluate(&file, &["Hyprland".into()], |_| true)
+                .blocker
+                .is_some()
+        );
+        assert_eq!(file.get_list("OnlyShowIn"), ["GNOME"]);
+        assert_eq!(file.get_list("NotShowIn"), ["Hyprland"]);
+        assert_eq!(file.get("TryExec"), Some("/bin/other"));
+        assert_eq!(file.get_bool("X-systemd-skip"), Some(true));
+        assert_eq!(file.get("X-Vendor-Setting"), Some("retained"));
+        assert_eq!(file.get("Name"), Some("X"));
+        assert_eq!(
+            desktop::exec_args(&file.get_string("Exec").unwrap()),
+            ["/opt/user space/hyprdeck", "gamescope", "launch"]
+        );
+    }
 
     #[test]
     fn plain_entry_runs() {

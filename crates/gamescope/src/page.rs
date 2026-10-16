@@ -453,9 +453,10 @@ impl Page {
                     "Steam Big Picture will no longer launch at login. The current session is unchanged."
                 }, false),
                 Err(error) => {
-                    page.syncing.set(true);
-                    page.startup.set_active(!on);
-                    page.syncing.set(false);
+                    // Persistence may have succeeded before daemon-reload failed.
+                    // Disable until the saved entry is read again, not guessed.
+                    page.startup_known.set(false);
+                    page.refresh_pending.set(true);
                     page.set_operation(&format!("Changing Gamescope login launch failed: {error:#}"), true);
                 }
             }

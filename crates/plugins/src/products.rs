@@ -42,7 +42,7 @@ struct ProductView {
 struct GroupView {
     widget: gtk::Box,
     group: adw::PreferencesGroup,
-    list: Option<gtk::ListBox>,
+    list: gtk::ListBox,
     expander: Option<adw::ExpanderRow>,
     rows: Vec<adw::ActionRow>,
     controller: Option<ControllerView>,
@@ -638,42 +638,34 @@ impl ProductView {
 
 impl GroupView {
     fn append_row(&self, row: &adw::ActionRow) {
-        if let Some(expander) = &self.expander {
-            expander.add_row(row);
-        } else if let Some(list) = &self.list {
-            list.append(row);
-        }
+        self.list.append(row);
     }
 
     fn remove_row(&self, row: &adw::ActionRow) {
-        if let Some(expander) = &self.expander {
-            expander.remove(row);
-        } else if let Some(list) = &self.list {
-            list.remove(row);
-        }
+        self.list.remove(row);
     }
 
     fn clear_and_reinsert(&self, rows: &[adw::ActionRow]) {
-        if let Some(expander) = &self.expander {
-            for row in rows {
+        for (index, row) in rows.iter().enumerate() {
+            if self
+                .list
+                .row_at_index(index as i32)
+                .as_ref()
+                .is_none_or(|current| current != row.upcast_ref::<gtk::ListBoxRow>())
+            {
+                let focus = row
+                    .root()
+                    .and_then(|root| root.downcast::<gtk::Window>().ok())
+                    .and_then(|window| gtk::prelude::GtkWindowExt::focus(&window))
+                    .filter(|focus| {
+                        focus == row.upcast_ref::<gtk::Widget>() || focus.is_ancestor(row)
+                    });
                 if row.parent().is_some() {
-                    expander.remove(row);
+                    self.list.remove(row);
                 }
-            }
-            for row in rows {
-                expander.add_row(row);
-            }
-        } else if let Some(list) = &self.list {
-            for (index, row) in rows.iter().enumerate() {
-                if list
-                    .row_at_index(index as i32)
-                    .as_ref()
-                    .is_none_or(|current| current != row.upcast_ref::<gtk::ListBoxRow>())
-                {
-                    if row.parent().is_some() {
-                        list.remove(row);
-                    }
-                    list.insert(row, index as i32);
+                self.list.insert(row, index as i32);
+                if let Some(focus) = focus {
+                    focus.grab_focus();
                 }
             }
         }
@@ -689,7 +681,10 @@ impl GroupView {
             widget.append(&view.widget);
             view
         });
-        let (group, list, expander) = if state.collapsed && state.visualization.is_none() {
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .build();
+        let (group, expander) = if state.collapsed && state.visualization.is_none() {
             let group = adw::PreferencesGroup::new();
             let expander = adw::ExpanderRow::builder()
                 .use_markup(false)
@@ -697,19 +692,17 @@ impl GroupView {
                 .build();
             expander.set_title(&state.title);
             expander.set_subtitle(&state.description);
+            expander.add_row(&list);
             group.add(&expander);
-            (group, None, Some(expander))
+            (group, Some(expander))
         } else {
             let group = adw::PreferencesGroup::builder()
                 .title(glib::markup_escape_text(&state.title))
                 .description(glib::markup_escape_text(&state.description))
                 .build();
-            let list = gtk::ListBox::builder()
-                .selection_mode(gtk::SelectionMode::None)
-                .build();
             list.add_css_class("boxed-list");
             group.add(&list);
-            (group, Some(list), None)
+            (group, None)
         };
         group.set_visible(
             !state.rows.is_empty()

@@ -88,6 +88,10 @@ pub fn enabled() -> Result<bool> {
     Ok(entry()?.is_some_and(|entry| entry.eval.enabled))
 }
 
+pub(crate) fn launch_allowed() -> Result<bool> {
+    Ok(entry()?.is_some_and(|entry| entry.eval.enabled && entry.eval.blocker.is_none()))
+}
+
 /// Schedule or unschedule the saved launcher for the next login only.
 pub fn set_enabled(on: bool) -> Result<()> {
     let existing = entry()?;
@@ -98,6 +102,9 @@ pub fn set_enabled(on: bool) -> Result<()> {
         return Ok(());
     }
     let cmd = command_string()?;
+    if existing.is_some() {
+        return xdg::configure(ID, true, Some(&cmd));
+    }
     let mut text = xdg::custom_entry("Steam Big Picture (Gamescope)", &cmd);
     text.push_str("Icon=input-gaming-symbolic\n");
     store::write_atomic(&xdg::user_dir().join(ID), text.as_bytes())?;

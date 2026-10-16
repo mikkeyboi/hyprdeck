@@ -28,13 +28,21 @@ pub fn start_background() {
     }
     hyprdeck_core::rt::spawn(async {
         let _ = tokio::task::spawn_blocking(|| {
-            if startup::enabled().unwrap_or(false) {
-                // Upgrade legacy bare `Exec=hyprdeck gamescope launch` entries to absolute path.
-                let _ = startup::set_enabled(true);
-                let settings = config::Settings::load().unwrap_or_default();
-                if let Err(err) = engine::launch(&settings, false) {
-                    tracing::warn!("login gamescope launch: {err:#}");
+            let result = (|| -> Result<()> {
+                if !startup::enabled()? {
+                    return Ok(());
                 }
+                // Migrate only Exec; retain desktop restrictions and user metadata.
+                startup::set_enabled(true)?;
+                if !startup::launch_allowed()? {
+                    return Ok(());
+                }
+                let settings = config::Settings::load()?;
+                engine::launch(&settings, false)?;
+                Ok(())
+            })();
+            if let Err(err) = result {
+                tracing::warn!("login gamescope launch: {err:#}");
             }
         })
         .await;

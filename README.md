@@ -179,6 +179,10 @@ which may be a temporary AppImage mount or development build. Enabled legacy bar
 are upgraded by the login background service. Scheduling reloads systemd's XDG generator without
 starting its unit. If that reload fails, the error explains that the setting was saved and gives
 the recovery command.
+Migration preserves desktop restrictions and unrelated entry properties. Automatic launch honors
+those restrictions and refuses malformed saved profiles without replacing them with defaults.
+After a save/reload partial failure, the Gaming switch re-reads the persisted setting rather than
+displaying a guessed rollback state.
 
 Headless scheduling is also available:
 
@@ -291,7 +295,7 @@ feedback with results in their product section. Late background snapshots cannot
   <img src="docs/screenshots/basilisk-lighting.png" width="49%" alt="Basilisk RGB effect and color settings">
   <img src="docs/screenshots/wolverine-overview.png" width="49%" alt="Wolverine controller overview and live input inspector">
   <img src="docs/screenshots/wolverine-buttons.png" width="49%" alt="Focused single-button onboard assignment editor">
-  <img src="docs/screenshots/wolverine-macros.png" width="49%" alt="Separate onboard keyboard shortcuts and Linux software macros">
+  <img src="docs/screenshots/basilisk-macros.png" width="49%" alt="Native programmable software macro creation and explicit upstream editor launch">
   <img src="docs/screenshots/basilisk-power.png" width="49%" alt="Customizable global OpenRazer battery notification preferences">
 </p>
 
