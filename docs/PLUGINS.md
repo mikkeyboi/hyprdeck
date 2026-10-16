@@ -41,6 +41,9 @@ hyprdeck plugins disable razer
 
 `list` and `check` output JSON. `state` and successful `action` output the versioned response envelope described below; failures print an error and exit unsuccessfully. Action names, arguments and device ids come from the plugin's own state/documentation. `JSON args` must be an object and should be single-quoted in a shell. State and action require prior enable. `check` without an id attempts every installed plugin and fails if any check fails, while still printing successful results. There is no automatic action, hardware configuration, firmware flash, binary installation or update.
 
+Product-page background snapshots never occupy the user-action busy gate. Starting an action invalidates any in-flight older snapshot; late refresh success or failure cannot replace that action's newer result or re-enable its controls. Explicit operations remain serialized, with native pending/running/completed/failed feedback.
+
+
 GitHub management requires `curl` and `sha256sum` on PATH (the same external-tool approach used by Hyprdeck's update features). Anonymous GitHub API rate limits apply; errors are explicit rather than silently treating stale data as a current release. Background checks use a one-hour cache, start after 30 seconds, and check hourly. Notifications use Hyprdeck's existing **System** notification policy: desktop/in-app/off, visibility, timing and error handling remain centralized. Notification deduplication is per plugin id and version. Notification failures are logged and retry on a later check. Manual checks force a fresh lookup; updates always re-fetch before replacement.
 
 Installed layout:
@@ -86,7 +89,7 @@ Names/descriptions and state texts are capped at 16,384 UTF-8 bytes and cannot c
 
 ## Subprocess transport: API version 1
 
-The host starts `<installed-executable> --request` directly, with the plugin directory as its current directory. It writes one JSON request to stdin and closes stdin; a newline is not required. The executable must read until EOF, emit exactly one JSON response on stdout and exit. Diagnostics belong on stderr. No banners, progress output or logging on stdout. Requests inherit the user's environment; do not depend on GTK or a graphical session for ordinary state/actions.
+The host starts `<installed-executable> --request` directly, with the plugin directory as its current directory. It writes one JSON request to stdin and closes stdin; a newline is not required. The executable must read until EOF, emit exactly one JSON response on stdout and exit. Diagnostics belong on stderr. No banners, progress output or logging on stdout. Requests inherit the user's environment; do not depend on GTK or a graphical session for ordinary state/actions. Controller input streaming is a separate optional subprocess interface described below, not an exception to the single-response request contract.
 
 State request:
 
@@ -183,8 +186,37 @@ capability. Different peripheral layouts can be added as new validated visualiza
 bundling vendor backends. Arbitrary plugin SVG, HTML or executable UI scripts are not accepted.
 
 Technical groups can set `collapsed: true` to appear under expandable details. Visualization values
-refresh in-place, preserving selection and editing. Polling cadence is sampled telemetry, not a
-USB packet-rate guarantee. Hiding the page stops refresh requests.
+refresh in-place, preserving selection and editing. Without a stream, readings follow ordinary
+state refreshes: sampled telemetry, not a USB packet-rate guarantee. Hiding the page stops refresh
+requests and any controller input stream.
+
+#### Optional live controller input stream
+
+A controller visualization can advertise `"stream":{"args":["--input-stream","usb:1-8"]}`.
+The host launches the enabled plugin's **own installed executable** with these literal arguments,
+never a shell, another executable or a command supplied in an argument. Its working directory is
+the plugin directory and stdin is closed. There must be 1–16 nonempty arguments, at most 256 bytes
+each and 2,048 bytes combined, with no control characters.
+
+The subprocess emits newline-delimited JSON (NDJSON), one complete snapshot per line, for example:
+
+```json
+{"status":"Live input · USB","inputs":[{"id":"a","label":"A","detail":"Standard input","pressed":true},{"id":"left_stick","label":"Left stick","detail":"Normalized position","x":0.25,"y":-0.5}]}
+```
+
+Each line, including its newline, is limited to 64 KiB. `status` and `inputs` are required and use
+the same text, input-id, uniqueness and normalized-value validation as the visualization. Send
+current readings, not deltas: absent readings become unavailable rather than staying pressed or
+centered. Diagnostics go to stderr; the host drains it while retaining at most 16 KiB. Do not
+emit request-response envelopes, logs or progress messages on stream stdout.
+
+The stream runs only while its controller view is mapped; it is not subject to the 15-second
+ordinary-request deadline and does not hold the request/action lock for its lifetime. State and
+actions still use `--request`, including capability/control metadata. Frames update the native
+view without polling state for each sample. EOF, invalid frames or backend failure clear live
+readings and show an explicit disconnection; remapping the view retries the stream. Leaving or
+destroying the view terminates and reaps the subprocess and its process-group descendants.
+Older hosts ignore the optional `stream` field, so keep useful state readings and rows as fallback.
 
 The **Plugins** manager handles installation, activation and updates separately. Installed
 integrations have nested sidebar entries leading to their product cards and device pages.
@@ -216,8 +248,8 @@ Legacy plugins without products keep their original group view.
 ```
 
 Product ids use the same safe-id rules as plugin ids, and must be unique. `kind` is `mouse`,
-`controller`, `dock` or `peripheral`, selecting native artwork—not a plugin-supplied executable or
-remote image. Names and displayed strings are plain text. At most 64 products and 12 sections per
+`controller`, `dock`, `keyboard`, `keypad`, `headset`, `mousemat`, `accessory` or `peripheral`,
+selecting native artwork—not a plugin-supplied executable or remote image. Names and displayed strings are plain text. At most 64 products and 12 sections per
 product; section ids are unique and every group reference must resolve to an existing group.
 Battery can be null; its percentage can be null or finite 0–100, charging can be null or Boolean,
 and source identifies the actual provider. Unknown values are not estimates.
@@ -284,8 +316,16 @@ does not invoke an action. The backend must validate the target device, zone and
 Forms group related native fields and send one explicit Apply action. `args.value` is an object
 keyed by each field id. Field kinds are `number`, `switch`, `text`, `choice`, and `color`; values
 use their corresponding JSON type. Number fields require finite min/max/step bounds, and choice
-fields require real options/current values. At most 32 fields, unique safe ids. The backend owns
-operation sequencing and capability validation. Pending or focused field edits survive live updates.
+fields require real options/current values. Form choices allow 1–1,024 unique options and become
+searchable when there are more than 16; a standalone `choice` control still allows at most 256
+options. At most 32 fields, unique safe ids. The backend owns operation sequencing and capability
+validation. Pending or focused field edits survive live updates.
+
+Action feedback is host-native: the submitted row shows a pending/running spinner and then
+completion, cancellation or failure, while conflicting controls are disabled during the request.
+Successful completion renders the returned state in the current section. This is busy feedback,
+not plugin-reported percentage progress; even a long analyzer action returns only its one final
+response and must finish within the ordinary request deadline.
 
 ### DPI editor
 
@@ -463,7 +503,7 @@ A state response may report absent OpenRazer/permissions while still exposing re
 
 ## Publishing fixed release assets
 
-For a stable Razer release `v0.1.0`, upload these **exact assets**:
+For a stable Razer release `v0.6.0`, publish these **exact required assets**:
 
 ```text
 plugin.json
@@ -473,17 +513,33 @@ hyprdeck-razer-linux-x86_64.sha256
 
 `plugin.json.executable` remains `hyprdeck-razer`; `asset` names the downloadable platform file. Hyprdeck installs it under the executable name and sets executable permissions. No archive extraction is involved. Replace names with your own executable for a different plugin, preserving the naming rule.
 
-Example from the plugin source repository, with a manifest version already set to `0.1.0`:
+The Razer release workflow also attaches `70-hyprdeck-wolverine.rules` for optional manual
+administrator installation. The host installs only the manifest and executable; a plugin update
+never installs udev rules, system dependencies or companion software.
+
+Publish and install the compatible host **before** publishing a plugin that uses new controls or
+expanded validation limits. In particular, Razer 0.6.0 can advertise form choices beyond the 256-option
+limit of Hyprdeck 0.1.2. API version 1 does not negotiate host feature levels or a minimum host
+version; additive fields such as `stream` are ignored by older hosts, but unknown controls or
+unsupported limits fail the state handshake. An enabled update then rolls back; a disabled
+installation defers its handshake until explicit enable. A host release alone does not upgrade
+the running process: restart into it before updating/enabling the new plugin.
+
+For Razer, merge the reviewed plugin PR with Cargo.toml, Cargo.lock's root package and plugin.json
+all at `0.6.0`, and wait for CI. From the plugin repository, tag that verified merged commit:
 
 ```sh
-cargo build --release --locked
-mkdir -p release
-cp plugin.json release/plugin.json
-cp target/release/hyprdeck-razer release/hyprdeck-razer-linux-x86_64
-(cd release && sha256sum hyprdeck-razer-linux-x86_64 > hyprdeck-razer-linux-x86_64.sha256)
-gh release create v0.1.0 --title 'Razer plugin 0.1.0' --notes 'Describe capabilities, requirements, and changes.' \
-  release/plugin.json release/hyprdeck-razer-linux-x86_64 release/hyprdeck-razer-linux-x86_64.sha256
+git fetch origin main --tags
+release_sha=$(git rev-parse origin/main)
+git tag v0.6.0 "$release_sha"
+git push origin refs/tags/v0.6.0
 ```
+
+The tag-triggered Release workflow checks the exact Cargo/manifest/tag identity, runs its checks,
+builds the standalone binary, generates the checksum and publishes the immutable release. Do not
+also run `gh release create` or upload local replacement assets: that races the workflow and its
+refusal to overwrite an existing release. If the tag exists but its release failed, inspect the
+failure and rerun Release for that same tag; fixes to source require a new version and tag.
 
 For a real update, increment the manifest to a newer stable version and publish matching `vX.Y.Z` assets. Do not mutate an existing release to replace its executable. Build the asset for the named architecture and document runtime requirements; a wrong-format executable fails its enable/update handshake.
 

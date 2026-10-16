@@ -26,7 +26,9 @@ struct Page {
     manager: gtk::Button,
     refresh_interval_ms: Cell<u64>,
     busy: Cell<bool>,
+    action_generation: Cell<u64>,
     loop_started: Cell<bool>,
+    pending_route: RefCell<Option<(Option<String>, Option<String>)>>,
     view: Rc<PluginView>,
 }
 struct PluginView {
@@ -64,6 +66,48 @@ struct Rendered {
     description: gtk::Label,
     groups: Vec<(adw::PreferencesGroup, Vec<adw::ActionRow>)>,
     controllers: Vec<Option<ControllerView>>,
+}
+
+#[derive(Clone)]
+struct ActionFeedback {
+    label: glib::WeakRef<gtk::Label>,
+    spinner: glib::WeakRef<gtk::Spinner>,
+}
+
+impl ActionFeedback {
+    fn new(row: &adw::ActionRow) -> Self {
+        let feedback = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        feedback.set_valign(gtk::Align::Center);
+        let spinner = gtk::Spinner::new();
+        spinner.set_visible(false);
+        let label = gtk::Label::new(None);
+        label.set_visible(false);
+        label.add_css_class("dim-label");
+        feedback.append(&spinner);
+        feedback.append(&label);
+        row.add_suffix(&feedback);
+        Self {
+            label: label.downgrade(),
+            spinner: spinner.downgrade(),
+        }
+    }
+
+    fn set(&self, message: &str, running: bool, error: Option<&str>) {
+        if let Some(label) = self.label.upgrade() {
+            label.set_text(message);
+            label.set_visible(true);
+            label.set_tooltip_text(error);
+            if error.is_some() {
+                label.add_css_class("error");
+            } else {
+                label.remove_css_class("error");
+            }
+        }
+        if let Some(spinner) = self.spinner.upgrade() {
+            spinner.set_spinning(running);
+            spinner.set_visible(running);
+        }
+    }
 }
 
 enum FormInput {
@@ -117,6 +161,20 @@ fn color_picker(value: &str) -> gtk::ColorDialogButton {
 fn mark_edit(view: &Rc<PluginView>, row: &adw::ActionRow) {
     view.dirty.set(true);
     row.add_css_class("hd-pending-edit");
+}
+
+fn has_pending_edit(widget: &gtk::Widget) -> bool {
+    if widget.has_css_class("hd-pending-edit") {
+        return true;
+    }
+    let mut child = widget.first_child();
+    while let Some(widget) = child {
+        if has_pending_edit(&widget) {
+            return true;
+        }
+        child = widget.next_sibling();
+    }
+    false
 }
 
 fn label(text: &str) -> gtk::Label {
@@ -280,6 +338,7 @@ pub fn build_plugin(ctx: &Ctx, id: &str) -> gtk::Widget {
         .transition_type(gtk::StackTransitionType::SlideLeftRight)
         .build();
     let state = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    state.set_widget_name(&format!("hd-plugin-root-{id}"));
     navigation.add_named(&state, Some("products"));
     content.append(&navigation);
     let manage = button("Open plugin manager");
@@ -297,7 +356,9 @@ pub fn build_plugin(ctx: &Ctx, id: &str) -> gtk::Widget {
         manager: manage,
         refresh_interval_ms: Cell::new(2000),
         busy: Cell::new(false),
+        action_generation: Cell::new(0),
         loop_started: Cell::new(false),
+        pending_route: RefCell::new(None),
         view: Rc::new(PluginView {
             id: id.to_owned(),
             state,
@@ -313,6 +374,20 @@ pub fn build_plugin(ctx: &Ctx, id: &str) -> gtk::Widget {
             root.vadjustment().set_value(0.0);
         }
     });
+    let page_route = page.clone();
+    root.connect_name_notify(move |w| {
+        let name = w.widget_name();
+        if let Some(route) = name.strip_prefix("route:") {
+            let mut parts = route.splitn(2, ':');
+            let prod = parts.next().filter(|s| !s.is_empty()).map(str::to_owned);
+            let sec = parts.next().filter(|s| !s.is_empty()).map(str::to_owned);
+            if let Some(products) = page_route.view.products.borrow().as_ref() {
+                products.navigate(prod.as_deref(), sec.as_deref());
+            } else {
+                *page_route.pending_route.borrow_mut() = Some((prod, sec));
+            }
+        }
+    });
     let page_on_map = page.clone();
     root.connect_map(move |_| {
         if page_on_map.loop_started.replace(true) {
@@ -326,9 +401,7 @@ pub fn build_plugin(ctx: &Ctx, id: &str) -> gtk::Widget {
                     break;
                 };
                 if root.is_mapped() && !page.busy.get() {
-                    page.begin("Refreshing…");
                     page.refresh().await;
-                    page.end();
                 }
                 drop(root);
                 glib::timeout_future(Duration::from_millis(page.refresh_interval_ms.get())).await;
@@ -613,8 +686,12 @@ impl Page {
                 .toast("A plugin operation is in progress. Please wait.");
             return false;
         }
-        self.status.set_text(message);
-        self.status.set_visible(message != "Refreshing…");
+        self.action_generation
+            .set(self.action_generation.get().wrapping_add(1));
+        if message != "Refreshing…" {
+            self.status.set_text(message);
+            self.status.set_visible(true);
+        }
         true
     }
     fn end(&self) {
@@ -628,9 +705,13 @@ impl Page {
         }
     }
     async fn refresh(self: &PageRef) {
+        let generation = self.action_generation.get();
         self.refresh_interval_ms.set(2000);
         let view = &self.view;
         let inventory = rt::blocking(backend::list).await;
+        if self.busy.get() || self.action_generation.get() != generation {
+            return;
+        }
         let unavailable = match &inventory {
             Ok(installed) => match installed.iter().find(|plugin| plugin.id == view.id) {
                 Some(plugin) if plugin.manifest.is_none() => Some(format!(
@@ -648,6 +729,11 @@ impl Page {
             view.diagnostics.set_visible(true);
             self.manager.set_visible(true);
             view.state.set_sensitive(false);
+            if let Some(rendered) = view.rendered.borrow().as_ref() {
+                for controller in rendered.controllers.iter().flatten() {
+                    controller.disconnect();
+                }
+            }
             if let Some(products) = view.products.borrow().as_ref() {
                 products.disconnect();
             }
@@ -657,7 +743,11 @@ impl Page {
             return;
         }
         let id = view.id.clone();
-        match rt::run(async move { backend::request(&id, None, Map::new()).await }).await {
+        let result = rt::run(async move { backend::request(&id, None, Map::new()).await }).await;
+        if self.busy.get() || self.action_generation.get() != generation {
+            return;
+        }
+        match result {
             Ok(state) => {
                 view.diagnostics.set_visible(false);
                 self.manager.set_visible(false);
@@ -671,6 +761,11 @@ impl Page {
                 view.diagnostics.set_visible(true);
                 self.manager.set_visible(true);
                 view.state.set_sensitive(false);
+                if let Some(rendered) = view.rendered.borrow().as_ref() {
+                    for controller in rendered.controllers.iter().flatten() {
+                        controller.disconnect();
+                    }
+                }
                 if let Some(products) = view.products.borrow().as_ref() {
                     products.disconnect();
                 }
@@ -684,15 +779,33 @@ impl Page {
         args: Map<String, Value>,
         destructive: bool,
         submitted: Option<adw::ActionRow>,
+        feedback: ActionFeedback,
     ) {
         if !self.begin("Running plugin action…") {
             return;
+        }
+        let title = submitted
+            .as_ref()
+            .map_or_else(|| action.clone(), |row| row.title().to_string());
+        feedback.set("Pending…", true, None);
+        self.status.set_text(&format!("Pending: {title}…"));
+        let trigger = submitted.clone();
+        if let Some(row) = &trigger {
+            row.set_sensitive(false);
         }
         let page = self.clone();
         let view = view.clone();
         let ctx = self.ctx.clone();
         ctx.spawn(async move {
-            if destructive && !page.ctx.confirm("Run destructive plugin action?", "This action is marked destructive by the plugin. It runs unsandboxed as your user.", "Run action", true).await { page.end(); return; }
+            if destructive && !page.ctx.confirm("Run destructive plugin action?", "This action is marked destructive by the plugin. It runs unsandboxed as your user.", "Run action", true).await {
+                feedback.set("Cancelled", false, None);
+                page.status.set_text(&format!("Cancelled: {title}"));
+                if let Some(row) = &trigger { row.set_sensitive(true); }
+                page.end();
+                return;
+            }
+            feedback.set("Running…", true, None);
+            page.status.set_text(&format!("Running: {title}…"));
             view.state.set_sensitive(false);
             if let Some(products) = view.products.borrow().as_ref() { products.set_sensitive(false); }
             let id = view.id.clone();
@@ -700,18 +813,23 @@ impl Page {
             match result {
                 Ok(state) => {
                     if let Some(row) = submitted { row.remove_css_class("hd-pending-edit"); }
-                    view.dirty.set(false);
+                    view.dirty.set(has_pending_edit(view.state.upcast_ref()));
                     view.diagnostics.set_visible(false);
                     page.manager.set_visible(false);
                     page.render(&view, state);
+                    feedback.set("Completed", false, None);
+                    page.status.set_text(&format!("Completed: {title}. Results updated in this section."));
                 }
                 Err(error) => {
+                    feedback.set("Failed", false, Some(&format!("{error:#}")));
+                    page.status.set_text(&format!("{title} failed: {error:#}"));
                     view.diagnostics.set_text(&format!("Action failed: {error:#}"));
                     view.diagnostics.set_visible(true);
                     page.manager.set_visible(true);
                     page.ctx.error("Plugin action failed", &error);
                 }
             }
+            if let Some(row) = &trigger { row.set_sensitive(true); }
             view.state.set_sensitive(true); page.end();
             if let Some(products) = view.products.borrow().as_ref() { products.set_sensitive(true); }
         });
@@ -741,6 +859,9 @@ impl Page {
             let focus = gtk::prelude::GtkWindowExt::focus(&self.ctx.window);
             if let Some(products) = view.products.borrow().as_ref() {
                 products.update(&state, false, focus.as_ref());
+                if let Some((prod, sec)) = self.pending_route.borrow_mut().take() {
+                    products.navigate(prod.as_deref(), sec.as_deref());
+                }
             }
             return;
         }
@@ -759,6 +880,13 @@ impl Page {
             let rendered = view.rendered.borrow();
             if let Some(old) = rendered.as_ref() {
                 if old.state == state {
+                    for (controller, group) in old.controllers.iter().zip(&state.groups) {
+                        if let (Some(controller), Some(visualization)) =
+                            (controller, &group.visualization)
+                        {
+                            controller.update(visualization);
+                        }
+                    }
                     return;
                 }
                 let same_shape = old.state.groups.len() == state.groups.len()
@@ -844,11 +972,12 @@ impl Page {
             let controller = section.visualization.as_ref().map(|visualization| {
                 let page = Rc::downgrade(self);
                 let target = Rc::downgrade(view);
-                let controller = ControllerView::new(visualization, move |row, control| {
-                    if let (Some(page), Some(view)) = (page.upgrade(), target.upgrade()) {
-                        page.control(&view, row, control);
-                    }
-                });
+                let controller =
+                    ControllerView::new(&view.id, visualization, move |row, control| {
+                        if let (Some(page), Some(view)) = (page.upgrade(), target.upgrade()) {
+                            page.control(&view, row, control);
+                        }
+                    });
                 view.state.append(&controller.widget);
                 controller
             });
@@ -883,6 +1012,7 @@ impl Page {
         });
     }
     fn control(self: &PageRef, view: &Rc<PluginView>, row: &adw::ActionRow, control: Control) {
+        let feedback = ActionFeedback::new(row);
         match control {
             Control::Button {
                 label,
@@ -897,9 +1027,17 @@ impl Page {
                 row.add_suffix(&widget);
                 let weak = Rc::downgrade(self);
                 let target = Rc::downgrade(view);
+                let edited = row.downgrade();
                 widget.connect_clicked(move |_| {
                     if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
-                        page.run_action(&view, action.clone(), args.clone(), destructive, None);
+                        page.run_action(
+                            &view,
+                            action.clone(),
+                            args.clone(),
+                            destructive,
+                            edited.upgrade(),
+                            feedback.clone(),
+                        );
                     }
                 });
             }
@@ -930,7 +1068,14 @@ impl Page {
                     if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
                         let mut args = args.clone();
                         args.insert("value".into(), Value::Bool(widget.is_active()));
-                        page.run_action(&view, action.clone(), args, false, edited.upgrade());
+                        page.run_action(
+                            &view,
+                            action.clone(),
+                            args,
+                            false,
+                            edited.upgrade(),
+                            feedback.clone(),
+                        );
                     }
                 });
             }
@@ -977,7 +1122,14 @@ impl Page {
                         let value = number_value(widget.value());
                         let mut args = args.clone();
                         args.insert("value".into(), value);
-                        page.run_action(&view, action.clone(), args, false, edited.upgrade());
+                        page.run_action(
+                            &view,
+                            action.clone(),
+                            args,
+                            false,
+                            edited.upgrade(),
+                            feedback.clone(),
+                        );
                     }
                 });
             }
@@ -1016,7 +1168,14 @@ impl Page {
                     {
                         let mut args = args.clone();
                         args.insert("value".into(), Value::String(option.value.clone()));
-                        page.run_action(&view, action.clone(), args, false, edited.upgrade());
+                        page.run_action(
+                            &view,
+                            action.clone(),
+                            args,
+                            false,
+                            edited.upgrade(),
+                            feedback.clone(),
+                        );
                     }
                 });
             }
@@ -1048,7 +1207,14 @@ impl Page {
                     if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
                         let mut args = args.clone();
                         args.insert("value".into(), Value::String(widget.text().to_string()));
-                        page.run_action(&view, action.clone(), args, false, edited.upgrade());
+                        page.run_action(
+                            &view,
+                            action.clone(),
+                            args,
+                            false,
+                            edited.upgrade(),
+                            feedback.clone(),
+                        );
                     }
                 });
             }
@@ -1076,7 +1242,14 @@ impl Page {
                     if let (Some(page), Some(view)) = (weak.upgrade(), target.upgrade()) {
                         let mut args = args.clone();
                         args.insert("value".into(), Value::String(color_hex(&widget.rgba())));
-                        page.run_action(&view, action.clone(), args, false, edited.upgrade());
+                        page.run_action(
+                            &view,
+                            action.clone(),
+                            args,
+                            false,
+                            edited.upgrade(),
+                            feedback.clone(),
+                        );
                     }
                 });
             }
@@ -1111,7 +1284,14 @@ impl Page {
                             };
                             let mut args = args.clone();
                             args.insert("value".into(), value);
-                            page.run_action(&view, action.clone(), args, false, applied_row);
+                            page.run_action(
+                                &view,
+                                action.clone(),
+                                args,
+                                false,
+                                applied_row,
+                                feedback.clone(),
+                            );
                         }
                     },
                 );
@@ -1212,6 +1392,7 @@ impl Page {
                             let model = gtk::StringList::new(&labels);
                             let input = adw::ComboRow::builder()
                                 .use_markup(false)
+                                .enable_search(field.options.len() > 16)
                                 .model(&model)
                                 .build();
                             input.set_title(&field.label);
@@ -1260,7 +1441,14 @@ impl Page {
                             .collect();
                         let mut args = args.clone();
                         args.insert("value".into(), Value::Object(values));
-                        page.run_action(&view, action.clone(), args, false, edited.upgrade());
+                        page.run_action(
+                            &view,
+                            action.clone(),
+                            args,
+                            false,
+                            edited.upgrade(),
+                            feedback.clone(),
+                        );
                     }
                 });
             }

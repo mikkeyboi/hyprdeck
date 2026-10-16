@@ -24,6 +24,7 @@ pub(crate) struct Products {
 struct ProductView {
     card: gtk::FlowBoxChild,
     card_name: gtk::Label,
+    card_description: gtk::Label,
     card_connection: gtk::Label,
     card_battery: gtk::Label,
     name: gtk::Label,
@@ -42,9 +43,52 @@ struct GroupView {
     widget: gtk::Box,
     group: adw::PreferencesGroup,
     list: gtk::ListBox,
+    expander: Option<adw::ExpanderRow>,
     rows: Vec<adw::ActionRow>,
     controller: Option<ControllerView>,
     state: Group,
+}
+
+const PRODUCTS_CSS: &str = "
+.hd-product-chip {
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 0.82em;
+  font-weight: 600;
+  background: alpha(currentColor, 0.08);
+}
+.hd-product-chip-accent {
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 0.82em;
+  font-weight: 600;
+  color: #69c991;
+  background: alpha(#69c991, 0.14);
+}
+.hd-product-card {
+  padding: 4px;
+}
+.hd-product-tabs button {
+  min-width: 0;
+  padding: 6px 8px;
+}
+";
+
+fn ensure_products_css() {
+    thread_local! { static INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    if INSTALLED.get() {
+        return;
+    }
+    if let Some(display) = gtk::gdk::Display::default() {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(PRODUCTS_CSS);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        INSTALLED.set(true);
+    }
 }
 
 fn text(value: &str, class: &str) -> gtk::Label {
@@ -56,32 +100,28 @@ fn text(value: &str, class: &str) -> gtk::Label {
     label.add_css_class(class);
     label
 }
-fn battery(product: &Product) -> String {
-    match &product.battery {
-        Some(battery) => match battery.percentage {
-            Some(value) => format!(
-                "Battery {:.0}%{}",
-                value,
-                match battery.charging {
-                    Some(true) => " · Charging",
-                    Some(false) => "",
-                    None => " · Charging status unavailable",
-                }
-            ),
-            None => match battery.charging {
-                Some(true) => "Charging · Battery level unavailable".into(),
-                _ => "Battery unavailable".into(),
-            },
+fn battery(product: &Product) -> Option<String> {
+    let battery = product.battery.as_ref()?;
+    match battery.percentage {
+        Some(value) => Some(format!(
+            "Battery {:.0}%{}",
+            value,
+            match battery.charging {
+                Some(true) => " · Charging",
+                _ => "",
+            }
+        )),
+        None => match battery.charging {
+            Some(true) => Some("Charging".into()),
+            _ => None,
         },
-        None => "Battery unavailable".into(),
     }
 }
 fn connection(product: &Product) -> String {
-    [product.connection.as_str(), product.status.as_str()]
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ")
+    if !product.connection.is_empty() {
+        return product.connection.clone();
+    }
+    product.status.clone()
 }
 
 fn control_target(control: &Control) -> (&str, &serde_json::Map<String, serde_json::Value>) {
@@ -162,11 +202,21 @@ impl Products {
         navigation: &gtk::Stack,
         render_control: impl Fn(&adw::ActionRow, Control) + 'static,
     ) -> Self {
-        let widget = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        ensure_products_css();
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        let intro = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let title = text("Connected Devices", "title-2");
+        let subtitle = text(
+            "Select a device to customize lighting, sensitivity, polling and hardware controls",
+            "dim-label",
+        );
+        intro.append(&title);
+        intro.append(&subtitle);
+        widget.append(&intro);
         let gallery = gtk::FlowBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .min_children_per_line(1)
-            .max_children_per_line(3)
+            .max_children_per_line(2)
             .column_spacing(18)
             .row_spacing(18)
             .homogeneous(true)
@@ -219,7 +269,14 @@ impl Products {
                 views.insert(product.id.clone(), view);
             }
             if let Some(view) = views.get_mut(&product.id) {
-                view.update(product, state, &self.render_control, preserve_edits, focus);
+                view.update(
+                    product,
+                    state,
+                    &self.plugin_id,
+                    &self.render_control,
+                    preserve_edits,
+                    focus,
+                );
             }
         }
     }
@@ -228,6 +285,13 @@ impl Products {
         for view in self.views.borrow().values() {
             view.connection
                 .set_text("Backend unavailable · Controls paused");
+            for groups in view.groups.values() {
+                for group in groups.values() {
+                    if let Some(controller) = &group.controller {
+                        controller.disconnect();
+                    }
+                }
+            }
             view.sections.set_sensitive(false);
         }
     }
@@ -237,32 +301,64 @@ impl Products {
             view.sections.set_sensitive(sensitive);
         }
     }
+
+    pub(crate) fn navigate(&self, product_id: Option<&str>, section_id: Option<&str>) {
+        let Some(product_id) = product_id else {
+            self.navigation.set_visible_child_name("products");
+            return;
+        };
+        let views = self.views.borrow();
+        let target = views.get(product_id).or_else(|| {
+            views
+                .values()
+                .find(|v| v.navigation_id.contains(product_id))
+        });
+        if let Some(view) = target {
+            self.navigation.set_visible_child_name(&view.navigation_id);
+            if let Some(sec) = section_id
+                && view.sections.child_by_name(sec).is_some()
+            {
+                view.sections.set_visible_child_name(sec);
+            }
+        }
+    }
 }
 
 impl ProductView {
     fn new(product: &Product, plugin_id: &str, navigation: &gtk::Stack) -> Self {
+        ensure_products_css();
         let navigation_id = format!("product-{plugin_id}-{}", product.id);
         let reconnecting = navigation.visible_child_name().as_deref() == Some(&navigation_id);
         if let Some(previous) = navigation.child_by_name(&navigation_id) {
             navigation.remove(&previous);
         }
-        let card_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        card_content.set_margin_top(16);
-        card_content.set_margin_bottom(16);
-        card_content.set_margin_start(16);
-        card_content.set_margin_end(16);
+        let card_content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        card_content.set_margin_top(18);
+        card_content.set_margin_bottom(18);
+        card_content.set_margin_start(18);
+        card_content.set_margin_end(18);
         card_content.append(&illustration::product(&product.kind, false));
         let card_name = text(&product.name, "title-3");
-        let card_connection = text(&connection(product), "dim-label");
-        let card_battery = text(&battery(product), "caption");
+        let card_description = text(&product.description, "dim-label");
+        let card_chips = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let card_connection = text(&connection(product), "hd-product-chip");
+        let card_bat_text = battery(product);
+        let card_battery = text(
+            card_bat_text.as_deref().unwrap_or(""),
+            "hd-product-chip-accent",
+        );
+        card_battery.set_visible(card_bat_text.is_some());
+        card_chips.append(&card_connection);
+        card_chips.append(&card_battery);
         card_content.append(&card_name);
-        card_content.append(&card_connection);
-        card_content.append(&card_battery);
+        card_content.append(&card_description);
+        card_content.append(&card_chips);
         let open = gtk::Button::builder()
             .child(&card_content)
             .hexpand(true)
             .build();
         open.add_css_class("card");
+        open.add_css_class("hd-product-card");
         open.set_tooltip_text(Some(&format!("Open {}", product.name)));
         open.update_property(&[gtk::accessible::Property::Label(&format!(
             "Open {}",
@@ -270,22 +366,27 @@ impl ProductView {
         ))]);
         let card = gtk::FlowBoxChild::new();
         card.set_child(Some(&open));
-        let page = gtk::Box::new(gtk::Orientation::Vertical, 18);
-        let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-        let back = gtk::Button::with_label("‹ Products");
+        let page = gtk::Box::new(gtk::Orientation::Vertical, 16);
+        let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let back = gtk::Button::with_label("‹ All Devices");
         back.set_tooltip_text(Some("Back to products"));
         toolbar.append(&back);
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        toolbar.append(&spacer);
+        let connection = text(&connection(product), "hd-product-chip");
+        let bat_text = battery(product);
+        let battery = text(bat_text.as_deref().unwrap_or(""), "hd-product-chip-accent");
+        battery.set_visible(bat_text.is_some());
+        toolbar.append(&connection);
+        toolbar.append(&battery);
         page.append(&toolbar);
+        let header_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
         let name = text(&product.name, "title-1");
         let description = text(&product.description, "dim-label");
-        let connection = text(&connection(product), "body");
-        let battery = text(&battery(product), "caption");
-        page.append(&name);
-        page.append(&description);
-        let metadata = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        metadata.append(&connection);
-        metadata.append(&battery);
-        page.append(&metadata);
+        header_box.append(&name);
+        header_box.append(&description);
+        page.append(&header_box);
         let sections = gtk::Stack::builder()
             .hhomogeneous(false)
             .vhomogeneous(false)
@@ -295,6 +396,7 @@ impl ProductView {
             .stack(&sections)
             .halign(gtk::Align::Start)
             .build();
+        tabs.add_css_class("hd-product-tabs");
         let tab_scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Automatic)
             .vscrollbar_policy(gtk::PolicyType::Never)
@@ -366,6 +468,7 @@ impl ProductView {
         Self {
             card,
             card_name,
+            card_description,
             card_connection,
             card_battery,
             name,
@@ -386,12 +489,16 @@ impl ProductView {
         &mut self,
         product: &Product,
         state: &State,
+        plugin_id: &str,
         render: &ControlRenderer,
         preserve: bool,
         focus: Option<&gtk::Widget>,
     ) {
         if self.card_name.text() != product.name {
             self.card_name.set_text(&product.name);
+        }
+        if self.card_description.text() != product.description {
+            self.card_description.set_text(&product.description);
         }
         let connection = connection(product);
         if self.card_connection.text() != connection {
@@ -400,13 +507,16 @@ impl ProductView {
         if self.connection.text() != connection {
             self.connection.set_text(&connection);
         }
-        let battery = battery(product);
-        if self.card_battery.text() != battery {
-            self.card_battery.set_text(&battery);
+        let bat = battery(product);
+        let bat_str = bat.as_deref().unwrap_or("");
+        if self.card_battery.text() != bat_str {
+            self.card_battery.set_text(bat_str);
         }
-        if self.battery.text() != battery {
-            self.battery.set_text(&battery);
+        self.card_battery.set_visible(bat.is_some());
+        if self.battery.text() != bat_str {
+            self.battery.set_text(bat_str);
         }
+        self.battery.set_visible(bat.is_some());
         if self.name.text() != product.name {
             self.name.set_text(&product.name);
         }
@@ -507,87 +617,145 @@ impl ProductView {
             let mut previous: Option<gtk::Widget> = None;
             for group in ordered {
                 if !groups.contains_key(&group.id) {
-                    let rendered = GroupView::new(group, render);
+                    let rendered = GroupView::new(group, plugin_id, render);
                     section_box.append(&rendered.widget);
                     groups.insert(group.id.clone(), rendered);
                 }
                 let rendered = groups.get_mut(&group.id).expect("group inserted");
-                rendered.update(group, render, preserve, focus);
+                rendered.update(group, plugin_id, render, preserve, focus);
                 if let Some(controller) = &rendered.controller {
                     let duplicate = matches!(&group.visualization, Some(Visualization::Controller { name, .. }) if name == &product.name);
                     controller.show_header(!duplicate);
                 }
-                if prioritize_diagram {
-                    if rendered.widget.prev_sibling() != previous {
-                        section_box.reorder_child_after(&rendered.widget, previous.as_ref());
-                    }
-                    previous = Some(rendered.widget.clone().upcast());
+                if rendered.widget.prev_sibling() != previous {
+                    section_box.reorder_child_after(&rendered.widget, previous.as_ref());
                 }
+                previous = Some(rendered.widget.clone().upcast());
             }
         }
     }
 }
 
 impl GroupView {
-    fn new(state: &Group, render: &ControlRenderer) -> Self {
+    fn append_row(&self, row: &adw::ActionRow) {
+        self.list.append(row);
+    }
+
+    fn remove_row(&self, row: &adw::ActionRow) {
+        self.list.remove(row);
+    }
+
+    fn clear_and_reinsert(&self, rows: &[adw::ActionRow]) {
+        for (index, row) in rows.iter().enumerate() {
+            if self
+                .list
+                .row_at_index(index as i32)
+                .as_ref()
+                .is_none_or(|current| current != row.upcast_ref::<gtk::ListBoxRow>())
+            {
+                let focus = row
+                    .root()
+                    .and_then(|root| root.downcast::<gtk::Window>().ok())
+                    .and_then(|window| gtk::prelude::GtkWindowExt::focus(&window))
+                    .filter(|focus| {
+                        focus == row.upcast_ref::<gtk::Widget>() || focus.is_ancestor(row)
+                    });
+                if row.parent().is_some() {
+                    self.list.remove(row);
+                }
+                self.list.insert(row, index as i32);
+                if let Some(focus) = focus {
+                    focus.grab_focus();
+                }
+            }
+        }
+    }
+
+    fn new(state: &Group, plugin_id: &str, render: &ControlRenderer) -> Self {
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 12);
         let controller = state.visualization.as_ref().map(|visualization| {
             let render = render.clone();
-            let view = ControllerView::new(visualization, move |row, control| render(row, control));
+            let view = ControllerView::new(plugin_id, visualization, move |row, control| {
+                render(row, control)
+            });
             widget.append(&view.widget);
             view
         });
-        let group = adw::PreferencesGroup::builder()
-            .title(glib::markup_escape_text(&state.title))
-            .description(glib::markup_escape_text(&state.description))
-            .build();
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
             .build();
-        list.add_css_class("boxed-list");
-        group.add(&list);
+        let (group, expander) = if state.collapsed && state.visualization.is_none() {
+            let group = adw::PreferencesGroup::new();
+            let expander = adw::ExpanderRow::builder()
+                .use_markup(false)
+                .expanded(false)
+                .build();
+            expander.set_title(&state.title);
+            expander.set_subtitle(&state.description);
+            expander.add_row(&list);
+            group.add(&expander);
+            (group, Some(expander))
+        } else {
+            let group = adw::PreferencesGroup::builder()
+                .title(glib::markup_escape_text(&state.title))
+                .description(glib::markup_escape_text(&state.description))
+                .build();
+            list.add_css_class("boxed-list");
+            group.add(&list);
+            (group, None)
+        };
         group.set_visible(
             !state.rows.is_empty()
                 || (state.visualization.is_none() && !state.description.is_empty()),
         );
         widget.append(&group);
-        let rows = state
-            .rows
-            .iter()
-            .map(|item| {
-                let row = adw::ActionRow::builder().use_markup(false).build();
-                row.set_title(&item.title);
-                row.set_subtitle(&item.subtitle);
-                if let Some(control) = &item.control {
-                    render(&row, control.clone());
-                }
-                list.append(&row);
-                row
-            })
-            .collect();
-        Self {
+        let mut view = Self {
             widget,
             group,
             list,
-            rows,
+            expander,
+            rows: Vec::with_capacity(state.rows.len()),
             controller,
             state: state.clone(),
+        };
+        for item in &state.rows {
+            let row = adw::ActionRow::builder().use_markup(false).build();
+            row.set_title(&item.title);
+            row.set_subtitle(&item.subtitle);
+            if let Some(control) = &item.control {
+                render(&row, control.clone());
+            }
+            view.append_row(&row);
+            view.rows.push(row);
         }
+        view
     }
+
     fn update(
         &mut self,
         state: &Group,
+        plugin_id: &str,
         render: &ControlRenderer,
         preserve: bool,
         focus: Option<&gtk::Widget>,
     ) {
         if self.state == *state {
+            if let (Some(controller), Some(visualization)) =
+                (&self.controller, &state.visualization)
+            {
+                controller.update(visualization);
+            }
             return;
         }
-        self.group
-            .set_title(&glib::markup_escape_text(&state.title));
-        self.group
-            .set_description(Some(&glib::markup_escape_text(&state.description)));
+        if let Some(expander) = &self.expander {
+            expander.set_title(&state.title);
+            expander.set_subtitle(&state.description);
+        } else {
+            self.group
+                .set_title(&glib::markup_escape_text(&state.title));
+            self.group
+                .set_description(Some(&glib::markup_escape_text(&state.description)));
+        }
         self.group.set_visible(
             !state.rows.is_empty()
                 || (state.visualization.is_none() && !state.description.is_empty()),
@@ -601,7 +769,9 @@ impl GroupView {
             (None, Some(visualization)) => {
                 let render = render.clone();
                 let controller =
-                    ControllerView::new(visualization, move |row, control| render(row, control));
+                    ControllerView::new(plugin_id, visualization, move |row, control| {
+                        render(row, control)
+                    });
                 self.widget.prepend(&controller.widget);
                 self.controller = Some(controller);
             }
@@ -615,15 +785,13 @@ impl GroupView {
                 .zip(&state.rows)
                 .all(|(a, b)| a.id == b.id);
         if !same_rows {
-            // Reconcile by row identity: capability removal revokes only removed actions,
-            // while edits in unrelated fields and the controller inspector survive.
             let mut old: HashMap<_, _> = self
                 .rows
                 .drain(..)
                 .zip(self.state.rows.drain(..))
                 .map(|(row, state)| (state.id.clone(), (row, state)))
                 .collect();
-            for (index, item) in state.rows.iter().enumerate() {
+            for item in &state.rows {
                 let (row, snapshot) = old.remove(&item.id).unwrap_or_else(|| {
                     let row = adw::ActionRow::builder().use_markup(false).build();
                     row.set_title(&item.title);
@@ -633,23 +801,13 @@ impl GroupView {
                     }
                     (row, item.clone())
                 });
-                if self
-                    .list
-                    .row_at_index(index as i32)
-                    .as_ref()
-                    .is_none_or(|current| current != row.upcast_ref::<gtk::ListBoxRow>())
-                {
-                    if row.parent().is_some() {
-                        self.list.remove(&row);
-                    }
-                    self.list.insert(&row, index as i32);
-                }
                 self.rows.push(row);
                 self.state.rows.push(snapshot);
             }
             for (_, (row, _)) in old {
-                self.list.remove(&row);
+                self.remove_row(&row);
             }
+            self.clear_and_reinsert(&self.rows);
         }
         for (index, item) in state.rows.iter().enumerate() {
             let row = &self.rows[index];
@@ -682,10 +840,10 @@ impl GroupView {
                 if let Some(control) = &item.control {
                     render(&replacement, control.clone());
                 }
-                self.list.remove(row);
-                self.list.insert(&replacement, index as i32);
+                self.remove_row(row);
                 self.rows[index] = replacement;
                 self.state.rows[index].control.clone_from(&item.control);
+                self.clear_and_reinsert(&self.rows);
             }
             self.state.rows[index].title.clone_from(&item.title);
             self.state.rows[index].subtitle.clone_from(&item.subtitle);

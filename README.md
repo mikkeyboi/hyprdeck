@@ -173,6 +173,16 @@ or unschedules the saved launcher for the next login; it does not start, stop or
 Its XDG entry is `~/.config/autostart/io.github.mikkeyboi.Hyprdeck.Gamescope.desktop`, so the Gaming
 switch and Startup Apps show the same enabled state. Launch parameters remain in `gamescope.toml`
 and are resolved afresh at login; there is no second profile or separate hard-coded wrapper.
+The entry records an absolute executable path, resolved from `PATH` or `~/.local/bin/hyprdeck`;
+install an executable there before enabling it. It does not fall back to the current executable,
+which may be a temporary AppImage mount or development build. Enabled legacy bare-name entries
+are upgraded by the login background service. Scheduling reloads systemd's XDG generator without
+starting its unit. If that reload fails, the error explains that the setting was saved and gives
+the recovery command.
+Migration preserves desktop restrictions and unrelated entry properties. Automatic launch honors
+those restrictions and refuses malformed saved profiles without replacing them with defaults.
+After a save/reload partial failure, the Gaming switch re-reads the persisted setting rather than
+displaying a guessed rollback state.
 
 Headless scheduling is also available:
 
@@ -274,6 +284,9 @@ The DPI editor can link X/Y sensitivity and edit desktop presets with explicit A
 Previous/Next selection. Host presets are separate from onboard stages and physical DPI buttons;
 unavailable readback is labeled, not guessed. Polling controls use actual advertised rates or an
 exact model's documented backend limits.
+Controller diagrams use a separate event-driven input stream rather than full settings polling.
+Native forms provide searchable large choices, and actions show pending/running/completed/failed
+feedback with results in their product section. Late background snapshots cannot overwrite action results.
 
 <p align="center">
   <img src="docs/screenshots/razer-products.png" width="49%" alt="Detected Razer products beneath a nested plugin sidebar entry">
@@ -281,9 +294,12 @@ exact model's documented backend limits.
   <img src="docs/screenshots/basilisk-sensitivity.png" width="49%" alt="Linked X/Y DPI, editable desktop presets and polling settings">
   <img src="docs/screenshots/basilisk-lighting.png" width="49%" alt="Basilisk RGB effect and color settings">
   <img src="docs/screenshots/wolverine-overview.png" width="49%" alt="Wolverine controller overview and live input inspector">
+  <img src="docs/screenshots/wolverine-buttons.png" width="49%" alt="Focused single-button onboard assignment editor">
+  <img src="docs/screenshots/basilisk-macros.png" width="49%" alt="Native programmable software macro creation and explicit upstream editor launch">
+  <img src="docs/screenshots/basilisk-power.png" width="49%" alt="Customizable global OpenRazer battery notification preferences">
 </p>
 
-Neutral libadwaita captures of the actual application with the separate
+Live captures of the actual application with the desktop's libadwaita styling and the separate
 [Razer plugin](https://github.com/mikkeyboi/hyprdeck-razer), using live OpenRazer and controller
 readings. Desktop DPI samples are labeled host presets, not onboard stage readback. Controller
 mapping, lighting and battery limits stay explicit; no device state was fabricated.

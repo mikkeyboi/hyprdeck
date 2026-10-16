@@ -5,9 +5,10 @@ use std::f64::consts::PI;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::cairo;
+use gtk::{cairo, glib};
 
-use crate::protocol::{Control, ControllerInput, Visualization};
+use crate::backend::{self, InputStream};
+use crate::protocol::{Control, ControllerInput, ControllerStream, Visualization};
 
 const WIDTH: f64 = 800.0;
 const HEIGHT: f64 = 450.0;
@@ -18,15 +19,20 @@ const CSS: &str = "
   font-size: 0.75em; font-weight: 700; letter-spacing: 1px; opacity: 0.65;
 }
 .hd-controller .hd-controller-status {
-  border-radius: 10px; padding: 6px 10px;
-  background: alpha(currentColor, 0.06); font-size: 0.85em;
+  border-radius: 999px; padding: 4px 12px;
+  background: alpha(#69c991, 0.14); color: #69c991; font-size: 0.82em; font-weight: 600;
 }
-.hd-controller .hd-controller-stage { background: #10171a; border-radius: 14px; }
+.hd-controller .hd-controller-status.error { background: alpha(#f08a8a, 0.14); color: #f08a8a; }
+.hd-controller .hd-controller-stage { background: #0d1316; border-radius: 14px; }
 .hd-controller .hd-controller-selector { border-radius: 9px; }
+.hd-controller .hd-controller-telemetry {
+  padding: 10px 14px; border-radius: 10px; background: alpha(currentColor, 0.04);
+  font-family: monospace; font-size: 0.88em;
+}
 .hd-controller .hd-controller-inspector {
   padding: 14px; border-radius: 12px; background: alpha(currentColor, 0.035);
 }
-.hd-controller .hd-controller-readings { font-family: monospace; font-size: 0.9em; }
+.hd-controller .hd-controller-readings { font-family: monospace; font-size: 0.92em; font-weight: 600; color: #69c991; }
 .hd-controller .hd-controller-legend { font-size: 0.8em; opacity: 0.75; }
 .hd-controller .hd-controller-active { color: #69c991; }
 .hd-controller .hd-controller-hint { font-size: 0.85em; opacity: 0.7; }
@@ -252,6 +258,13 @@ pub(crate) struct ControllerView {
     inner: Rc<Inner>,
 }
 struct Inner {
+    plugin_id: String,
+    stream: RefCell<Option<ControllerStream>>,
+    stream_lease: RefCell<Option<InputStream>>,
+    stream_generation: Cell<u64>,
+    stream_failed: Cell<bool>,
+    mapped: Cell<bool>,
+    paused: Cell<bool>,
     name: gtk::Label,
     connection: gtk::Label,
     status: gtk::Label,
@@ -259,6 +272,7 @@ struct Inner {
     front: gtk::ToggleButton,
     rear_button: gtk::ToggleButton,
     selector: gtk::DropDown,
+    telemetry: gtk::Label,
     inspector_title: gtk::Label,
     readings: gtk::Label,
     detail: gtk::Label,
@@ -278,6 +292,7 @@ struct Inner {
 
 impl ControllerView {
     pub(crate) fn new(
+        plugin_id: &str,
         visualization: &Visualization,
         on_control: impl Fn(&adw::ActionRow, Control) + 'static,
     ) -> Self {
@@ -296,14 +311,12 @@ impl ControllerView {
         let views = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         views.add_css_class("linked");
         views.set_valign(gtk::Align::Center);
-        let front = gtk::ToggleButton::with_label("Front");
-        let rear_button = gtk::ToggleButton::with_label("Rear");
+        let front = gtk::ToggleButton::with_label("Front Controls");
+        let rear_button = gtk::ToggleButton::with_label("M1–M6 Bumpers & Paddles");
         rear_button.set_group(Some(&front));
         front.set_active(true);
-        front.set_tooltip_text(Some("Show standard buttons, sticks and triggers"));
-        rear_button.set_tooltip_text(Some(
-            "Inspect extra inputs; state and capabilities are supplied by the plugin",
-        ));
+        front.set_tooltip_text(Some("Show standard face buttons, thumbsticks and triggers"));
+        rear_button.set_tooltip_text(Some("Show M1–M2 claw bumpers and M3–M6 rear paddles"));
         views.append(&front);
         views.append(&rear_button);
         toolbar.append(&views);
@@ -322,54 +335,65 @@ impl ControllerView {
             "Controller diagram. Select an input with the input selector below, or click a control.",
         )]);
         root.append(&area);
-        let legend = gtk::Box::new(gtk::Orientation::Horizontal, 18);
-        let pressed = text("● Pressed", "hd-controller-legend");
+        let telemetry = text("", "hd-controller-telemetry");
+        root.append(&telemetry);
+
+        let bar_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let legend = gtk::Box::new(gtk::Orientation::Horizontal, 14);
+        legend.set_hexpand(true);
+        legend.set_valign(gtk::Align::Center);
+        let pressed = text("● Active", "hd-controller-legend");
         pressed.add_css_class("hd-controller-active");
         legend.append(&pressed);
-        legend.append(&text("○ Released", "hd-controller-legend"));
-        legend.append(&text("┄ Unavailable", "hd-controller-legend"));
-        root.append(&legend);
+        legend.append(&text("○ Idle", "hd-controller-legend"));
+        legend.append(&text("┄ Hardware-mapped (M1–M6)", "hd-controller-legend"));
+        bar_row.append(&legend);
 
-        let selector_label = text("_Inspect input", "heading");
+        let selector_label = text("_Control:", "dim-label");
         selector_label.set_use_underline(true);
+        selector_label.set_valign(gtk::Align::Center);
         let labels = SLOTS.each_ref().map(|slot| slot.label);
         let selector = gtk::DropDown::from_strings(&labels);
         selector.set_enable_search(true);
-        selector.set_hexpand(true);
         selector.add_css_class("hd-controller-selector");
         selector.update_property(&[gtk::accessible::Property::Label("Inspect controller input")]);
         selector_label.set_mnemonic_widget(Some(&selector));
-        root.append(&selector_label);
-        root.append(&selector);
+        bar_row.append(&selector_label);
+        bar_row.append(&selector);
+        root.append(&bar_row);
 
-        let inspector = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let inspector = gtk::Box::new(gtk::Orientation::Vertical, 6);
         inspector.add_css_class("hd-controller-inspector");
+        let title_row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         let inspector_title = text("", "heading");
+        inspector_title.set_hexpand(true);
         let readings = text("", "hd-controller-readings");
         readings.set_selectable(true);
-        let detail = text("", "");
+        title_row.append(&inspector_title);
+        title_row.append(&readings);
+        let detail = text("", "dim-label");
         detail.set_selectable(true);
         let capability = text("", "hd-controller-hint");
-        inspector.append(&inspector_title);
-        inspector.append(&readings);
+        capability.set_visible(false);
+        inspector.append(&title_row);
         inspector.append(&detail);
         inspector.append(&capability);
-        let actions = adw::PreferencesGroup::builder()
-            .title("Mapping and actions")
-            .build();
+        let actions = adw::PreferencesGroup::builder().build();
         actions.set_visible(false);
         inspector.append(&actions);
         root.append(&inspector);
-        root.append(&text(
-            "Sampled input, not an event history. Rear positions are a generic layout; state and actions are reported by the plugin.",
-            "hd-controller-hint",
-        ));
-
         let body_fill = cairo::LinearGradient::new(0.0, 85.0, 0.0, 410.0);
         body_fill.add_color_stop_rgb(0.0, 0.25, 0.30, 0.32);
         body_fill.add_color_stop_rgb(0.5, 0.16, 0.20, 0.22);
         body_fill.add_color_stop_rgb(1.0, 0.10, 0.14, 0.16);
         let inner = Rc::new(Inner {
+            plugin_id: plugin_id.to_owned(),
+            stream: RefCell::new(None),
+            stream_lease: RefCell::new(None),
+            stream_generation: Cell::new(0),
+            stream_failed: Cell::new(false),
+            mapped: Cell::new(false),
+            paused: Cell::new(false),
             name,
             connection,
             status,
@@ -377,6 +401,7 @@ impl ControllerView {
             front,
             rear_button,
             selector,
+            telemetry,
             inspector_title,
             readings,
             detail,
@@ -457,11 +482,34 @@ impl ControllerView {
             }
         });
         inner.area.add_controller(motion);
+        let weak = Rc::downgrade(&inner);
+        root.connect_map(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.mapped.set(true);
+                inner.stream_failed.set(false);
+                inner.start_stream();
+            }
+        });
+        let weak = Rc::downgrade(&inner);
+        root.connect_unmap(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.mapped.set(false);
+                inner.stop_stream();
+            }
+        });
+        let weak = Rc::downgrade(&inner);
+        root.connect_destroy(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.mapped.set(false);
+                inner.stop_stream();
+            }
+        });
         let view = Self {
             widget: root.upcast(),
             inner,
         };
         view.update(visualization);
+        view.inner.refresh_telemetry();
         view.inner.refresh_inspector();
         view
     }
@@ -474,62 +522,25 @@ impl ControllerView {
             connection,
             status,
             inputs,
+            stream,
         } = visualization;
         set_text(&self.inner.name, name);
         set_text(&self.inner.connection, connection);
-        set_text(&self.inner.status, status);
-        let mut incoming: [Option<&ControllerInput>; SLOTS.len()] = [None; SLOTS.len()];
-        for input in inputs {
-            if let Some(index) = SLOTS.iter().position(|slot| slot.id == input.id) {
-                incoming[index] = Some(input);
-            }
+        if *self.inner.stream.borrow() != *stream {
+            self.inner.stop_stream();
+            self.inner.stream.borrow_mut().clone_from(stream);
+            *self.inner.inputs.borrow_mut() = std::array::from_fn(|_| None);
+            self.inner.stream_failed.set(false);
         }
-        let mut redraw = false;
-        let mut inspect = false;
-        {
-            let mut current = self.inner.inputs.borrow_mut();
-            for (index, (old, new)) in current.iter_mut().zip(incoming).enumerate() {
-                match (old.as_mut(), new) {
-                    (Some(old), Some(new)) => {
-                        if old == new {
-                            continue;
-                        }
-                        inspect |= index == self.inner.selected.get();
-                        redraw |= old.pressed != new.pressed
-                            || old.value != new.value
-                            || old.x != new.x
-                            || old.y != new.y;
-                        // Keep string storage and avoid copying unchanged metadata
-                        // through frequent sample-only changes; identity is fixed.
-                        if old.label != new.label {
-                            old.label.clone_from(&new.label);
-                        }
-                        if old.detail != new.detail {
-                            old.detail.clone_from(&new.detail);
-                        }
-                        old.pressed = new.pressed;
-                        old.value = new.value;
-                        old.x = new.x;
-                        old.y = new.y;
-                        if old.control != new.control {
-                            old.control.clone_from(&new.control);
-                        }
-                    }
-                    (None, None) => {}
-                    (_, new) => {
-                        *old = new.cloned();
-                        redraw = true;
-                        inspect |= index == self.inner.selected.get();
-                    }
-                }
-            }
+        if self.inner.paused.replace(false) {
+            self.inner.stream_failed.set(false);
         }
-        if redraw {
-            self.inner.area.queue_draw();
+        let live = stream.is_some();
+        if !live {
+            set_text(&self.inner.status, status);
         }
-        if inspect {
-            self.inner.refresh_inspector();
-        }
+        self.inner.update_inputs(inputs, !live, true);
+        self.inner.start_stream();
     }
 
     pub(crate) fn show_header(&self, visible: bool) {
@@ -546,9 +557,147 @@ impl ControllerView {
             }
         }
     }
+
+    pub(crate) fn disconnect(&self) {
+        self.inner.paused.set(true);
+        self.inner.stop_stream();
+        self.inner
+            .status
+            .set_text("Live input paused · Backend unavailable");
+    }
 }
 
 impl Inner {
+    fn stop_stream(&self) {
+        self.stream_generation
+            .set(self.stream_generation.get().wrapping_add(1));
+        self.stream_lease.borrow_mut().take();
+    }
+
+    fn start_stream(self: &Rc<Self>) {
+        if !self.mapped.get()
+            || self.paused.get()
+            || self.stream_failed.get()
+            || self.stream_lease.borrow().is_some()
+        {
+            return;
+        }
+        let Some(stream) = self.stream.borrow().clone() else {
+            return;
+        };
+        let generation = self.stream_generation.get();
+        let (lease, mut receiver) = backend::input_stream(self.plugin_id.clone(), stream);
+        *self.stream_lease.borrow_mut() = Some(lease);
+        self.status.set_text("Starting live input…");
+        self.status.remove_css_class("error");
+        let weak = Rc::downgrade(self);
+        // Tokio's bounded receiver wakes the GTK future directly. There is no
+        // request polling, timer quantization, or main-thread HID/file I/O.
+        glib::spawn_future_local(async move {
+            while let Some(event) = receiver.recv().await {
+                let Some(inner) = weak.upgrade() else { break };
+                if inner.stream_generation.get() != generation {
+                    break;
+                }
+                match event {
+                    Ok(frame) => {
+                        set_text(&inner.status, &frame.status);
+                        inner.update_inputs(&frame.inputs, true, false);
+                    }
+                    Err(error) => {
+                        inner.status.set_text(&error);
+                        inner.status.add_css_class("error");
+                        inner.stream_failed.set(true);
+                        inner.update_inputs(&[], true, false);
+                        inner.stream_lease.borrow_mut().take();
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    fn update_inputs(&self, inputs: &[ControllerInput], samples: bool, controls: bool) {
+        let mut incoming: [Option<&ControllerInput>; SLOTS.len()] = [None; SLOTS.len()];
+        for input in inputs {
+            if let Some(index) = SLOTS.iter().position(|slot| slot.id == input.id) {
+                incoming[index] = Some(input);
+            }
+        }
+        let mut redraw = false;
+        let mut inspect = false;
+        {
+            let mut current = self.inputs.borrow_mut();
+            for (index, (old, new)) in current.iter_mut().zip(incoming).enumerate() {
+                match (old.as_mut(), new) {
+                    (Some(old), Some(new)) => {
+                        let sample_changed = samples
+                            && (old.pressed != new.pressed
+                                || old.value != new.value
+                                || old.x != new.x
+                                || old.y != new.y);
+                        let metadata_changed = old.label != new.label
+                            || old.detail != new.detail
+                            || (controls && old.control != new.control);
+                        if !sample_changed && !metadata_changed {
+                            continue;
+                        }
+                        inspect |= index == self.selected.get();
+                        redraw |= sample_changed;
+                        if old.label != new.label {
+                            old.label.clone_from(&new.label);
+                        }
+                        if old.detail != new.detail {
+                            old.detail.clone_from(&new.detail);
+                        }
+                        if samples {
+                            old.pressed = new.pressed;
+                            old.value = new.value;
+                            old.x = new.x;
+                            old.y = new.y;
+                        }
+                        if controls && old.control != new.control {
+                            old.control.clone_from(&new.control);
+                        }
+                    }
+                    (None, None) => {}
+                    (Some(old), None) if !controls => {
+                        if old.pressed.is_some()
+                            || old.value.is_some()
+                            || old.x.is_some()
+                            || old.y.is_some()
+                        {
+                            old.pressed = None;
+                            old.value = None;
+                            old.x = None;
+                            old.y = None;
+                            redraw = true;
+                            inspect |= index == self.selected.get();
+                        }
+                    }
+                    (_, new) => {
+                        *old = new.cloned();
+                        if !samples && let Some(input) = old {
+                            input.pressed = None;
+                            input.value = None;
+                            input.x = None;
+                            input.y = None;
+                        }
+                        redraw = true;
+                        inspect |= index == self.selected.get();
+                    }
+                }
+            }
+        }
+        if redraw {
+            self.area.queue_draw();
+            self.refresh_telemetry();
+        }
+        if inspect {
+            self.refresh_inspector();
+        }
+    }
+
     fn set_rear(&self, rear: bool) {
         if self.rear.replace(rear) != rear {
             self.hovered.set(None);
@@ -587,6 +736,54 @@ impl Inner {
             }
         }
     }
+    fn refresh_telemetry(&self) {
+        let inputs = self.inputs.borrow();
+        let stick_str = |idx: usize| -> String {
+            let Some(inp) = inputs[idx].as_ref() else {
+                return "—".into();
+            };
+            match (inp.x, inp.y) {
+                (Some(x), Some(y)) => format!("{x:+.2}, {y:+.2}"),
+                _ => "—".into(),
+            }
+        };
+        let trig_str = |idx: usize| -> String {
+            let Some(inp) = inputs[idx].as_ref() else {
+                return "—".into();
+            };
+            match inp.value {
+                Some(v) => format!("{:.0}%", v * 100.0),
+                None => "—".into(),
+            }
+        };
+        let mut active_btns = Vec::new();
+        for (idx, slot) in SLOTS.iter().enumerate() {
+            if !slot.rear() && inputs[idx].as_ref().and_then(|i| i.pressed) == Some(true) {
+                let name = if !slot.glyph.is_empty() {
+                    slot.glyph
+                } else {
+                    slot.label
+                };
+                active_btns.push(name);
+            }
+        }
+        let active_summary = if active_btns.is_empty() {
+            "Idle".to_owned()
+        } else {
+            active_btns.join(" + ")
+        };
+        set_text(
+            &self.telemetry,
+            &format!(
+                "L-Stick ({})   ·   R-Stick ({})   ·   LT {} / RT {}   ·   Active: {}",
+                stick_str(8),
+                stick_str(9),
+                trig_str(6),
+                trig_str(7),
+                active_summary
+            ),
+        );
+    }
     fn refresh_inspector(&self) {
         let index = self.selected.get();
         let slot = &SLOTS[index];
@@ -601,19 +798,12 @@ impl Inner {
             .map(|input| input.detail.as_str())
             .filter(|detail| !detail.is_empty());
         set_text(&self.detail, detail.unwrap_or(if slot.rear() {
-            "Rear-button positions are illustrative. Independent physical state is shown only when explicitly reported by the plugin."
+            "On-the-fly hardware remapping: hold Function + this M-button on the controller, then press the target button."
         } else {
-            "Select a control to inspect the input reported by your device. Unavailable means the plugin has no sample for this input."
+            "Click any control on the controller diagram or press buttons on your controller to see live readings."
         }));
         let control = input.and_then(|input| input.control.as_ref());
-        set_text(
-            &self.capability,
-            if control.is_some() {
-                "Plugin-provided control · Apply a change below."
-            } else {
-                "Inspection only · No mapping action is exposed for this input."
-            },
-        );
+        self.capability.set_visible(false);
         let same_control = match (&*self.shown_control.borrow(), control) {
             (None, None) => true,
             (Some((old_index, old)), Some(new)) => *old_index == index && old == new,
@@ -755,9 +945,9 @@ impl Inner {
         centered_text(
             cr,
             if self.rear.get() {
-                "REAR CONTROLS · GENERIC LAYOUT"
+                "M1–M2 CLAW BUMPERS  ·  M3–M6 REAR PADDLES"
             } else {
-                "SELECT A CONTROL TO INSPECT"
+                "CLICK ANY CONTROL TO INSPECT  ·  LIVE TELEMETRY"
             },
             400.0,
             431.0,
@@ -801,31 +991,36 @@ fn ensure_css() {
 }
 fn reading(slot: &Slot, input: Option<&ControllerInput>) -> String {
     if slot.rear() && input.and_then(|input| input.pressed).is_none() {
-        return "Independent physical state: unavailable".to_owned();
+        return "Hardware-mapped onboard (M1–M6)".to_owned();
     }
     let pressed = match input.and_then(|input| input.pressed) {
-        Some(true) => "Pressed",
+        Some(true) => "PRESSED",
         Some(false) => "Released",
-        None => "Press state unavailable",
+        None => "Unavailable",
     };
     match slot.kind {
         Kind::Stick => {
+            let click = match input.and_then(|input| input.pressed) {
+                Some(true) => "Click pressed",
+                Some(false) => "Click released",
+                None => "Click unavailable",
+            };
             let x = input
                 .and_then(|input| input.x)
-                .map(|value| format!("{value:+.2}"))
-                .unwrap_or_else(|| "unavailable".into());
+                .map(|value| format!("{value:+.3}"))
+                .unwrap_or_else(|| "—".into());
             let y = input
                 .and_then(|input| input.y)
-                .map(|value| format!("{value:+.2}"))
-                .unwrap_or_else(|| "unavailable".into());
-            format!("{pressed} · X {x} · Y {y}\nAxes −1…+1; negative Y points up.")
+                .map(|value| format!("{value:+.3}"))
+                .unwrap_or_else(|| "—".into());
+            format!("{click}  ·  X {x}  ·  Y {y}")
         }
         Kind::Trigger => match input.and_then(|input| input.value) {
-            Some(value) => format!("{pressed} · {:.0}% · {value:.3} / 1.000", value * 100.0),
-            None => format!("{pressed} · Travel unavailable"),
+            Some(value) => format!("{pressed}  ·  {:.0}% ({value:.3})", value * 100.0),
+            None => format!("{pressed}  ·  —"),
         },
         _ => match input.and_then(|input| input.value) {
-            Some(value) => format!("{pressed} · Value {value:.3} / 1.000"),
+            Some(value) => format!("{pressed}  ·  {value:.3}"),
             None => pressed.to_owned(),
         },
     }
@@ -943,10 +1138,9 @@ fn draw_slot(cr: &cairo::Context, slot: &Slot, input: Option<&ControllerInput>, 
         _ => input.pressed.is_some(),
     });
     let press_known = input.and_then(|input| input.pressed).is_some();
-    let border_known = if matches!(slot.kind, Kind::Trigger) {
-        available
-    } else {
-        press_known
+    let border_known = match slot.kind {
+        Kind::Trigger | Kind::Stick => available,
+        _ => press_known,
     };
     if selected {
         shape_path(cr, slot.shape, 5.0);
@@ -1039,6 +1233,10 @@ fn draw_slot(cr: &cairo::Context, slot: &Slot, input: Option<&ControllerInput>, 
             }
             match (ax, ay) {
                 (Some(ax), Some(ay)) => {
+                    cr.move_to(x, y);
+                    cr.line_to(x + ax * travel, y + ay * travel);
+                    cr.set_line_width(2.0);
+                    let _ = cr.stroke();
                     cr.arc(x + ax * travel, y + ay * travel, 8.0, 0.0, 2.0 * PI);
                     let _ = cr.fill();
                 }

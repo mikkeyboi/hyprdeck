@@ -222,8 +222,8 @@ impl FormField {
             ),
             "choice" => {
                 ensure!(
-                    !self.options.is_empty() && self.options.len() <= 256,
-                    "invalid form choices"
+                    !self.options.is_empty() && self.options.len() <= 1024,
+                    "form choice must have 1–1024 options"
                 );
                 let mut values = HashSet::new();
                 for option in &self.options {
@@ -270,6 +270,8 @@ pub enum Visualization {
         connection: String,
         status: String,
         inputs: Vec<ControllerInput>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream: Option<ControllerStream>,
     },
 }
 
@@ -290,6 +292,46 @@ pub struct ControllerInput {
     pub control: Option<Control>,
 }
 
+/// Arguments for the enabled plugin's own installed executable, never a command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ControllerStream {
+    pub args: Vec<String>,
+}
+
+impl ControllerStream {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.args.is_empty() && self.args.len() <= 16,
+            "controller stream requires 1..16 arguments"
+        );
+        let mut total = 0;
+        for arg in &self.args {
+            ensure!(
+                !arg.is_empty() && arg.len() <= 256 && !arg.chars().any(char::is_control),
+                "invalid controller stream argument"
+            );
+            total += arg.len();
+        }
+        ensure!(total <= 2048, "controller stream arguments are too large");
+        Ok(())
+    }
+}
+
+pub(crate) const MAX_INPUT_FRAME: usize = 64 * 1024;
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ControllerFrame {
+    pub inputs: Vec<ControllerInput>,
+    pub status: String,
+}
+
+impl ControllerFrame {
+    pub(crate) fn validate(&self) -> Result<()> {
+        text(&self.status, "controller stream status", false)?;
+        validate_controller_inputs(&self.inputs)
+    }
+}
+
 impl Visualization {
     fn validate(&self) -> Result<()> {
         match self {
@@ -298,69 +340,74 @@ impl Visualization {
                 connection,
                 status,
                 inputs,
+                stream,
             } => {
                 text(name, "controller name", true)?;
                 text(connection, "controller connection", false)?;
                 text(status, "controller status", false)?;
-                ensure!(inputs.len() <= 32, "too many controller inputs");
-                let mut ids = HashSet::new();
-                for input in inputs {
-                    ensure!(
-                        matches!(
-                            input.id.as_str(),
-                            "a" | "b"
-                                | "x"
-                                | "y"
-                                | "lb"
-                                | "rb"
-                                | "lt"
-                                | "rt"
-                                | "left_stick"
-                                | "right_stick"
-                                | "dpad_up"
-                                | "dpad_down"
-                                | "dpad_left"
-                                | "dpad_right"
-                                | "view"
-                                | "menu"
-                                | "guide"
-                                | "m1"
-                                | "m2"
-                                | "m3"
-                                | "m4"
-                                | "m5"
-                                | "m6"
-                        ),
-                        "unknown controller input id {}",
-                        input.id
-                    );
-                    ensure!(
-                        ids.insert(&input.id),
-                        "duplicate controller input id {}",
-                        input.id
-                    );
-                    text(&input.label, "controller input label", true)?;
-                    text(&input.detail, "controller input detail", false)?;
-                    for (value, min, max) in [
-                        (input.value, 0.0, 1.0),
-                        (input.x, -1.0, 1.0),
-                        (input.y, -1.0, 1.0),
-                    ] {
-                        ensure!(
-                            value.is_none_or(
-                                |value| value.is_finite() && (min..=max).contains(&value)
-                            ),
-                            "invalid normalized controller value"
-                        );
-                    }
-                    if let Some(control) = &input.control {
-                        control.validate()?;
-                    }
+                validate_controller_inputs(inputs)?;
+                if let Some(stream) = stream {
+                    stream.validate()?;
                 }
             }
         }
         Ok(())
     }
+}
+
+fn validate_controller_inputs(inputs: &[ControllerInput]) -> Result<()> {
+    ensure!(inputs.len() <= 32, "too many controller inputs");
+    const IDS: [&str; 23] = [
+        "a",
+        "b",
+        "x",
+        "y",
+        "lb",
+        "rb",
+        "lt",
+        "rt",
+        "left_stick",
+        "right_stick",
+        "dpad_up",
+        "dpad_down",
+        "dpad_left",
+        "dpad_right",
+        "view",
+        "menu",
+        "guide",
+        "m1",
+        "m2",
+        "m3",
+        "m4",
+        "m5",
+        "m6",
+    ];
+    let mut ids = 0u32;
+    for input in inputs {
+        let index = IDS
+            .iter()
+            .position(|id| *id == input.id)
+            .ok_or_else(|| anyhow::anyhow!("unknown controller input id {}", input.id))?;
+        let bit = 1u32 << index;
+        ensure!(ids & bit == 0, "duplicate controller input id {}", input.id);
+        ids |= bit;
+        text(&input.label, "controller input label", true)?;
+        text(&input.detail, "controller input detail", false)?;
+        for (value, min, max) in [
+            (input.value, 0.0, 1.0),
+            (input.x, -1.0, 1.0),
+            (input.y, -1.0, 1.0),
+        ] {
+            ensure!(
+                value.is_none_or(|value| value.is_finite() && (min..=max).contains(&value)),
+                "invalid normalized controller value"
+            );
+        }
+        if let Some(control) = &input.control {
+            control.validate()?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -517,7 +564,15 @@ impl State {
             ensure!(
                 matches!(
                     product.kind.as_str(),
-                    "mouse" | "controller" | "dock" | "peripheral"
+                    "mouse"
+                        | "controller"
+                        | "dock"
+                        | "keyboard"
+                        | "keypad"
+                        | "headset"
+                        | "mousemat"
+                        | "accessory"
+                        | "peripheral"
                 ),
                 "unsupported product depiction"
             );
@@ -754,6 +809,7 @@ mod tests {
             connection: String::new(),
             status: String::new(),
             inputs,
+            stream: None,
         };
         assert!(
             visualization(vec![input.clone(), input.clone()])
@@ -771,6 +827,68 @@ mod tests {
         let mut invalid = input;
         invalid.x = Some(-1.1);
         assert!(visualization(vec![invalid]).validate().is_err());
+    }
+
+    #[test]
+    fn controller_stream_is_optional_and_arguments_are_bounded() {
+        let legacy: Visualization = serde_json::from_value(serde_json::json!({
+            "kind": "controller", "name": "Controller", "connection": "USB",
+            "status": "Connected", "inputs": []
+        }))
+        .unwrap();
+        assert!(legacy.validate().is_ok());
+        assert!(matches!(
+            legacy,
+            Visualization::Controller { stream: None, .. }
+        ));
+        let stream = ControllerStream {
+            args: vec!["--input-stream".into(), "usb:1-8".into()],
+        };
+        assert!(stream.validate().is_ok());
+        for args in [
+            vec![],
+            vec![String::new()],
+            vec!["x".repeat(257)],
+            vec!["x\0y".into()],
+            vec!["line\nbreak".into()],
+            vec!["x".into(); 17],
+            vec!["x".repeat(256); 9],
+        ] {
+            assert!(ControllerStream { args }.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn live_frames_share_snapshot_telemetry_validation() {
+        let base = serde_json::json!({"inputs": [{
+            "id": "left_stick", "label": "Left stick", "detail": "Live",
+            "x": 0.25, "y": -0.5
+        }], "status": "Live input"});
+        assert!(
+            serde_json::from_value::<ControllerFrame>(base.clone())
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        let mut invalid = base.clone();
+        invalid["inputs"][0]["x"] = serde_json::json!(1.01);
+        assert!(
+            serde_json::from_value::<ControllerFrame>(invalid)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        let mut duplicate = base.clone();
+        duplicate["inputs"]
+            .as_array_mut()
+            .unwrap()
+            .push(base["inputs"][0].clone());
+        assert!(
+            serde_json::from_value::<ControllerFrame>(duplicate)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

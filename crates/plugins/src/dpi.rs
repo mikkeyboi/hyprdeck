@@ -179,7 +179,7 @@ pub(crate) fn build(
     let heading = gtk::Label::builder().label(row.title()).xalign(0.0).build();
     heading.add_css_class("heading");
     root.append(&heading);
-    let live_text = match (x, y) { (Some(x), Some(y)) => format!("Current device DPI: {x:.0} × {y:.0}"), _ => "Current DPI unavailable · values below are pending manual settings, not device readback".into() };
+    let live_text = match (x, y) { (Some(x), Some(y)) => format!("Current DPI: {x:.0} × {y:.0}"), _ => "Mouse sleeping / wireless standby · wake mouse to read current DPI, or apply a preset below".into() };
     let live = gtk::Label::builder()
         .label(&live_text)
         .xalign(0.0)
@@ -193,9 +193,8 @@ pub(crate) fn build(
         .build();
     list.add_css_class("boxed-list");
     let link_row = adw::ActionRow::builder().use_markup(false).build();
-    link_row.set_title("Link horizontal and vertical DPI");
-    link_row
-        .set_subtitle("When linked, changing X also changes Y. Nothing is written until Apply.");
+    link_row.set_title("Link X & Y sensitivity");
+    link_row.set_subtitle("Keep horizontal and vertical DPI equal");
     let linked_widget = gtk::Switch::builder()
         .active(*linked)
         .valign(gtk::Align::Center)
@@ -288,7 +287,15 @@ pub(crate) fn build(
         .build();
     presets.add_css_class("heading");
     root.append(&presets);
-    let explanation=gtk::Label::builder().label(if storage=="host" {"Saved on this computer, not the mouse. Use a preset or Previous/Next to apply it; the mouse's DPI buttons keep their onboard behavior."} else {"Stages reported by the device. Changes require explicit Apply."}).wrap(true).xalign(0.0).build();
+    let explanation = gtk::Label::builder()
+        .label(if storage == "host" {
+            "Quick-switch DPI presets stored on this PC."
+        } else {
+            "Hardware DPI stages reported by the mouse."
+        })
+        .wrap(true)
+        .xalign(0.0)
+        .build();
     explanation.add_css_class("dim-label");
     root.append(&explanation);
     let active = gtk::Label::builder()
@@ -392,16 +399,16 @@ pub(crate) fn update(widget: &gtk::Widget, control: &Control) {
     else {
         return;
     };
-    let readback = match (x, y) { (Some(x), Some(y)) => format!("Current device DPI: {x:.0} × {y:.0}"), _ => "Current DPI unavailable · values below are pending manual settings, not device readback".into() };
+    let readback = match (x, y) { (Some(x), Some(y)) => format!("Current DPI: {x:.0} × {y:.0}"), _ => "Mouse sleeping / wireless standby · wake mouse to read current DPI, or apply a preset below".into() };
     let current = active
         .as_ref()
         .and_then(|id| stages.iter().find(|stage| &stage.id == id))
         .map_or_else(
             || {
                 if x.is_none() || y.is_none() {
-                    "Active preset unavailable without device readback".into()
+                    "Select any preset and click Use to apply".into()
                 } else {
-                    "Current DPI is outside the saved presets".into()
+                    "Custom DPI active".into()
                 }
             },
             |stage| format!("Active preset: {}", stage.label),

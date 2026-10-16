@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -12,12 +13,14 @@ use anyhow::{Context, Result, bail, ensure};
 use hyprdeck_core::{rt, store};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::process;
 use crate::protocol::{
-    API_VERSION, MAX_DOCUMENT, Manifest, Request, Response, State, action_name, valid_id,
+    API_VERSION, ControllerFrame, ControllerStream, MAX_DOCUMENT, MAX_INPUT_FRAME, Manifest,
+    Request, Response, State, action_name, valid_id,
 };
 
 static OPERATIONS: Mutex<()> = Mutex::const_new(());
@@ -264,6 +267,186 @@ pub async fn request(id: &str, action: Option<&str>, args: Map<String, Value>) -
     request_in(&root().join(id), &manifest, action, args).await
 }
 
+/// Dropping the page's lease requests termination; the runtime task always reaps.
+pub(crate) struct InputStream {
+    stop: Option<oneshot::Sender<()>>,
+}
+
+impl Drop for InputStream {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+pub(crate) fn input_stream(
+    id: String,
+    stream: ControllerStream,
+) -> (
+    InputStream,
+    mpsc::Receiver<std::result::Result<ControllerFrame, String>>,
+) {
+    let (stop, cancel) = oneshot::channel();
+    let (sender, receiver) = mpsc::channel(8);
+    rt::spawn(async move {
+        if let Err(error) = run_input_stream(&id, &stream, cancel, &sender).await {
+            let _ = sender
+                .send(Err(format!("Live input disconnected: {error:#}")))
+                .await;
+        }
+    });
+    (InputStream { stop: Some(stop) }, receiver)
+}
+
+struct InputProcessGroup(u32);
+impl Drop for InputProcessGroup {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(-(self.0 as i32), libc::SIGKILL);
+        }
+    }
+}
+
+async fn run_input_stream(
+    id: &str,
+    stream: &ControllerStream,
+    mut cancel: oneshot::Receiver<()>,
+    sender: &mpsc::Sender<std::result::Result<ControllerFrame, String>>,
+) -> Result<()> {
+    stream.validate()?;
+    let prepare = async {
+        let _lock = lock().await?;
+        ensure!(settings()?.enabled.contains(id), "plugin {id} is disabled");
+        let manifest = installed(id)?;
+        let dir = root().join(id);
+        let executable = check_executable(&dir, &manifest)?;
+        let mut command = Command::new(executable);
+        command
+            .args(&stream.args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        command
+            .spawn()
+            .context("starting installed plugin input stream")
+    };
+    let mut child = tokio::select! {
+        biased;
+        _ = &mut cancel => return Ok(()),
+        child = prepare => child?,
+    };
+    let group = child.id().map(InputProcessGroup);
+    let stdout = child.stdout.take().context("missing input stream stdout")?;
+    let mut stderr = child.stderr.take().context("missing input stream stderr")?;
+    let mut diagnostics = Vec::new();
+    let result = {
+        let read = async {
+            tokio::try_join!(
+                read_input_frames(stdout, sender),
+                input_diagnostics(&mut stderr, &mut diagnostics)
+            )?;
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::select! {
+            biased;
+            _ = &mut cancel => None,
+            result = read => Some(result),
+        }
+    };
+    // Kill the whole group, including children that might retain a pipe, then
+    // wait explicitly. Dropping a GTK view never abandons a zombie or daemon.
+    let exited = child.try_wait().ok().flatten();
+    drop(group);
+    let _ = child.start_kill();
+    child.wait().await.context("reaping plugin input stream")?;
+    if let Some(result) = result {
+        // stdout may close before stderr has been polled. Drain the terminated
+        // group's remaining diagnostics, still bounded in both time and memory.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            input_diagnostics(&mut stderr, &mut diagnostics),
+        )
+        .await;
+        let diagnostics = String::from_utf8_lossy(&diagnostics);
+        let diagnostics = diagnostics.trim();
+        if !diagnostics.is_empty() {
+            return result.with_context(|| format!("plugin diagnostics: {diagnostics}"));
+        }
+        if let Some(status) = exited {
+            return result.with_context(|| format!("input process exited with {status}"));
+        }
+        result?;
+    }
+    Ok(())
+}
+
+async fn read_input_frames(
+    stdout: impl AsyncRead + Unpin,
+    sender: &mpsc::Sender<std::result::Result<ControllerFrame, String>>,
+) -> Result<()> {
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::new();
+    loop {
+        read_input_line(&mut reader, &mut line).await?;
+        let frame: ControllerFrame =
+            serde_json::from_slice(&line).context("invalid input stream NDJSON frame")?;
+        frame.validate()?;
+        sender.send(Ok(frame)).await.context("input view closed")?;
+        line.clear();
+    }
+}
+
+async fn read_input_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    line: &mut Vec<u8>,
+) -> Result<()> {
+    loop {
+        let bytes = reader.fill_buf().await.context("reading input stream")?;
+        ensure!(
+            !bytes.is_empty(),
+            "input stream reached EOF{}",
+            if line.is_empty() {
+                ""
+            } else {
+                " before a complete frame"
+            }
+        );
+        let newline = bytes.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(bytes.len(), |index| index + 1);
+        ensure!(
+            line.len() + count <= MAX_INPUT_FRAME,
+            "input stream frame exceeds {MAX_INPUT_FRAME} bytes"
+        );
+        line.extend_from_slice(&bytes[..count]);
+        reader.consume(count);
+        if newline.is_some() {
+            return Ok(());
+        }
+    }
+}
+
+async fn input_diagnostics(
+    mut stderr: impl AsyncRead + Unpin,
+    diagnostics: &mut Vec<u8>,
+) -> Result<()> {
+    let mut chunk = [0; 1024];
+    loop {
+        let count = stderr
+            .read(&mut chunk)
+            .await
+            .context("reading input stream diagnostics")?;
+        if count == 0 {
+            return Ok(());
+        }
+        let keep = count.min((16 * 1024usize).saturating_sub(diagnostics.len()));
+        diagnostics.extend_from_slice(&chunk[..keep]);
+    }
+}
+
 pub async fn enable(id: &str) -> Result<()> {
     let _lock = lock().await?;
     let manifest = installed(id)?;
@@ -465,6 +648,51 @@ async fn replace_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn input_lines_are_bounded_before_newline_or_eof() {
+        let bytes = vec![b'x'; MAX_INPUT_FRAME + 1];
+        let mut reader = BufReader::with_capacity(128, bytes.as_slice());
+        let mut line = Vec::new();
+        let error = read_input_line(&mut reader, &mut line).await.unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+        assert!(line.len() <= MAX_INPUT_FRAME);
+        let mut reader = BufReader::new(b"partial".as_slice());
+        line.clear();
+        assert!(
+            read_input_line(&mut reader, &mut line)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("complete frame")
+        );
+    }
+
+    #[tokio::test]
+    async fn input_reader_keeps_button_edges_and_reports_disconnect() {
+        let bytes = b"{\"inputs\":[{\"id\":\"a\",\"label\":\"A\",\"detail\":\"\",\"pressed\":true}],\"status\":\"Live input\"}\n{\"inputs\":[{\"id\":\"a\",\"label\":\"A\",\"detail\":\"\",\"pressed\":false}],\"status\":\"Live input\"}\n";
+        let (sender, mut receiver) = mpsc::channel(8);
+        let error = read_input_frames(bytes.as_slice(), &sender)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("EOF"));
+        assert_eq!(
+            receiver.recv().await.unwrap().unwrap().inputs[0].pressed,
+            Some(true)
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap().unwrap().inputs[0].pressed,
+            Some(false)
+        );
+        let bytes = b"{\"inputs\":[],\"status\":\"Live\",\"bad\":}\n";
+        assert!(
+            read_input_frames(bytes.as_slice(), &sender)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid")
+        );
+    }
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
