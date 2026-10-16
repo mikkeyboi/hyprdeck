@@ -17,6 +17,30 @@ pub fn pages() -> Vec<PageInfo> {
     }]
 }
 
+/// If "Launch Steam Big Picture at login" is enabled, ensure the login entry uses
+/// an absolute executable path (so `systemd-xdg-autostart-generator` never skips it
+/// when `~/.local/bin` is absent from the early systemd user PATH) and launch the
+/// saved session if `xdg-desktop-autostart.target` skipped it during login.
+pub fn start_background() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    hyprdeck_core::rt::spawn(async {
+        let _ = tokio::task::spawn_blocking(|| {
+            if startup::enabled().unwrap_or(false) {
+                // Upgrade legacy bare `Exec=hyprdeck gamescope launch` entries to absolute path.
+                let _ = startup::set_enabled(true);
+                let settings = config::Settings::load().unwrap_or_default();
+                if let Err(err) = engine::launch(&settings, false) {
+                    tracing::warn!("login gamescope launch: {err:#}");
+                }
+            }
+        })
+        .await;
+    });
+}
+
 const USAGE: &str =
     "usage: hyprdeck gamescope <plan | launch [--restart-steam] | autostart <status | on | off>>";
 

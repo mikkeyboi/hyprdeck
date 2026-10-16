@@ -53,11 +53,14 @@ fn all_pages() -> Vec<PageInfo> {
     pages
 }
 
-fn start_background_services() {
+fn start_background_services(login: bool) {
     // Migrate retired notification switches before providers can save their settings.
     hyprdeck_core::notify::settings();
     hd_startup::start_background();
     hd_display::start_background();
+    if login {
+        hd_gamescope::start_background();
+    }
     hd_input::start_background();
     hd_audio::start_background();
     hd_bluetooth::start_background();
@@ -357,6 +360,17 @@ impl Shell {
     }
 
     fn present(&self, page: Option<&str>) {
+        let (base_page, sub_route) = match page {
+            Some(p) if p.starts_with("plugin:") => {
+                let mut parts = p.splitn(3, ':');
+                let _ = parts.next();
+                let pid = parts.next().unwrap_or("");
+                let rest = parts.next();
+                (Some(format!("plugin:{pid}")), rest)
+            }
+            other => (other.map(str::to_owned), None),
+        };
+        let page = base_page.as_deref();
         if page.is_some_and(|id| id == "plugins" || id.starts_with("plugin:")) {
             match hd_plugins::installed_pages() {
                 Ok(installed) => self.refresh_inventory(installed),
@@ -390,6 +404,12 @@ impl Shell {
                 content.set_title("Plugin unavailable");
             }
             self.split.set_show_content(true);
+        }
+        if let Some(page_id) = page
+            && page_id.starts_with("plugin:")
+            && let Some(child) = self.stack.child_by_name(page_id)
+        {
+            child.set_widget_name(&format!("route:{}", sub_route.unwrap_or("")));
         }
         self.ctx.window.set_visible(true);
         self.ctx.window.present();
@@ -435,7 +455,7 @@ pub fn run() -> glib::ExitCode {
         let first = !started.replace(true);
         if first {
             *hold.borrow_mut() = Some(app.hold());
-            start_background_services();
+            start_background_services(opts.background);
             event_loop(app, get_shell.clone(), hold.clone());
         }
         let show =

@@ -250,9 +250,14 @@ pub fn set_enabled(id: &str, enabled: bool) -> Result<()> {
         if entry.user_path.is_some() {
             std::fs::remove_file(&user).with_context(|| format!("removing {}", user.display()))?;
         }
-        return Ok(());
+        return crate::units::daemon_reload().context(
+            "Saved the login setting, but could not reload systemd's autostart generator; run systemctl --user daemon-reload",
+        );
     }
-    store::write_atomic(&user, text.as_bytes())
+    store::write_atomic(&user, text.as_bytes())?;
+    crate::units::daemon_reload().context(
+        "Saved the login setting, but could not reload systemd's autostart generator; run systemctl --user daemon-reload",
+    )
 }
 
 /// `my app!` → `my-app`.
