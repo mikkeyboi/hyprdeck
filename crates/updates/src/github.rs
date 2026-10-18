@@ -90,6 +90,7 @@ struct ApiError {
 /// Result of a lookup: the release (`None` when it does not exist) plus a
 /// warning when only stale cached data could be returned because the network
 /// request failed.
+#[derive(Clone)]
 pub struct Lookup<T = Option<Release>> {
     pub release: T,
     pub fetched_at: i64,

@@ -20,7 +20,7 @@ pub struct Project {
     pub title: &'static str,
     /// `owner/repo` on GitHub.
     pub github: &'static str,
-    /// Release package in the official Arch repositories.
+    /// Release package in the configured repositories, when available.
     pub repo_pkg: &'static str,
     /// Development package in the AUR (switching is offered only if it still exists there).
     pub git_pkg: &'static str,
@@ -28,7 +28,7 @@ pub struct Project {
     pub binary: Option<&'static str>,
 }
 
-/// Known components. Package names verified against the Arch repos and the AUR.
+/// Known components. Availability of repository and AUR packages is checked at runtime.
 pub const PROJECTS: &[Project] = &[
     Project {
         title: "Hyprland",
@@ -106,6 +106,28 @@ pub const PROJECTS: &[Project] = &[
         repo_pkg: "xdg-desktop-portal-hyprland",
         git_pkg: "xdg-desktop-portal-hyprland-git",
         binary: None,
+    },
+    Project {
+        title: "MangoHUD",
+        github: "flightlessmango/MangoHud",
+        repo_pkg: "mangohud",
+        git_pkg: "mangohud-git",
+        binary: Some("mangohud"),
+    },
+    Project {
+        title: "MangoHUD (32-bit)",
+        github: "flightlessmango/MangoHud",
+        repo_pkg: "lib32-mangohud",
+        git_pkg: "lib32-mangohud-git",
+        binary: None,
+    },
+    // Some distributions package MangoApp separately; Arch bundles it in mangohud.
+    Project {
+        title: "MangoApp",
+        github: "flightlessmango/MangoHud",
+        repo_pkg: "mangoapp",
+        git_pkg: "mangoapp-git",
+        binary: Some("mangoapp"),
     },
 ];
 
@@ -524,10 +546,11 @@ pub fn run_check() -> Report {
             .pacman
             .then(|| s.spawn(|| aur::list_updates().map_err(|e| format!("{e:#}"))));
         // Network lookups are independent of pacman; run them in parallel.
-        let gh: Vec<_> = detected
-            .iter()
-            .map(|&(p, _)| s.spawn(move || github::latest_release(p.github, now)))
-            .collect();
+        let mut gh = std::collections::BTreeMap::new();
+        for &(p, _) in &detected {
+            gh.entry(p.github)
+                .or_insert_with(|| s.spawn(move || github::latest_release(p.github, now)));
+        }
         let git_pkgs: Vec<&str> = if tooling.pacman {
             detected.iter().map(|(p, _)| p.git_pkg).collect()
         } else {
@@ -559,13 +582,20 @@ pub fn run_check() -> Report {
             None => (aur::Listing::default(), None),
         };
         let in_aur = in_aur.join().unwrap_or_default();
+        let upstreams: std::collections::BTreeMap<_, _> = gh
+            .into_iter()
+            .map(|(repo, handle)| {
+                let result = handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("GitHub lookup panicked")))
+                    .map_err(|e| format!("{e:#}"));
+                (repo, result)
+            })
+            .collect();
         let tracked: Vec<Tracked> = detected
             .into_iter()
-            .zip(gh)
-            .map(|((p, d), h)| {
-                let upstream = h
-                    .join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("GitHub lookup panicked")));
+            .map(|(p, d)| {
+                let upstream = upstreams[p.github].clone().map_err(anyhow::Error::msg);
                 tracked(p, d, &sync, in_aur.contains(p.git_pkg), upstream, now)
             })
             .collect();

@@ -10,6 +10,7 @@ mod dialog;
 mod github;
 mod helper;
 mod news;
+mod overlay;
 mod page;
 mod parse;
 mod pkgbuild;
@@ -35,6 +36,12 @@ pub fn pages() -> Vec<PageInfo> {
         icon: "software-update-available-symbolic",
         build: page::build,
     }]
+}
+
+/// Package/dependency status and the existing safe check/review/update entry
+/// point for MangoHUD/MangoApp preferences. Builds no separate package writer.
+pub fn overlay_packages(ctx: &hyprdeck_core::ui::Ctx) -> gtk::Widget {
+    overlay::build(ctx)
 }
 
 pub fn start_background() {
