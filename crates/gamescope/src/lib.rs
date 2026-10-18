@@ -3,6 +3,7 @@
 pub mod config;
 pub mod engine;
 pub mod overlay;
+mod overlay_controls;
 mod overlay_page;
 mod overlay_preview;
 mod page;

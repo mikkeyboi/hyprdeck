@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use hyprdeck_core::{cmd, store};
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_CONFIG: &str = "fps\nframetime\nframe_timing\ngpu_stats\ncpu_stats\nmangoapp_steam=1\nposition=top-left\nfont_size=24\nbackground_alpha=0.5\n";
+pub const DEFAULT_CONFIG: &str = "fps\nfps_text=FPS\nhide_fps_superscript=1\ngpu_stats\ngpu_temp\ncpu_stats\ncpu_temp\nframetime=0\nframe_timing=0\nmangoapp_steam=1\nposition=top-left\nfont_size=24\nbackground_alpha=0.5\n";
 
 // Plan refreshes and saves run on workers. Serialize profile/native-file writes
 // so an older plan cannot overwrite a just-saved appearance.
@@ -39,6 +39,19 @@ impl Settings {
         materialize(&self.config)?;
         Ok(())
     }
+}
+
+/// Persist appearance without changing the separately saved next-launch toggle.
+pub fn save_appearance(config: &str) -> Result<()> {
+    validate(config)?;
+    let _guard = CONFIG_WRITE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut settings = Settings::load()?;
+    settings.config = config.into();
+    store::save("overlay", &settings)?;
+    materialize(config)?;
+    Ok(())
 }
 
 pub fn validate(config: &str) -> Result<()> {
@@ -85,17 +98,8 @@ pub fn require_mangoapp() -> Result<()> {
 /// Replace just one native option, retaining comments and unrecognised settings.
 /// Remove duplicate assignments so the control's value is unambiguous.
 pub fn set_option(config: &str, key: &str, value: &str) -> String {
-    let mut result = String::with_capacity(config.len() + key.len() + value.len() + 2);
-    for line in config.lines() {
-        let option = line
-            .trim()
-            .split_once('=')
-            .map_or(line.trim(), |(k, _)| k.trim());
-        if option != key {
-            result.push_str(line);
-            result.push('\n');
-        }
-    }
+    let mut result = remove_option(config, key);
+    result.reserve(key.len() + value.len() + 2);
     result.push_str(key);
     result.push('=');
     result.push_str(value);
@@ -103,13 +107,35 @@ pub fn set_option(config: &str, key: &str, value: &str) -> String {
     result
 }
 
+/// Remove only active assignments, keeping unrelated options and comments.
+pub fn remove_option(config: &str, key: &str) -> String {
+    let mut result = String::with_capacity(config.len());
+    for line in config.lines() {
+        if parsed_option(line).is_some_and(|(option, _)| option == key) {
+            continue;
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+    result
+}
+
+pub(super) fn parsed_option(line: &str) -> Option<(&str, &str)> {
+    // MangoHUD strips everything after #, including on assignment lines.
+    let line = line.split('#').next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(
+        line.split_once('=')
+            .map_or((line, "1"), |(key, value)| (key.trim(), value.trim())),
+    )
+}
+
 pub fn option<'a>(config: &'a str, key: &str) -> Option<&'a str> {
     config.lines().rev().find_map(|line| {
-        let line = line.trim();
-        let (k, value) = line
-            .split_once('=')
-            .map_or((line, "1"), |(k, v)| (k.trim(), v.trim()));
-        (k == key).then_some(value)
+        let (option, value) = parsed_option(line)?;
+        (option == key).then_some(value)
     })
 }
 
@@ -132,5 +158,20 @@ mod tests {
         assert_eq!(option("fps=0\n#fps\n", "fps"), Some("0"));
         assert_eq!(option("fps=0\nfps\n", "fps"), Some("1"));
         assert_eq!(option("#font_size=24\n", "font_size"), None);
+    }
+    #[test]
+    fn inline_comments_and_reset_follow_native_precedence() {
+        let config =
+            "# FPS heading\nfps=1\nfps = 0 # disabled\ncustom_text=Game # native comment\n";
+        assert_eq!(option(config, "fps"), Some("0"));
+        assert_eq!(option(config, "custom_text"), Some("Game"));
+        assert_eq!(
+            set_option(config, "fps", "1"),
+            "# FPS heading\ncustom_text=Game # native comment\nfps=1\n"
+        );
+        assert_eq!(
+            remove_option(config, "fps"),
+            "# FPS heading\ncustom_text=Game # native comment\n"
+        );
     }
 }

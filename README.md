@@ -174,18 +174,35 @@ Open **Gaming → Performance overlay** for MangoHUD/MangoApp. Install `mangohud
 injecting MangoHUD into Steam or every game. The toggle is off by default. A missing renderer is
 reported explicitly instead of silently launching without the requested overlay.
 
-Position, font size, opacity and common metrics have native controls. FPS-only, balanced and detailed
-presets replace the draft. **Full configuration** exposes every option supported by the installed
-MangoHUD: colors, fonts, offsets, graphs, hotkeys, logging and more. Unknown options and comments are
-preserved; MangoHUD handles unsupported settings. Its `exec` options execute commands as your user.
-Interception-only OpenGL/Vulkan settings do not configure games through MangoApp.
+Searchable native controls cover MangoHUD metrics, layout, fonts, dimensions, offsets, RGB color
+pickers, graphs, thresholds, hotkeys, logging, media and network information. Each control can reset
+its override to the renderer's default. **FPS + temperatures** shows FPS, GPU usage, and GPU/CPU
+temperatures; FPS-only and detailed presets are also available. Presets replace the entire draft.
+Existing saved configurations are not migrated or overwritten by opening the view.
+
+**Custom FPS label** replaces `GAMESCOPE` with `FPS` or literal text such as your game's name.
+The default sensor preset uses `FPS`. With an empty custom label, **Use FPS instead of GAMESCOPE**
+uses MangoHUD's engine-name hiding option; **Number only** hides all other metrics. MangoApp does
+not automatically substitute the running application's name into the label. Its executable-name
+metric is separate, not a dynamic FPS-label template. See the native [label selection](https://github.com/flightlessmango/MangoHud/blob/master/src/overlay.h).
+
+**Full configuration** remains the lossless editor for every native option supported by the
+installed version, including ordering, repeated custom text/commands and newer options. Graphical
+edits preserve unrelated lines; MangoHUD handles unsupported settings. Its `exec` options execute
+commands as your user. Injection-only OpenGL/Vulkan settings and MangoHUD's game FPS limiter do not
+configure games through MangoApp; use the Gaming session controls for Gamescope's limiter.
 
 **Start 3D preview** needs `gamescope` and `glxgears` (`mesa-utils`). It runs an isolated headless
 Gamescope and the real MangoApp renderer, then embeds full-composition captures in this view—no
-mock HUD or desktop screen capture. The SDR demo is 960 × 540 at 30 FPS, captured at 5 FPS and scaled
-to fit; actual game FPS, available sensors, HDR and resolution differ. Draft edits hot-reload after
-a short delay without saving or touching Steam. Stop, closing the view, or hiding its window stops
-preview rendering. The private timing queue prevents interference with a running gaming session.
+mock HUD or desktop screen capture. Virtual refresh is selectable from 30–360 Hz (120 Hz initially),
+without a separate 30 FPS limiter. Image quality trades PNG readback cost for fidelity: smooth
+480 × 270, balanced 640 × 360, or detailed 960 × 540, scaled to fit. Captures target up to 60 FPS;
+actual capture rate depends on hardware and Gamescope's PNG encoding/readback, independently of
+the demo's reported FPS. Decoding runs off the GTK thread, scratch files use the runtime directory,
+and a bounded frame channel skips work when the UI falls behind. This is an SDR layout preview,
+not a benchmark; actual game FPS, sensors, HDR and resolution differ. Draft edits hot-reload after
+a short delay without saving or touching Steam, unless live application is enabled. Stop, closing
+the view, or hiding its window stops rendering. A private timing queue isolates gaming sessions.
 Gamescope’s screenshot-control protocol v3 is required; unavailable dependencies/backend support
 produce an actionable error. See the [Gamescope control protocol](https://github.com/ValveSoftware/gamescope/blob/3.16.25/protocol/gamescope-control.xml)
 and [MangoHUD configuration reference](https://github.com/flightlessmango/MangoHud/blob/master/data/MangoHud.conf).
@@ -193,8 +210,25 @@ and [MangoHUD configuration reference](https://github.com/flightlessmango/MangoH
 The overlay profile lives in `~/.config/hyprdeck/overlay.toml`; Hyprdeck materializes its native
 configuration as `~/.config/hyprdeck/MangoHud.conf`. Save through this view, not the generated file.
 The launch command and service use the same absolute configuration path and clear inherited inline
-MangoHUD overrides. Enable/disable requires a new session; an already-enabled MangoApp can reload
-saved appearance changes. Saving never restarts Steam.
+MangoHUD overrides. **Apply appearance edits live** automatically saves appearance after a short
+delay, and already-enabled Hyprdeck MangoApp sessions reload the file without restarting Hyprdeck,
+Steam or the game. Live appearance saves do not commit the separate enable switch; **Save overlay**
+commits that switch for the next session. Attaching/detaching MangoApp still requires a new session.
+Native options that the renderer cannot hot-reload remain subject to its installed-version limits.
+
+Gamescope supplies application frame timing to MangoApp; **Gamescope and frame reporting** exposes
+its latency graphs, refresh, HDR and upscaler information. The `GAMESCOPE` text is MangoApp's engine
+label, not a second Gamescope FPS counter. Gamescope's own debug HUD and statistics output are
+diagnostic facilities, not a GOverlay-style temperature/appearance editor.
+
+**MangoHUD packages and updates** shows binary paths, package ownership, installed versions,
+repository/AUR updates, and informational upstream releases. **Check now** uses the shared checker;
+**Review system updates…** opens Hyprdeck's existing reviewed full-system updater. It never performs
+an unsafe partial upgrade or replaces distro libraries with downloaded binaries. On Arch, `mangohud`
+includes `mangoapp`; optional `lib32-mangohud` supplies 32-bit injection libraries. Missing packages
+must be installed through the distribution's package manager; the updater upgrades installed
+packages only. Non-pacman systems receive package-manager guidance, not an unsupported install
+button. Development (`-git`) packages retain the existing AUR commit-only update limitations.
 
 ### Session status and launch
 
