@@ -37,7 +37,7 @@ pub struct Snapshot {
     pub vrr_policy: i64,
     pub gamescope_available: bool,
     pub steam_available: bool,
-    pub steam_state: SteamState,
+    pub session: SessionStatus,
 }
 
 pub fn snapshot() -> Result<Snapshot> {
@@ -54,8 +54,49 @@ pub fn snapshot() -> Result<Snapshot> {
         vrr_policy,
         gamescope_available: cmd::which("gamescope").is_some(),
         steam_available: cmd::which("steam").is_some(),
-        steam_state: processes()?.steam_state(),
+        session: session_status()?,
     })
+}
+
+/// Process-only observation: no display, dependency, or systemd subprocess polling.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionStatus {
+    pub steam_pids: Vec<u32>,
+    pub gamescope_pids: Vec<u32>,
+    pub steam_scopes: Vec<u32>,
+    pub managed_gamescope_pids: Vec<u32>,
+}
+
+impl SessionStatus {
+    pub fn steam_state(&self) -> SteamState {
+        if !self.steam_scopes.is_empty() {
+            SteamState::Gamescope
+        } else if !self.steam_pids.is_empty() {
+            SteamState::Desktop
+        } else {
+            SteamState::Stopped
+        }
+    }
+
+    pub fn managed_transition(&self) -> bool {
+        !self.managed_gamescope_pids.is_empty() && self.steam_scopes.is_empty()
+    }
+}
+
+pub fn session_status() -> Result<SessionStatus> {
+    let mut session = processes()?.session_status();
+    for &pid in &session.gamescope_pids {
+        // Only classify an already-identified Gamescope process. A cgroup name
+        // never establishes executable identity or makes unrelated Steam nested.
+        if std::fs::read_to_string(format!("/proc/{pid}/cgroup")).is_ok_and(|groups| {
+            groups
+                .lines()
+                .any(|line| line.split('/').any(|component| component == UNIT))
+        }) {
+            session.managed_gamescope_pids.push(pid);
+        }
+    }
+    Ok(session)
 }
 
 #[derive(Debug, Clone)]
@@ -67,17 +108,39 @@ pub struct Plan {
     pub hdr: bool,
     pub adaptive_sync: bool,
     pub argv: Vec<String>,
+    pub environment: Vec<(String, String)>,
     pub warnings: Vec<String>,
 }
 
 impl Plan {
     /// A copyable preview only. Launch passes argv directly, never through a shell.
     pub fn command_line(&self) -> String {
-        self.argv
+        self.environment
             .iter()
-            .map(|arg| cmd::shell_quote(arg))
+            .map(|(key, value)| format!("{key}={}", cmd::shell_quote(value)))
+            .chain(self.argv.iter().map(|arg| cmd::shell_quote(arg)))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// Add the persisted overlay only at real preview/launch boundaries, keeping
+    /// the settings planner independent of filesystem state and dependencies.
+    pub fn with_overlay(mut self) -> Result<Self> {
+        if let Some(environment) = crate::overlay::launch_environment()? {
+            let separator = self
+                .argv
+                .iter()
+                .position(|arg| arg == "--")
+                .context("Gamescope launch plan has no command separator")?;
+            self.argv.insert(separator, "--mangoapp".into());
+            self.environment.push(environment);
+            // Native file settings must not be shadowed by a desktop-wide
+            // MANGOHUD_CONFIG override. Do not inject a second per-game HUD.
+            self.environment
+                .push(("MANGOHUD_CONFIG".into(), String::new()));
+            self.environment.push(("MANGOHUD".into(), "0".into()));
+        }
+        Ok(self)
     }
 }
 
@@ -175,6 +238,18 @@ pub fn plan(settings: &Settings, snapshot: &Snapshot) -> Result<Plan> {
     if settings.framerate_limit > (i32::MAX / 1000) as u32 {
         bail!("Framerate limit is too large for Gamescope; use 0 to disable it.");
     }
+    if settings.hide_cursor_delay > i32::MAX as u32 {
+        bail!(
+            "Cursor hide delay must be between 0 and {} milliseconds.",
+            i32::MAX
+        );
+    }
+    let sensitivity = settings.mouse_sensitivity as f32;
+    if !settings.mouse_sensitivity.is_finite() || !sensitivity.is_finite() || sensitivity <= 0.0 {
+        bail!(
+            "Mouse sensitivity must be finite, positive, and representable by Gamescope (for example 1.0)."
+        );
+    }
     if !snapshot.gamescope_available {
         bail!(
             "Gamescope is not installed or not on PATH. Install gamescope, then refresh detection."
@@ -210,7 +285,7 @@ pub fn plan(settings: &Settings, snapshot: &Snapshot) -> Result<Plan> {
             monitor.name
         ));
     }
-    if snapshot.steam_state == SteamState::Desktop {
+    if snapshot.session.steam_state() == SteamState::Desktop {
         warnings.push("Desktop Steam is running. Launch requires permission to exit it normally, closing games and interrupting downloads.".into());
     }
     if settings.framerate_limit != 0 {
@@ -218,6 +293,9 @@ pub fn plan(settings: &Settings, snapshot: &Snapshot) -> Result<Plan> {
     }
     if settings.grab_keyboard {
         warnings.push("Gamescope 3.16.25's native Wayland backend does not inhibit host keyboard shortcuts. The -g request is passed through, but Hyprland shortcuts remain active.".into());
+    }
+    if settings.force_grab_cursor {
+        warnings.push("Forced cursor capture always uses relative mouse mode, including Steam menus. It can make desktop-style pointing awkward; leave it off for automatic switching unless a game needs it. This does not fix upstream focus or input bugs.".into());
     }
     if settings.window_mode == WindowMode::Fullscreen && !settings.auto_display {
         warnings.push("Native Wayland fullscreen uses the compositor's physical output size; output-size overrides are initial window dimensions, not a desktop modeset.".into());
@@ -262,6 +340,15 @@ pub fn plan(settings: &Settings, snapshot: &Snapshot) -> Result<Plan> {
     if settings.grab_keyboard {
         argv.push("-g".into());
     }
+    if settings.force_grab_cursor {
+        argv.push("--force-grab-cursor".into());
+    }
+    argv.extend([
+        "--hide-cursor-delay".into(),
+        settings.hide_cursor_delay.to_string(),
+        "--mouse-sensitivity".into(),
+        sensitivity.to_string(),
+    ]);
     if settings.framerate_limit != 0 {
         argv.extend([
             "--framerate-limit".into(),
@@ -277,6 +364,7 @@ pub fn plan(settings: &Settings, snapshot: &Snapshot) -> Result<Plan> {
         hdr,
         adaptive_sync,
         argv,
+        environment: Vec::new(),
         warnings,
     })
 }
@@ -296,6 +384,23 @@ struct Process {
 struct Processes(HashMap<u32, Process>);
 
 impl Processes {
+    fn session_status(&self) -> SessionStatus {
+        let mut session = SessionStatus {
+            steam_scopes: self.steam_scopes(),
+            ..SessionStatus::default()
+        };
+        for (&pid, process) in &self.0 {
+            match process.executable.as_str() {
+                "steam" => session.steam_pids.push(pid),
+                "gamescope" => session.gamescope_pids.push(pid),
+                _ => {}
+            }
+        }
+        session.steam_pids.sort_unstable();
+        session.gamescope_pids.sort_unstable();
+        session
+    }
+
     fn gamescope_parent(&self, pid: u32) -> Option<u32> {
         let mut current = pid;
         for _ in 0..self.0.len() {
@@ -678,7 +783,17 @@ fn start_service(plan: &Plan) -> Result<()> {
         {
             continue;
         }
+        if plan
+            .environment
+            .iter()
+            .any(|(override_key, _)| override_key == key)
+        {
+            continue;
+        }
         args.push(format!("--setenv={key}"));
+    }
+    for (key, value) in &plan.environment {
+        args.push(format!("--setenv={key}={value}"));
     }
     args.push("--".into());
     args.push(gamescope);
@@ -787,6 +902,22 @@ fn observe_launch(plan: &Plan, mode: WindowMode) -> Result<LaunchOutcome> {
     }
 }
 
+/// Opening is deliberately separate from launching: if the live banner races
+/// with an external exit, never replace that session with a new defaults launch.
+pub fn open_existing() -> Result<LaunchOutcome> {
+    let _local = LAUNCH_LOCK.lock().map_err(|_| {
+        anyhow::anyhow!("Steam Gamescope launch lock was interrupted; restart Hyprdeck and retry")
+    })?;
+    let _file = lock()?;
+    let running = processes()?;
+    if running.steam_state() != SteamState::Gamescope {
+        bail!(
+            "The existing Steam Gamescope session has exited. No new session was started; review your launch settings and choose Launch Big Picture."
+        );
+    }
+    focus_existing(&running)
+}
+
 pub fn launch(settings: &Settings, restart_steam: bool) -> Result<LaunchOutcome> {
     let _local = LAUNCH_LOCK.lock().map_err(|_| {
         anyhow::anyhow!("Steam Gamescope launch lock was interrupted; restart Hyprdeck and retry")
@@ -823,14 +954,14 @@ pub fn launch(settings: &Settings, restart_steam: bool) -> Result<LaunchOutcome>
             "The managed Gamescope session is already running or stopping, but associated Steam is not ready. Inspect journalctl --user -u {UNIT} -b and wait; no duplicate was launched."
         );
     }
-    let mut launch_plan = plan(settings, &snapshot()?)?;
+    let mut launch_plan = plan(settings, &snapshot()?)?.with_overlay()?;
     settings
         .save()
         .context("Saving Gamescope choices before launch")?;
     if steam_state == SteamState::Desktop {
         shutdown_steam()?;
         // Output focus and policy may have changed while Steam closed.
-        launch_plan = plan(settings, &snapshot()?)?;
+        launch_plan = plan(settings, &snapshot()?)?.with_overlay()?;
     }
     let running = processes()?;
     match running.steam_state() {
@@ -869,7 +1000,7 @@ mod tests {
             vrr_policy: 2,
             gamescope_available: true,
             steam_available: true,
-            steam_state: SteamState::Stopped,
+            session: SessionStatus::default(),
         }
     }
 
@@ -1029,5 +1160,158 @@ mod tests {
         assert_eq!(processes.steam_state(), SteamState::Desktop);
         processes.0.get_mut(&10).unwrap().parent = 21;
         assert_eq!(processes.steam_state(), SteamState::Gamescope);
+    }
+
+    #[test]
+    fn live_session_tracks_external_start_exit_and_multiple_steam_processes() {
+        let mut processes = Processes(HashMap::new());
+        assert_eq!(
+            processes.session_status().steam_state(),
+            SteamState::Stopped
+        );
+        processes.0.insert(
+            30,
+            Process {
+                parent: 1,
+                executable: "steam".into(),
+            },
+        );
+        assert_eq!(
+            processes.session_status().steam_state(),
+            SteamState::Desktop
+        );
+        processes.0.insert(
+            10,
+            Process {
+                parent: 1,
+                executable: "gamescope".into(),
+            },
+        );
+        processes.0.insert(
+            11,
+            Process {
+                parent: 10,
+                executable: String::new(),
+            },
+        );
+        processes.0.insert(
+            20,
+            Process {
+                parent: 11,
+                executable: "steam".into(),
+            },
+        );
+        processes.0.insert(
+            21,
+            Process {
+                parent: 20,
+                executable: "steam".into(),
+            },
+        );
+        let session = processes.session_status();
+        assert_eq!(session.steam_state(), SteamState::Gamescope);
+        assert_eq!(session.steam_pids, [20, 21, 30]);
+        assert_eq!(session.gamescope_pids, [10]);
+        assert_eq!(session.steam_scopes, [10]);
+        processes.0.remove(&20);
+        processes.0.remove(&21);
+        assert_eq!(
+            processes.session_status().steam_state(),
+            SteamState::Desktop
+        );
+        processes.0.remove(&30);
+        assert_eq!(
+            processes.session_status().steam_state(),
+            SteamState::Stopped
+        );
+    }
+
+    #[test]
+    fn managed_gamescope_without_associated_steam_is_a_transition_not_openable() {
+        let mut session = SessionStatus {
+            gamescope_pids: vec![10],
+            managed_gamescope_pids: vec![10],
+            ..SessionStatus::default()
+        };
+        assert!(session.managed_transition());
+        assert_eq!(session.steam_state(), SteamState::Stopped);
+        session.steam_pids.push(20);
+        assert!(session.managed_transition());
+        assert_eq!(session.steam_state(), SteamState::Desktop);
+        session.steam_scopes.push(10);
+        assert!(!session.managed_transition());
+        assert_eq!(session.steam_state(), SteamState::Gamescope);
+    }
+
+    #[test]
+    fn broken_or_cyclic_ancestry_never_identifies_a_steam_host() {
+        let processes = Processes(HashMap::from([
+            (
+                10,
+                Process {
+                    parent: 11,
+                    executable: "steam".into(),
+                },
+            ),
+            (
+                11,
+                Process {
+                    parent: 10,
+                    executable: String::new(),
+                },
+            ),
+            (
+                20,
+                Process {
+                    parent: 99,
+                    executable: "steam".into(),
+                },
+            ),
+            (
+                30,
+                Process {
+                    parent: 1,
+                    executable: "gamescope".into(),
+                },
+            ),
+        ]));
+        let session = processes.session_status();
+        assert_eq!(session.steam_state(), SteamState::Desktop);
+        assert!(session.steam_scopes.is_empty());
+        assert_eq!(session.steam_pids, [10, 20]);
+    }
+
+    #[test]
+    fn invalid_mouse_values_and_integer_overflow_never_reach_gamescope() {
+        let mut settings = Settings::default();
+        for sensitivity in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+        ] {
+            settings.mouse_sensitivity = sensitivity;
+            assert!(plan(&settings, &detected()).is_err());
+        }
+        settings.mouse_sensitivity = 1.0;
+        settings.hide_cursor_delay = i32::MAX as u32;
+        assert!(plan(&settings, &detected()).is_ok());
+        settings.hide_cursor_delay += 1;
+        assert!(plan(&settings, &detected()).is_err());
+    }
+
+    #[test]
+    fn preview_environment_quotes_only_the_assignment_value() {
+        let mut plan = plan(&Settings::default(), &detected()).unwrap();
+        plan.environment.push((
+            "MANGOHUD_CONFIGFILE".into(),
+            "/a profile/overlay.conf".into(),
+        ));
+        assert!(
+            plan.command_line()
+                .starts_with("MANGOHUD_CONFIGFILE='/a profile/overlay.conf' gamescope ")
+        );
     }
 }

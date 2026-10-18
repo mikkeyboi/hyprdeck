@@ -2,6 +2,9 @@
 
 pub mod config;
 pub mod engine;
+pub mod overlay;
+mod overlay_page;
+mod overlay_preview;
 mod page;
 pub mod startup;
 
@@ -80,7 +83,7 @@ pub fn cli(args: &[String]) -> Option<Result<()>> {
 fn print_plan() -> Result<()> {
     let settings = config::Settings::load()?;
     let snapshot = engine::snapshot()?;
-    let plan = engine::plan(&settings, &snapshot)?;
+    let plan = engine::plan(&settings, &snapshot)?.with_overlay()?;
     println!(
         "{}: {}×{} at {:.2} Hz",
         plan.output, plan.width, plan.height, plan.refresh_rate

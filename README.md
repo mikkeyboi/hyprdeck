@@ -22,7 +22,7 @@ loads last. Your hand-written config is never rewritten behind your back.
 | --- | --- |
 | **Startup Apps** | XDG autostart entries, systemd user services and `hl.on("hyprland.start")` commands in one list. Enable/disable for the next login, start/stop/restart now, view logs, add apps, and delete entries you own (with a preview of every file removed). |
 | **Displays** | Drag-to-arrange layout. Resolution, refresh rate, scale (only values Hyprland accepts), rotation, VRR, mirroring, color management and HDR (SDR brightness/saturation/luminance, EOTF, bit depth, ICC). Changes apply behind a 15 s keep-or-revert countdown. Brightness, contrast and input source over DDC/CI via `ddcutil`. |
-| **Gaming** | Launch Steam Big Picture inside native Wayland Gamescope with Steam Input/overlay integration. Detect the focused or selected output’s physical resolution, refresh rate, HDR preset and VRR policy; override rendering, presentation and frame-rate settings. Preview/copy the command, save a profile, and reopen an existing session without duplicates. Desktop Steam restarts only after confirmation. |
+| **Gaming** | Native Wayland Gamescope + Steam Big Picture, Steam Input and overlay integration. Live session/PID status without navigation. Display-derived resolution, HDR and VRR; advanced rendering and input controls. A separate MangoHUD view provides presets, full native configuration and an actual embedded 3D overlay preview. Save profiles, inspect commands, and open existing sessions without duplicates. Desktop Steam restarts only after confirmation. |
 | **Input Devices** | Keyboard layouts, options and repeat; pointer, focus and touchpad behaviour; cursor; overrides per physical device. Every value shows where it comes from: config file:line, hyprdeck, or default. |
 | **Keybinds** | Every effective bind in readable form, grouped and searchable. Add, edit, disable and restore binds. Record key combos (even ones Hyprland already grabs). Pick an app, a shell action, a window/workspace action or any dispatcher. Warns before replacing an existing bind. |
 | **Audio** | Play through several outputs at once (a PipeWire combine sink) and route specific apps to specific outputs. Includes volumes, default output, a "what's playing where" overview, and a tray submenu. |
@@ -157,6 +157,50 @@ Auto/On/Off, scaling filter, frame-rate cap and keyboard-grab request are config
 Wayland fullscreen ultimately uses the compositor’s output size; use render resolution to lower
 game rendering resolution. The native backend’s keyboard-grab option does not suppress Hyprland
 shortcuts, and Gamescope’s frame-rate cap uses refresh-rate divisors; both limitations are shown.
+
+**Controller and mouse switching** keeps Gamescope’s automatic cursor capture by default. The idle
+cursor hides after 1000 ms; change the delay or mouse movement multiplier in the input expander.
+**Force relative mouse capture** is opt-in for games that need it; it also affects Steam menus and
+can make ordinary pointing awkward. These controls mitigate cursor/capture issues, not upstream
+Steam Input or compositor focus bugs. Hyprland shortcuts remain active; no global input rules are
+changed. Unfocused-FPS throttling is deliberately omitted: Gamescope 3.16.25 only applies that option
+in its SDL backend, not this launcher’s native Wayland backend.
+
+### Performance overlay
+
+Open **Gaming → Performance overlay** for MangoHUD/MangoApp. Install `mangohud` (including the
+`mangoapp` executable; some distributions package it separately). Enable the overlay and choose
+**Save overlay**; new sessions use Gamescope’s recommended `--mangoapp` integration rather than
+injecting MangoHUD into Steam or every game. The toggle is off by default. A missing renderer is
+reported explicitly instead of silently launching without the requested overlay.
+
+Position, font size, opacity and common metrics have native controls. FPS-only, balanced and detailed
+presets replace the draft. **Full configuration** exposes every option supported by the installed
+MangoHUD: colors, fonts, offsets, graphs, hotkeys, logging and more. Unknown options and comments are
+preserved; MangoHUD handles unsupported settings. Its `exec` options execute commands as your user.
+Interception-only OpenGL/Vulkan settings do not configure games through MangoApp.
+
+**Start 3D preview** needs `gamescope` and `glxgears` (`mesa-utils`). It runs an isolated headless
+Gamescope and the real MangoApp renderer, then embeds full-composition captures in this view—no
+mock HUD or desktop screen capture. The SDR demo is 960 × 540 at 30 FPS, captured at 5 FPS and scaled
+to fit; actual game FPS, available sensors, HDR and resolution differ. Draft edits hot-reload after
+a short delay without saving or touching Steam. Stop, closing the view, or hiding its window stops
+preview rendering. The private timing queue prevents interference with a running gaming session.
+Gamescope’s screenshot-control protocol v3 is required; unavailable dependencies/backend support
+produce an actionable error. See the [Gamescope control protocol](https://github.com/ValveSoftware/gamescope/blob/3.16.25/protocol/gamescope-control.xml)
+and [MangoHUD configuration reference](https://github.com/flightlessmango/MangoHud/blob/master/data/MangoHud.conf).
+
+The overlay profile lives in `~/.config/hyprdeck/overlay.toml`; Hyprdeck materializes its native
+configuration as `~/.config/hyprdeck/MangoHud.conf`. Save through this view, not the generated file.
+The launch command and service use the same absolute configuration path and clear inherited inline
+MangoHUD overrides. Enable/disable requires a new session; an already-enabled MangoApp can reload
+saved appearance changes. Saving never restarts Steam.
+
+### Session status and launch
+
+The banner lists Steam and Gamescope PIDs, their association, and managed sessions starting/exiting.
+One process-only observation runs every two seconds while Gaming is visible; hidden pages stop
+polling. No repeated display detection or systemd subprocesses are needed, and drafts are retained.
 
 If Steam is already nested, **Open existing session** focuses it without saving drafts or restarting.
 If desktop Steam is running, launch asks before a normal shutdown/restart; games can close and
