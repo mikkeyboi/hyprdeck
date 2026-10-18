@@ -11,9 +11,37 @@ use hyprdeck_core::rt;
 use hyprdeck_core::ui::{self, Ctx};
 
 use crate::config::{Filter, Settings, Toggle, WindowMode};
-use crate::engine::{self, LaunchOutcome, Plan, Snapshot, SteamState};
+use crate::engine::{self, LaunchOutcome, Plan, SessionStatus, Snapshot, SteamState};
 use crate::startup;
 
+/// A visibility epoch prevents an observation started before hiding the page
+/// from being applied after it is shown again. At most one poll is in flight.
+#[derive(Default)]
+struct SessionPolling {
+    mapped: bool,
+    in_flight: bool,
+    epoch: u64,
+}
+
+impl SessionPolling {
+    fn set_mapped(&mut self, mapped: bool) {
+        self.mapped = mapped;
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    fn begin(&mut self) -> Option<u64> {
+        if !self.mapped || self.in_flight {
+            return None;
+        }
+        self.in_flight = true;
+        Some(self.epoch)
+    }
+
+    fn complete(&mut self, epoch: u64) -> bool {
+        self.in_flight = false;
+        self.mapped && self.epoch == epoch
+    }
+}
 struct Page {
     window: glib::WeakRef<adw::ApplicationWindow>,
     toasts: glib::WeakRef<adw::ToastOverlay>,
@@ -23,6 +51,11 @@ struct Page {
     dirty: Cell<bool>,
     busy: Cell<bool>,
     refresh_pending: Cell<bool>,
+    detecting: Cell<bool>,
+    polling: RefCell<SessionPolling>,
+    poll_timer: RefCell<Option<glib::SourceId>>,
+    session: RefCell<Option<SessionStatus>>,
+    session_error: RefCell<Option<String>>,
     preview_busy: Cell<bool>,
     revision: Cell<u64>,
     save_valid: Cell<bool>,
@@ -61,6 +94,9 @@ struct Page {
     filter: adw::ComboRow,
     framerate_limit: adw::EntryRow,
     grab_keyboard: adw::SwitchRow,
+    force_grab_cursor: adw::SwitchRow,
+    hide_cursor_delay: adw::EntryRow,
+    mouse_sensitivity: adw::EntryRow,
     resolved: adw::ActionRow,
     preview: gtk::TextView,
     plan_message: gtk::Label,
@@ -106,6 +142,19 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         .css_classes(["card"])
         .build();
     content.append(&hero_frame);
+
+    let overlay_group = adw::PreferencesGroup::new();
+    let overlay_row = action_row(
+        "Performance overlay",
+        "MangoHUD settings and a live 3D preview",
+    );
+    overlay_row.add_prefix(&gtk::Image::from_icon_name(
+        "utilities-system-monitor-symbolic",
+    ));
+    overlay_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    overlay_row.set_activatable(true);
+    overlay_group.add(&overlay_row);
+    content.append(&overlay_group);
 
     let startup = switch_row(
         "Launch Steam Big Picture at login",
@@ -194,7 +243,7 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         .build();
     let advanced = adw::ExpanderRow::builder().use_markup(false).build();
     advanced.set_title("Advanced Gamescope settings");
-    advanced.set_subtitle("Render resolution, HDR, adaptive sync and input");
+    advanced.set_subtitle("Render resolution, HDR, adaptive sync and frame rates");
     advanced.add_prefix(&gtk::Image::from_icon_name("preferences-system-symbolic"));
     let custom_render = switch_row(
         "Custom render resolution",
@@ -231,6 +280,16 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         "Grab keyboard",
         "Requests Gamescope’s keyboard grab; host Hyprland shortcuts remain active on native Wayland",
     );
+    let force_grab_cursor = switch_row(
+        "Force relative mouse capture",
+        "Off: Gamescope switches capture automatically. On: always relative, even in Steam menus; may make pointing awkward.",
+    );
+    let hide_cursor_delay = entry_row("Hide idle cursor after (milliseconds)");
+    hide_cursor_delay.set_tooltip_text(Some(
+        "1000 ms helps the cursor get out of the way after switching to a controller; 0 hides it immediately when idle",
+    ));
+    let mouse_sensitivity = entry_row("Mouse movement multiplier");
+    mouse_sensitivity.set_tooltip_text(Some("Positive decimal; 1.0 leaves movement unchanged"));
     advanced.add_row(&custom_render);
     advanced.add_row(&render_width);
     advanced.add_row(&render_height);
@@ -239,9 +298,23 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     advanced.add_row(&window_mode);
     advanced.add_row(&filter);
     advanced.add_row(&framerate_limit);
-    advanced.add_row(&grab_keyboard);
     advanced_group.add(&advanced);
     controls.append(&advanced_group);
+    let input_group = adw::PreferencesGroup::new();
+    let input = adw::ExpanderRow::builder().use_markup(false).build();
+    input.set_title("Controller and mouse switching");
+    input.set_subtitle("Automatic capture recommended · keyboard and cursor options");
+    input.add_prefix(&gtk::Image::from_icon_name("input-mouse-symbolic"));
+    input.add_row(&force_grab_cursor);
+    input.add_row(&hide_cursor_delay);
+    input.add_row(&mouse_sensitivity);
+    input.add_row(&grab_keyboard);
+    input.add_row(&action_row(
+        "Host shortcuts stay active",
+        "Gamescope 3.16.25’s native Wayland backend does not inhibit Hyprland shortcuts, even with keyboard grab. Focus and input switching still depend on Steam, the game and upstream Gamescope; these options are mitigations, not a complete fix. Changes apply to the next new session only.",
+    ));
+    input_group.add(&input);
+    controls.append(&input_group);
     content.append(&controls);
 
     let copy = gtk::Button::builder()
@@ -315,6 +388,11 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         dirty: Cell::new(false),
         busy: Cell::new(false),
         refresh_pending: Cell::new(false),
+        detecting: Cell::new(false),
+        polling: RefCell::new(SessionPolling::default()),
+        poll_timer: RefCell::new(None),
+        session: RefCell::new(None),
+        session_error: RefCell::new(None),
         preview_busy: Cell::new(false),
         revision: Cell::new(0),
         save_valid: Cell::new(false),
@@ -353,6 +431,9 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         filter,
         framerate_limit,
         grab_keyboard,
+        force_grab_cursor,
+        hide_cursor_delay,
+        mouse_sensitivity,
         resolved,
         preview,
         plan_message,
@@ -363,11 +444,34 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     root.connect_destroy({
         let owner = RefCell::new(Some(page.clone()));
         move |_| {
+            if let Some(page) = owner.borrow().as_ref() {
+                page.stop_polling();
+            }
             owner.borrow_mut().take();
         }
     });
     page.set_settings(&Settings::default());
     page.connect_controls();
+    overlay_row.connect_activated({
+        let weak = Rc::downgrade(&page);
+        move |_| {
+            let Some(page) = weak.upgrade() else {
+                return;
+            };
+            let Some(ctx) = page.context() else {
+                return;
+            };
+            let dialog = crate::overlay_page::present(&ctx);
+            dialog.connect_closed({
+                let weak = weak.clone();
+                move |_| {
+                    if let Some(page) = weak.upgrade() {
+                        page.request_plan();
+                    }
+                }
+            });
+        }
+    });
     page.refresh.connect_clicked({
         let page = Rc::downgrade(&page);
         move |_| {
@@ -419,6 +523,15 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         move || {
             if let Some(page) = page.upgrade() {
                 page.refresh_detection();
+                page.start_polling();
+            }
+        }
+    });
+    root.connect_unmap({
+        let page = Rc::downgrade(&page);
+        move |_| {
+            if let Some(page) = page.upgrade() {
+                page.stop_polling();
             }
         }
     });
@@ -426,6 +539,117 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
 }
 
 impl Page {
+    fn start_polling(self: &Rc<Self>) {
+        if self.poll_timer.borrow().is_some() {
+            return;
+        }
+        self.polling.borrow_mut().set_mapped(true);
+        self.poll_session();
+        let weak = Rc::downgrade(self);
+        *self.poll_timer.borrow_mut() = Some(glib::timeout_add_seconds_local(2, move || {
+            let Some(page) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            page.poll_session();
+            glib::ControlFlow::Continue
+        }));
+    }
+
+    fn stop_polling(&self) {
+        self.polling.borrow_mut().set_mapped(false);
+        if let Some(timer) = self.poll_timer.borrow_mut().take() {
+            timer.remove();
+        }
+    }
+
+    fn poll_session(self: &Rc<Self>) {
+        if self.detecting.get() {
+            return;
+        }
+        let Some(epoch) = self.polling.borrow_mut().begin() else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let result =
+                rt::blocking(|| engine::session_status().map_err(|error| format!("{error:#}")))
+                    .await;
+            let Some(page) = weak.upgrade() else {
+                return;
+            };
+            let accepted = page.polling.borrow_mut().complete(epoch);
+            if accepted {
+                let update = match result {
+                    Ok(session) => {
+                        let state_changed = page
+                            .session
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|old| old.steam_state() != session.steam_state());
+                        let session_changed = page.session.borrow().as_ref() != Some(&session);
+                        let recovered = page.session_error.borrow_mut().take().is_some();
+                        if session_changed {
+                            if let Some(snapshot) = page.snapshot.borrow_mut().as_mut() {
+                                snapshot.session = session.clone();
+                            }
+                            *page.session.borrow_mut() = Some(session);
+                        }
+                        if state_changed {
+                            page.request_plan();
+                        }
+                        session_changed || recovered
+                    }
+                    Err(error) => {
+                        let changed = page.session_error.borrow().as_ref() != Some(&error);
+                        *page.session_error.borrow_mut() = Some(error);
+                        changed
+                    }
+                };
+                if update {
+                    page.update_session_banner();
+                    page.update_controls();
+                }
+            } else if page.polling.borrow().mapped {
+                page.poll_session();
+            }
+            if !page.busy.get() && page.refresh_pending.get() {
+                page.refresh_detection();
+            }
+        });
+    }
+
+    fn update_session_banner(&self) {
+        if let Some(error) = self.session_error.borrow().as_ref() {
+            self.hero_state.set_label(&format!("Live Steam detection unavailable: {error}\nRetrying while this page is open; no processes were changed."));
+            return;
+        }
+        let session = self.session.borrow();
+        let Some(session) = session.as_ref() else {
+            self.hero_state
+                .set_label("Waiting for Steam session detection…");
+            return;
+        };
+        let status = if session.managed_transition() {
+            "Managed Gamescope is starting or exiting; waiting for associated Steam."
+        } else {
+            match session.steam_state() {
+                SteamState::Stopped => "Steam is stopped. Launch a new Big Picture session.",
+                SteamState::Desktop => {
+                    "Desktop Steam is running. Launch asks before a normal restart."
+                }
+                SteamState::Gamescope => {
+                    "Steam is inside Gamescope. Open it without restarting or applying your draft."
+                }
+            }
+        };
+        self.hero_state.set_label(&format!(
+            "{status}\nSteam PID(s): {} · Gamescope PID(s): {} · Steam host PID(s): {}",
+            pid_list(&session.steam_pids),
+            pid_list(&session.gamescope_pids),
+            pid_list(&session.steam_scopes),
+        ));
+    }
+
     fn context(&self) -> Option<Ctx> {
         Some(Ctx {
             window: self.window.upgrade()?,
@@ -480,6 +704,8 @@ impl Page {
             &self.render_width,
             &self.render_height,
             &self.framerate_limit,
+            &self.hide_cursor_delay,
+            &self.mouse_sensitivity,
         ] {
             let page = Rc::downgrade(self);
             row.connect_changed(move |_| {
@@ -502,7 +728,11 @@ impl Page {
                 }
             });
         }
-        for row in [&self.auto_display, &self.grab_keyboard] {
+        for row in [
+            &self.auto_display,
+            &self.grab_keyboard,
+            &self.force_grab_cursor,
+        ] {
             let page = Rc::downgrade(self);
             row.connect_active_notify(move |_| {
                 if let Some(page) = page.upgrade() {
@@ -569,6 +799,12 @@ impl Page {
         self.framerate_limit
             .set_text(&settings.framerate_limit.to_string());
         self.grab_keyboard.set_active(settings.grab_keyboard);
+        self.force_grab_cursor
+            .set_active(settings.force_grab_cursor);
+        self.hide_cursor_delay
+            .set_text(&settings.hide_cursor_delay.to_string());
+        self.mouse_sensitivity
+            .set_text(&settings.mouse_sensitivity.to_string());
         self.syncing.set(false);
         self.update_controls();
     }
@@ -660,6 +896,16 @@ impl Page {
             },
             framerate_limit: integer(&self.framerate_limit, "Frame-rate limit")?,
             grab_keyboard: self.grab_keyboard.is_active(),
+            force_grab_cursor: self.force_grab_cursor.is_active(),
+            hide_cursor_delay: integer(&self.hide_cursor_delay, "Cursor hide delay")?,
+            mouse_sensitivity: self
+                .mouse_sensitivity
+                .text()
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| {
+                    "Mouse sensitivity must be a positive decimal (for example 1.0).".to_owned()
+                })?,
         })
     }
 
@@ -691,17 +937,25 @@ impl Page {
             .set_sensitive(!self.busy.get() && self.save_valid.get());
         self.copy.set_sensitive(!self.command.borrow().is_empty());
         let existing = self
-            .snapshot
+            .session
             .borrow()
             .as_ref()
-            .is_some_and(|s| s.steam_state == SteamState::Gamescope);
+            .is_some_and(|s| s.steam_state() == SteamState::Gamescope);
         self.launch.set_label(if existing {
             "Open existing session"
         } else {
             "Launch Big Picture"
         });
-        self.launch
-            .set_sensitive(!self.busy.get() && (existing || self.plan.borrow().is_some()));
+        let managed_transition = self
+            .session
+            .borrow()
+            .as_ref()
+            .is_some_and(SessionStatus::managed_transition);
+        self.launch.set_sensitive(
+            !self.busy.get()
+                && self.session_error.borrow().is_none()
+                && (existing || (!managed_transition && self.plan.borrow().is_some())),
+        );
         self.spinner
             .set_visible(self.busy.get() || self.preview_busy.get());
         self.saved_state.set_label(if !self.ready.get() {
@@ -748,13 +1002,12 @@ impl Page {
     }
 
     fn update_display(&self) {
+        self.update_session_banner();
         let snapshot = self.snapshot.borrow();
         let Some(snapshot) = snapshot.as_ref() else {
             self.display.set_title("Display detection unavailable");
             self.display
                 .set_subtitle("Refresh detection to read the current Hyprland outputs.");
-            self.hero_state
-                .set_label("Detection has not completed successfully.");
             return;
         };
         let selected = self.selected_output();
@@ -789,31 +1042,16 @@ impl Page {
                 .set_title(selected.as_deref().unwrap_or("No focused display"));
             self.display.set_subtitle("This output is unavailable. Choose a connected display or refresh detection; saved choices have not been reset.");
         }
-        let missing = match (snapshot.gamescope_available, snapshot.steam_available) {
-            (false, false) => "Gamescope and Steam are missing from PATH.",
-            (false, true) => "Gamescope is missing from PATH.",
-            (true, false) => "Steam is missing from PATH.",
-            (true, true) => "Gamescope and Steam detected.",
-        };
-        let state = match snapshot.steam_state {
-            SteamState::Stopped => "Steam is stopped; ready to plan a new session.",
-            SteamState::Desktop => {
-                "Desktop Steam is running. Launch asks before a normal restart; games and downloads may close."
-            }
-            SteamState::Gamescope => {
-                "Steam is already inside Gamescope. Open it without restarting or changing these settings."
-            }
-        };
-        self.hero_state.set_label(&format!("{missing}\n{state}"));
     }
 
     fn refresh_detection(self: &Rc<Self>) {
-        if self.busy.get() {
+        if self.busy.get() || self.polling.borrow().in_flight {
             self.refresh_pending.set(true);
             return;
         }
         self.busy.set(true);
         self.refresh_pending.set(false);
+        self.detecting.set(true);
         let load_config = !self.ready.get();
         self.update_controls();
         let weak = Rc::downgrade(self);
@@ -846,6 +1084,8 @@ impl Page {
             let selected = page.selected_output();
             match snapshot {
                 Ok(snapshot) => {
+                    *page.session.borrow_mut() = Some(snapshot.session.clone());
+                    *page.session_error.borrow_mut() = None;
                     *page.snapshot.borrow_mut() = Some(snapshot);
                     *page.detection_error.borrow_mut() = None;
                 }
@@ -871,6 +1111,7 @@ impl Page {
                 }
             }
             page.busy.set(false);
+            page.detecting.set(false);
             page.update_status();
             page.update_display();
             page.request_plan();
@@ -929,11 +1170,12 @@ impl Page {
                     false
                 };
                 (
-                    plan.map(|plan| {
-                        let command = plan.command_line();
-                        (plan, command)
-                    })
-                    .map_err(|error| format!("{error:#}")),
+                    plan.and_then(Plan::with_overlay)
+                        .map(|plan| {
+                            let command = plan.command_line();
+                            (plan, command)
+                        })
+                        .map_err(|error| format!("{error:#}")),
                     save_valid,
                 )
             })
@@ -1030,9 +1272,9 @@ impl Page {
         if self.busy.get() {
             return;
         }
-        let state = match self.snapshot.borrow().as_ref() {
-            Some(snapshot) => snapshot.steam_state.clone(),
-            None => return,
+        let state = match self.session.borrow().as_ref() {
+            Some(session) if self.session_error.borrow().is_none() => session.steam_state(),
+            _ => return,
         };
         let settings = match self.read_settings() {
             Ok(settings) => settings,
@@ -1084,7 +1326,14 @@ impl Page {
                 false,
             );
             drop(page);
-            let result = rt::blocking(move || engine::launch(&settings, restart_steam)).await;
+            let result = rt::blocking(move || {
+                if state == SteamState::Gamescope {
+                    engine::open_existing()
+                } else {
+                    engine::launch(&settings, restart_steam)
+                }
+            })
+            .await;
             let Some(page) = weak.upgrade() else {
                 return;
             };
@@ -1212,5 +1461,47 @@ fn physical_size(monitor: &Monitor) -> (i64, i64) {
         (monitor.height, monitor.width)
     } else {
         (monitor.width, monitor.height)
+    }
+}
+
+fn pid_list(pids: &[u32]) -> String {
+    if pids.is_empty() {
+        "none".into()
+    } else {
+        pids.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionPolling;
+
+    #[test]
+    fn hidden_pages_never_begin_polls_and_slow_polls_do_not_overlap() {
+        let mut polling = SessionPolling::default();
+        assert!(polling.begin().is_none());
+        polling.set_mapped(true);
+        let epoch = polling.begin().unwrap();
+        assert!(polling.begin().is_none());
+        assert!(polling.complete(epoch));
+        assert!(polling.begin().is_some());
+    }
+
+    #[test]
+    fn hiding_discards_observations_even_after_a_quick_remap() {
+        let mut polling = SessionPolling::default();
+        polling.set_mapped(true);
+        let old_epoch = polling.begin().unwrap();
+        polling.set_mapped(false);
+        polling.set_mapped(true);
+        assert!(polling.begin().is_none());
+        assert!(!polling.complete(old_epoch));
+        let fresh_epoch = polling.begin().unwrap();
+        polling.set_mapped(false);
+        assert!(!polling.complete(fresh_epoch));
+        assert!(polling.begin().is_none());
     }
 }

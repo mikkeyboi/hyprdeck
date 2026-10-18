@@ -45,6 +45,9 @@ pub struct Settings {
     pub filter: Filter,
     pub framerate_limit: u32,
     pub grab_keyboard: bool,
+    pub force_grab_cursor: bool,
+    pub hide_cursor_delay: u32,
+    pub mouse_sensitivity: f64,
 }
 
 impl Default for Settings {
@@ -63,6 +66,9 @@ impl Default for Settings {
             filter: Filter::Linear,
             framerate_limit: 0,
             grab_keyboard: false,
+            force_grab_cursor: false,
+            hide_cursor_delay: 1000,
+            mouse_sensitivity: 1.0,
         }
     }
 }
@@ -74,5 +80,24 @@ impl Settings {
 
     pub fn save(&self) -> Result<()> {
         store::save("gamescope", self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn older_profiles_keep_automatic_mouse_capture_and_switching_defaults() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "grab_keyboard": true,
+            "framerate_limit": 60
+        }))
+        .unwrap();
+        assert!(settings.grab_keyboard);
+        assert_eq!(settings.framerate_limit, 60);
+        assert!(!settings.force_grab_cursor);
+        assert_eq!(settings.hide_cursor_delay, 1000);
+        assert_eq!(settings.mouse_sensitivity, 1.0);
     }
 }
