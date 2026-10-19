@@ -3,6 +3,7 @@ use crate::{
     proton::{self, InstalledTool, Provider, Release, Target, TargetKind},
     proton_repair, recovery,
     steam::{self, Game},
+    steam_assign,
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -49,9 +50,13 @@ impl CustomTarget {
         }
     }
 }
+struct ToolEntry {
+    tool: InstalledTool,
+    capabilities: proton::Capabilities,
+}
 struct Inventory {
     targets: Vec<Target>,
-    tools: Vec<InstalledTool>,
+    tools: Vec<ToolEntry>,
     steam: steam::Inventory,
     warnings: Vec<String>,
 }
@@ -77,7 +82,19 @@ fn inventory() -> anyhow::Result<Inventory> {
     let mut warnings = Vec::new();
     for target in &targets {
         match proton::installed(target) {
-            Ok(installed) => tools.extend(installed),
+            Ok(installed) => {
+                for tool in installed {
+                    let capabilities =
+                        proton::capabilities(target, &tool).unwrap_or_else(|error| {
+                            proton::Capabilities {
+                                editable: false,
+                                removable: false,
+                                reason: format!("{error:#}"),
+                            }
+                        });
+                    tools.push(ToolEntry { tool, capabilities });
+                }
+            }
             Err(e) => warnings.push(format!("{}: {e:#}", target.name)),
         }
     }
@@ -116,6 +133,7 @@ struct Page {
     syncing: Cell<bool>,
     revision: Cell<u64>,
     cancel_flag: RefCell<Option<Arc<AtomicBool>>>,
+    notice: RefCell<Option<String>>,
 }
 
 pub fn build(ctx: &Ctx) -> gtk::Widget {
@@ -171,6 +189,8 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         .child(&releases)
         .build();
     let details = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    details.set_margin_start(16);
+    details.set_margin_end(8);
     let release_title = gtk::Label::builder()
         .label("Select a release")
         .wrap(true)
@@ -299,6 +319,7 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         syncing: Cell::new(false),
         revision: Cell::new(0),
         cancel_flag: RefCell::new(None),
+        notice: RefCell::new(None),
     });
     root.connect_destroy({
         let owner = RefCell::new(Some(page.clone()));
@@ -366,7 +387,9 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     page.releases.connect_row_selected({
         let weak = Rc::downgrade(&page);
         move |_, _| {
-            if let Some(page) = weak.upgrade() {
+            if let Some(page) = weak.upgrade()
+                && !page.syncing.get()
+            {
                 page.show_release();
             }
         }
@@ -439,9 +462,16 @@ impl Page {
     }
     fn clear_releases(&self) {
         self.revision.set(self.revision.get().wrapping_add(1));
+        let syncing = self.syncing.replace(true);
+        self.releases.unselect_all();
         self.release_data.borrow_mut().clear();
         self.repair.set_active(false);
-        ui::clear(&self.releases);
+        // ListBox owns a selection model: unparenting its children bypasses
+        // that model and leaves stale row/selection state when providers change.
+        while let Some(row) = self.releases.row_at_index(0) {
+            self.releases.remove(&row);
+        }
+        self.syncing.set(syncing);
         self.show_release();
     }
     fn reload(self: &Rc<Self>) {
@@ -468,7 +498,7 @@ impl Page {
                             .unwrap_or(0);
                         let message = if data.warnings.is_empty() {
                             format!(
-                                "{} launcher targets · {} custom runners · {} Steam-managed tools · {} installed Steam apps. No game settings are changed by this view.",
+                                "{} launcher targets · {} custom runners · {} Steam-managed tools · {} installed Steam apps. Changes require an explicit preview and approval.",
                                 data.targets.len(),
                                 data.tools.len(),
                                 data.steam.steam_tools.len(),
@@ -482,7 +512,11 @@ impl Page {
                         page.target.set_model(Some(&model));
                         page.target.set_selected(index as u32);
                         page.syncing.set(false);
-                        page.status.set_label(&message);
+                        if let Some(notice) = page.notice.borrow_mut().take() {
+                            page.status.set_label(&format!("{notice}\n{message}"));
+                        } else {
+                            page.status.set_label(&message);
+                        }
                         page.render_inventory();
                     }
                     Err(e) => page
@@ -528,6 +562,7 @@ impl Page {
                 }
                 match result {
                     Ok(releases) => {
+                        let syncing = page.syncing.replace(true);
                         for release in &releases {
                             let row = adw::ActionRow::builder().use_markup(false).build();
                             row.set_title(&release.version);
@@ -544,6 +579,7 @@ impl Page {
                         }
                         let count = releases.len();
                         *page.release_data.borrow_mut() = releases;
+                        page.syncing.set(syncing);
                         page.status.set_label(&format!("{count} upstream releases. Read notes and availability before installing; upstream tools execute as your user when selected by a launcher."));
                         if let Some(row) = page.releases.row_at_index(0) {
                             page.releases.select_row(Some(&row));
@@ -737,9 +773,15 @@ impl Page {
             self.installed.append(&label("No supported launcher detected. Add an installation target above; its path is the tool directory, not the game prefix."));
             return;
         };
-        let group=adw::PreferencesGroup::builder().title("Installed compatibility tools").description("Associations below are saved Steam configuration, not proof that Steam's automatic recommendation will select a tool. Unassigned games remain automatic/unknown. No mappings are edited.").build();
+        let group=adw::PreferencesGroup::builder().title("Installed compatibility tools").description("Manage standalone tool display names and game assignments. Steam-managed packages are changed through Steam. Saved defaults and automatic selections do not prove which tool Steam will run.").build();
         let mut count = 0;
-        for tool in data.tools.iter().filter(|t| t.target_id == target.id) {
+        for entry in data
+            .tools
+            .iter()
+            .filter(|entry| entry.tool.target_id == target.id)
+        {
+            let tool = &entry.tool;
+            let capabilities = &entry.capabilities;
             let associated: Vec<_> = data
                 .steam
                 .games
@@ -786,6 +828,37 @@ impl Page {
             });
             open.set_valign(gtk::Align::Center);
             row.add_suffix(&open);
+            if target.kind == TargetKind::Steam {
+                let games = gtk::Button::with_label("Manage games…");
+                games.set_valign(gtk::Align::Center);
+                row.add_suffix(&games);
+                games.connect_clicked({
+                    let weak = Rc::downgrade(self);
+                    let target = target.clone();
+                    let id = tool.name.clone();
+                    let name = tool.display_name.clone();
+                    move |_| {
+                        if let Some(page) = weak.upgrade() {
+                            page.tool_assignments(target.clone(), id.clone(), name.clone());
+                        }
+                    }
+                });
+            }
+            let edit = gtk::Button::with_label("Edit name…");
+            edit.set_valign(gtk::Align::Center);
+            edit.set_sensitive(capabilities.editable);
+            edit.set_tooltip_text(Some(&capabilities.reason));
+            row.add_suffix(&edit);
+            edit.connect_clicked({
+                let weak = Rc::downgrade(self);
+                let target = target.clone();
+                let tool = tool.clone();
+                move |_| {
+                    if let Some(page) = weak.upgrade() {
+                        page.rename_tool(target.clone(), tool.clone());
+                    }
+                }
+            });
             for game in &associated {
                 row.add_row(&game_link(game));
             }
@@ -807,28 +880,23 @@ impl Page {
                     }
                 });
             }
-            if tool.managed {
-                let remove = gtk::Button::with_label("Remove…");
-                let referenced = data.steam.mappings.iter().any(|mapping| {
-                    same_root(&mapping.steam_root, &target)
-                        && mapping.tool.as_deref() == Some(&tool.name)
-                });
-                remove.set_sensitive(
-                    !referenced && associated.is_empty() && data.warnings.is_empty(),
-                );
-                remove.set_tooltip_text(Some("Only unreferenced Hyprdeck-managed installs can be removed. Saved game/default mappings block removal. Close Steam and Wine first."));
-                remove.set_valign(gtk::Align::Center);
-                row.add_suffix(&remove);
-                remove.connect_clicked({
-                    let weak = Rc::downgrade(self);
-                    let target = target.clone();
-                    let tool = tool.clone();
-                    move |_| {
-                        if let Some(page) = weak.upgrade() {
-                            page.remove_tool(target.clone(), tool.clone());
-                        }
+            let remove = gtk::Button::with_label("Remove…");
+            remove.set_sensitive(capabilities.removable && data.warnings.is_empty());
+            remove.set_tooltip_text(Some(&capabilities.reason));
+            remove.set_valign(gtk::Align::Center);
+            row.add_suffix(&remove);
+            remove.connect_clicked({
+                let weak = Rc::downgrade(self);
+                let target = target.clone();
+                let tool = tool.clone();
+                move |_| {
+                    if let Some(page) = weak.upgrade() {
+                        page.remove_tool(target.clone(), tool.clone());
                     }
-                });
+                }
+            });
+            if !capabilities.editable || !capabilities.removable {
+                row.add_row(&action_row("Management limits", &capabilities.reason));
             }
             group.add(&row);
         }
@@ -873,6 +941,34 @@ impl Page {
                 for game in associated {
                     row.add_row(&game_link(game));
                 }
+                let assign = gtk::Button::with_label("Manage games…");
+                assign.set_valign(gtk::Align::Center);
+                assign.set_sensitive(!tool.internal_name.is_empty());
+                row.add_suffix(&assign);
+                assign.connect_clicked({
+                    let weak = Rc::downgrade(self);
+                    let target = target.clone();
+                    let id = tool.internal_name.clone();
+                    let name = tool.name.clone();
+                    move |_| {
+                        if let Some(page) = weak.upgrade() {
+                            page.tool_assignments(target.clone(), id.clone(), name.clone());
+                        }
+                    }
+                });
+                let uninstall = gtk::Button::with_label("Uninstall in Steam…");
+                uninstall.set_valign(gtk::Align::Center);
+                row.add_suffix(&uninstall);
+                uninstall.connect_clicked({
+                    let weak = Rc::downgrade(self);
+                    let target = target.clone();
+                    let app = tool.app_id;
+                    move |_| {
+                        if let Some(page) = weak.upgrade() {
+                            page.uninstall_steam_tool(target.clone(), app);
+                        }
+                    }
+                });
                 group.add(&row);
             }
         }
@@ -931,6 +1027,19 @@ impl Page {
                     }
                 }
             });
+            let assignment = gtk::Button::with_label("Compatibility…");
+            assignment.set_valign(gtk::Align::Center);
+            row.add_suffix(&assignment);
+            assignment.connect_clicked({
+                let weak = Rc::downgrade(self);
+                let target = target.clone();
+                let game = game.clone();
+                move |_| {
+                    if let Some(page) = weak.upgrade() {
+                        page.game_assignment(target.clone(), game.clone());
+                    }
+                }
+            });
             game_group.add(&row);
         }
         if game_count == 0 {
@@ -961,6 +1070,405 @@ impl Page {
             self.games.append(&mappings);
         }
     }
+    fn tool_choices(&self, target: &Target) -> Vec<(String, String)> {
+        let inventory = self.inventory.borrow();
+        let Some(data) = inventory.as_ref() else {
+            return Vec::new();
+        };
+        let mut tools = std::collections::BTreeMap::<
+            String,
+            (String, std::collections::BTreeSet<PathBuf>),
+        >::new();
+        for entry in data
+            .tools
+            .iter()
+            .filter(|entry| entry.tool.target_id == target.id)
+        {
+            let tool = &entry.tool;
+            let choice = tools
+                .entry(tool.name.clone())
+                .or_insert_with(|| (tool.display_name.clone(), Default::default()));
+            choice.1.insert(tool.path.clone());
+        }
+        for tool in
+            data.steam.steam_tools.iter().filter(|tool| {
+                same_root(&tool.steam_root, target) && !tool.internal_name.is_empty()
+            })
+        {
+            let choice = tools
+                .entry(tool.internal_name.clone())
+                .or_insert_with(|| (tool.name.clone(), Default::default()));
+            choice.1.insert(tool.path.clone());
+        }
+        tools
+            .into_iter()
+            .filter(|(_, (_, paths))| paths.len() == 1)
+            .map(|(id, (name, _))| (id, name))
+            .collect()
+    }
+
+    fn game_assignment(self: &Rc<Self>, target: Target, game: Game) {
+        if self.busy.get() {
+            return;
+        }
+        let choices = self.tool_choices(&target);
+        let mut names = vec!["Automatic / configured default (remove override)".to_owned()];
+        names.extend(choices.iter().map(|(id, name)| format!("{name} · {id}")));
+        let dialog = adw::AlertDialog::new(
+            Some("Game compatibility tool"),
+            Some(&format!(
+                "{} · {}\n\nThis applies to the selected Steam installation and harmonizes existing local-user overrides. Steam and Wine must be fully stopped before saving. Prefixes, saves and launch options are not edited.",
+                game.name, game.app_id
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("save", "Preview changes…")]);
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+        let row = adw::ComboRow::builder()
+            .title("Compatibility tool")
+            .model(&gtk::StringList::new(
+                &names.iter().map(String::as_str).collect::<Vec<_>>(),
+            ))
+            .build();
+        row.set_selected(
+            game.tool
+                .as_ref()
+                .and_then(|id| choices.iter().position(|(candidate, _)| candidate == id))
+                .map_or(0, |index| index as u32 + 1),
+        );
+        let group = adw::PreferencesGroup::new();
+        group.add(&row);
+        dialog.set_extra_child(Some(&group));
+        glib::spawn_future_local({
+            let weak = Rc::downgrade(self);
+            async move {
+                let Some(page) = weak.upgrade() else {
+                    return;
+                };
+                if dialog.choose_future(Some(&page.ctx.window)).await != "save" {
+                    return;
+                }
+                let tool = if row.selected() == 0 {
+                    None
+                } else {
+                    choices
+                        .get(row.selected() as usize - 1)
+                        .map(|(id, _)| id.clone())
+                };
+                page.preview_assignments(
+                    target,
+                    vec![steam_assign::Change {
+                        app_id: game.app_id,
+                        tool,
+                    }],
+                    None,
+                );
+            }
+        });
+    }
+
+    fn tool_assignments(self: &Rc<Self>, target: Target, tool_id: String, tool_name: String) {
+        if self.busy.get() {
+            return;
+        }
+        let inventory = self.inventory.borrow();
+        let Some(data) = inventory.as_ref() else {
+            return;
+        };
+        let dialog = adw::Dialog::builder()
+            .title("Manage tool game assignments")
+            .content_width(760)
+            .content_height(700)
+            .build();
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&adw::HeaderBar::new());
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        body.set_margin_top(12);
+        body.set_margin_bottom(12);
+        body.set_margin_start(12);
+        body.set_margin_end(12);
+        let introduction = label(&format!(
+            "{tool_name} · {tool_id}\nSelect games, then assign this tool or remove their explicit overrides. Unassigning returns selected games to Steam's automatic/configured default, regardless of their current tool. Steam/Wine must be stopped to commit; prefixes and saves are never edited."
+        ));
+        introduction.set_selectable(false);
+        body.append(&introduction);
+        let search = gtk::SearchEntry::builder()
+            .placeholder_text("Find games to assign or unassign…")
+            .build();
+        body.append(&search);
+        let (scroll, content) = ui::page_scaffold();
+        scroll.set_vexpand(true);
+        body.append(&scroll);
+        let group = adw::PreferencesGroup::new();
+        content.append(&group);
+        let mut selections: Vec<(u32, bool, gtk::CheckButton)> = Vec::new();
+        let mut filtered = Vec::new();
+        let games: Vec<_> = data
+            .steam
+            .games
+            .iter()
+            .filter(|game| same_steam_target(game, &target))
+            .collect();
+        for game in &games {
+            let row = action_row(
+                &game.name,
+                &format!(
+                    "{} · {} · {}",
+                    game.app_id,
+                    game.tool
+                        .as_deref()
+                        .unwrap_or("Automatic / default / unknown"),
+                    game.assignment
+                ),
+            );
+            let selected = gtk::CheckButton::new();
+            selected.set_valign(gtk::Align::Center);
+            row.add_prefix(&selected);
+            row.set_activatable_widget(Some(&selected));
+            group.add(&row);
+            selections.push((game.app_id, true, selected));
+            filtered.push((format!("{} {}", game.name, game.app_id).to_lowercase(), row));
+        }
+        let stale: std::collections::BTreeSet<_> = data
+            .steam
+            .mappings
+            .iter()
+            .filter(|mapping| {
+                same_root(&mapping.steam_root, &target)
+                    && mapping.app_id != 0
+                    && mapping.tool.as_deref() == Some(tool_id.as_str())
+                    && !games.iter().any(|game| game.app_id == mapping.app_id)
+            })
+            .map(|mapping| mapping.app_id)
+            .collect();
+        for app in stale {
+            let row = action_row(
+                &format!("Uninstalled Steam app {app}"),
+                "Saved reference to this tool · unassignment only",
+            );
+            let selected = gtk::CheckButton::new();
+            selected.set_valign(gtk::Align::Center);
+            row.add_prefix(&selected);
+            row.set_activatable_widget(Some(&selected));
+            group.add(&row);
+            selections.push((app, false, selected));
+            filtered.push((app.to_string(), row));
+        }
+        if selections.is_empty() {
+            group.add(&action_row(
+                "No installed games or saved references",
+                "Steam library manifests are required before a tool can be assigned.",
+            ));
+        }
+        drop(inventory);
+        search.connect_search_changed(move |search| {
+            let query = search.text().to_lowercase();
+            for (keywords, row) in &filtered {
+                row.set_visible(keywords.contains(&query));
+            }
+        });
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let assign = gtk::Button::with_label("Assign selected…");
+        assign.add_css_class("suggested-action");
+        let unassign = gtk::Button::with_label("Unassign selected…");
+        buttons.append(&assign);
+        buttons.append(&unassign);
+        body.append(&buttons);
+        let selections = Rc::new(selections);
+        for (button, assign) in [(&assign, true), (&unassign, false)] {
+            button.connect_clicked({ let weak=Rc::downgrade(self); let target=target.clone(); let id=tool_id.clone(); let selections=selections.clone(); let dialog=dialog.downgrade(); move |_| {
+                let Some(page)=weak.upgrade() else{return;};
+                let selected:Vec<_>=selections.iter().filter(|(_,_,selected)|selected.is_active()).collect();
+                if selected.is_empty(){page.ctx.toast("Select at least one game.");return;}
+                if assign && selected.iter().any(|(_,installed,_)|!installed){page.ctx.toast("Uninstalled game references can only be unassigned; deselect them to assign this tool.");return;}
+                let changes=selected.iter().map(|(app,_,_)|steam_assign::Change{app_id:*app,tool:assign.then(||id.clone())}).collect();
+                page.preview_assignments(target.clone(),changes,Some(dialog.clone()));
+            }});
+        }
+        toolbar.set_content(Some(&body));
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&self.ctx.window));
+    }
+
+    fn preview_assignments(
+        self: &Rc<Self>,
+        target: Target,
+        changes: Vec<steam_assign::Change>,
+        dialog: Option<glib::WeakRef<adw::Dialog>>,
+    ) {
+        if self.busy.get() {
+            return;
+        }
+        self.set_busy(true);
+        self.status
+            .set_label("Preparing an exact compatibility-assignment preview…");
+        glib::spawn_future_local({
+            let weak = Rc::downgrade(self);
+            async move {
+                let result = rt::blocking(move || steam_assign::plan(&target, &changes)).await;
+                let Some(page) = weak.upgrade() else {
+                    return;
+                };
+                page.set_busy(false);
+                let plan = match result {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        page.status
+                            .set_label(&format!("Could not prepare assignment changes: {error:#}"));
+                        return;
+                    }
+                };
+                if plan.files.is_empty() {
+                    page.ctx
+                        .toast("Selected assignments already match. Nothing was changed.");
+                    return;
+                }
+                let changes = {
+                    let names = page.inventory.borrow();
+                    plan.changes
+                        .iter()
+                        .map(|change| {
+                            let name = names
+                                .as_ref()
+                                .and_then(|inventory| {
+                                    inventory.steam.games.iter().find(|game| {
+                                        game.app_id == change.app_id
+                                            && game.steam_root == plan.steam_root
+                                    })
+                                })
+                                .map_or("Uninstalled Steam app", |game| game.name.as_str());
+                            format!(
+                                "{name} ({}) → {}",
+                                change.app_id,
+                                change
+                                    .tool
+                                    .as_deref()
+                                    .unwrap_or("automatic/configured default")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let files = plan
+                    .files
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let body = format!(
+                    "Steam installation: {}\n\n{changes}\n\nConfiguration files:\n{files}\n\nThis updates the installation-wide mapping and existing local-user overrides for these games. Complete originals are backed up. Steam and Wine must be fully stopped; concurrent changes are refused. Prefixes, saves, launch options and the global default are not edited.",
+                    plan.steam_root.display()
+                );
+                if !page
+                    .ctx
+                    .confirm(
+                        "Apply game compatibility assignments?",
+                        &body,
+                        "Apply assignments",
+                        false,
+                    )
+                    .await
+                    || page.busy.get()
+                {
+                    return;
+                }
+                page.set_busy(true);
+                let result = rt::blocking(move || steam_assign::apply(&plan)).await;
+                page.set_busy(false);
+                match result {
+                    Ok(outcome) => {
+                        let backups = outcome
+                            .backups
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        *page.notice.borrow_mut() = Some(format!(
+                            "Updated {} game assignment(s). Original config backups:\n{backups}",
+                            outcome.changed_games
+                        ));
+                        page.ctx.toast(format!(
+                            "Updated {} game assignment(s); originals backed up.",
+                            outcome.changed_games
+                        ));
+                        if let Some(dialog) = dialog.and_then(|dialog| dialog.upgrade()) {
+                            dialog.close();
+                        }
+                        page.reload();
+                    }
+                    Err(error) => page
+                        .status
+                        .set_label(&format!("Assignments did not complete: {error:#}")),
+                }
+            }
+        });
+    }
+
+    fn rename_tool(self: &Rc<Self>, target: Target, tool: InstalledTool) {
+        if self.busy.get() {
+            return;
+        }
+        let dialog = adw::AlertDialog::new(
+            Some("Edit compatibility tool display name"),
+            Some(
+                "Only the display name changes. The internal tool ID, installation path, version, parser state and game assignments stay unchanged. Steam/the launcher and Wine must be stopped. The original manifest is backed up.",
+            ),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("save", "Save display name")]);
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+        let group = adw::PreferencesGroup::new();
+        let name = adw::EntryRow::builder()
+            .title("Display name")
+            .text(&tool.display_name)
+            .build();
+        group.add(&name);
+        dialog.set_extra_child(Some(&group));
+        glib::spawn_future_local({
+            let weak = Rc::downgrade(self);
+            async move {
+                let Some(page) = weak.upgrade() else {
+                    return;
+                };
+                if dialog.choose_future(Some(&page.ctx.window)).await != "save" || page.busy.get() {
+                    return;
+                }
+                let name = name.text().to_string();
+                page.set_busy(true);
+                let result = rt::blocking(move || proton::rename(&target, &tool, &name)).await;
+                page.set_busy(false);
+                match result {
+                    Ok(tool) => {
+                        *page.notice.borrow_mut() = Some(format!(
+                            "Display name updated to {}. Internal ID and assignments unchanged; original manifest preserved.",
+                            tool.display_name
+                        ));
+                        page.reload();
+                    }
+                    Err(error) => page
+                        .status
+                        .set_label(&format!("Could not edit tool: {error:#}")),
+                }
+            }
+        });
+    }
+
+    fn uninstall_steam_tool(self: &Rc<Self>, target: Target, app: u32) {
+        glib::spawn_future_local({
+            let weak = Rc::downgrade(self);
+            async move {
+                let Some(page) = weak.upgrade() else {
+                    return;
+                };
+                if !page.ctx.confirm("Open Steam's tool uninstall confirmation?","This tool is managed by Steam. Hyprdeck will not delete its package files. Steam handles the uninstall and any runtime dependencies. Unassign games first if you no longer want them to select this tool.","Open Steam",true).await{return;}
+                let result = rt::blocking(move || proton::steam_uninstall(&target, app)).await;
+                if let Err(error) = result {
+                    page.ctx.error("Could not open Steam uninstall", &error);
+                }
+            }
+        });
+    }
+
     fn parser_dialog(self: &Rc<Self>, target: Target, tool: InstalledTool) {
         let dialog = adw::Dialog::builder()
             .title("Managed runner prefix parser")
@@ -1101,10 +1609,38 @@ impl Page {
         if self.busy.get() {
             return;
         }
+        let references: std::collections::BTreeSet<_> = self
+            .inventory
+            .borrow()
+            .as_ref()
+            .map(|inventory| {
+                inventory
+                    .steam
+                    .mappings
+                    .iter()
+                    .filter(|mapping| {
+                        same_root(&mapping.steam_root, &target)
+                            && mapping.tool.as_deref() == Some(tool.name.as_str())
+                    })
+                    .map(|mapping| mapping.app_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let warning = if references.is_empty() {
+            "No saved references were found. Automatic selections and other launchers cannot be guaranteed.".to_owned()
+        } else if references.contains(&0) {
+            "This tool is the configured Steam default. Choose another default in Steam before removing it. Per-game references can be cleared through Manage games.".to_owned()
+        } else {
+            format!(
+                "{} saved game reference(s) must be unassigned first. Choose Manage games, clear those overrides, then return to remove the tool.",
+                references.len()
+            )
+        };
         let body = format!(
-            "Remove {} at {}?\n\nNo saved Steam association was found. Unknown automatic selections and other launchers cannot be guaranteed. This removes executable tool files only, not game prefixes. Close Steam, Wine and games before continuing.",
+            "Remove {} at {}?\n\n{}\n\nThis permanently removes the user-owned standalone runner directory, including any saved parser/manifest backups inside it, but never game prefixes or saves. Close Steam/the launcher and Wine first.",
             tool.display_name,
-            tool.path.display()
+            tool.path.display(),
+            warning
         );
         glib::spawn_future_local({
             let weak = Rc::downgrade(self);
@@ -1112,12 +1648,22 @@ impl Page {
                 let Some(page) = weak.upgrade() else {
                     return;
                 };
-                if !page
-                    .ctx
-                    .confirm("Remove compatibility tool?", &body, "Remove", true)
-                    .await
-                {
-                    return;
+                let dialog = adw::AlertDialog::new(Some("Remove compatibility tool?"), Some(&body));
+                dialog.add_responses(&[("cancel", "Cancel"), ("remove", "Remove")]);
+                dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+                dialog.set_response_enabled("remove", references.is_empty());
+                if target.kind == TargetKind::Steam && references.iter().any(|id| *id != 0) {
+                    dialog.add_response("manage", "Manage games…");
+                }
+                dialog.set_default_response(Some("cancel"));
+                dialog.set_close_response("cancel");
+                match dialog.choose_future(Some(&page.ctx.window)).await.as_str() {
+                    "manage" => {
+                        page.tool_assignments(target, tool.name, tool.display_name);
+                        return;
+                    }
+                    "remove" => {}
+                    _ => return,
                 }
                 if page.busy.get() {
                     return;
@@ -1126,7 +1672,10 @@ impl Page {
                 let result = rt::blocking(move || proton::remove(&target, &tool)).await;
                 page.set_busy(false);
                 match result {
-                    Ok(()) => page.reload(),
+                    Ok(()) => {
+                        *page.notice.borrow_mut()=Some("Standalone compatibility tool removed. Game prefixes and saves were not touched.".into());
+                        page.reload();
+                    }
                     Err(e) => page
                         .status
                         .set_label(&format!("Could not remove tool: {e:#}")),

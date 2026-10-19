@@ -247,10 +247,12 @@ adds a user-selected tool directory and launcher format; those choices live in
 **Download tools** lists upstream releases with readable notes, publication dates, prerelease status
 and the upstream release link. Providers include GE-Proton, Valve Proton, Proton-TKG (including
 available upstream CI artifacts), Proton-CachyOS, Proton-Wineland and SteamTinkerLaunch.
-Wineland currently uses its renamed `nanomatters/proton-salkim` repository. CPU-specific native
-packages and source archives are not substituted for portable Proton binaries. Equivalent compression
-formats are handled without confusing them with different builds. Unsupported launcher/architecture
-pairs and unavailable artifacts explain why installation is not offered.
+Wineland currently uses its renamed `nanomatters/proton-salkim` repository. Downloads select the
+highest advertised CPU-compatible tier: for x86-64, v2/v3/v4 require the complete instruction set and
+OS-enabled register state; baseline remains the fallback. The chosen asset and detected capability
+are shown before installation. Native distribution packages, source-only archives and alternate ABIs
+are not substituted. Equivalent compression formats are not confused with different builds.
+Unsupported launcher/architecture pairs and unavailable assets explain why installation is not offered.
 
 Valve Proton is installed/updated by the selected Steam packaging, not from GitHub's source archives.
 Series, Experimental and install app IDs come from that client's current `appcache/appinfo.vdf`,
@@ -262,14 +264,18 @@ Steam's current build for that series. SteamTinkerLaunch is an
 interpreted wrapper: its release script/data are laid out without executing a downloaded installer,
 and its runtime dependencies must already be installed. Flatpak Steam uses the upstream STL extension
 instructions instead of a host-script installation. Lutris/other non-Steam Proton use requires the
-launcher's UMU/Proton support; Hyprdeck does not change individual game runner settings.
+launcher's UMU/Proton support. Non-Steam per-game runner settings remain in those launchers.
 
 Downloads expose progress/cancellation. Archives are validated for traversal, escaping links,
 duplicates and special files; installation stages on the destination filesystem and atomically
 commits without overwriting another version. No downloaded executable runs during installation.
-Restart the launcher to discover a new tool. Only Hyprdeck-receipt-owned installs can be removed;
-known Steam game associations block removal and running launchers/Wine must be closed. Manually
-installed/system-managed tools remain visible but are not deleted here.
+Restart the launcher to discover a new tool. **Edit name…** changes an owned standalone tool's
+manifest display name, preserving its internal ID, directory, version and assignments, with an
+original-manifest backup. **Remove…** supports safe user-owned manual installations as well as
+receipt-verified Hyprdeck installs. System/package-owned, symlinked, nested or ambiguous multi-tool
+directories are read-only with an explanation. Steam-managed packages use **Uninstall in Steam…**
+rather than direct file deletion. Saved game/default references block removal; **Manage games…**
+provides the unassignment path. Changing standalone tools requires the launcher and Wine to be stopped.
 
 **Installed tools** lists custom runners and Steam-managed tools, with games explicitly assigned
 to each internal tool ID. **Steam games & recovery** reverses that view: installed games show their
@@ -277,7 +283,20 @@ saved compatibility assignment, library/prefix location, a Steam shortcut and Pr
 Configured global defaults are displayed separately: they do not prove a game actually uses Proton,
 and automatic or conflicting selections remain unknown. Steam-managed IDs use Steam's cached tool
 registrations when available; missing registrations are labelled, not guessed from folder names.
-Inventory is read-only; this view does not rewrite Steam's compatibility mappings.
+**Manage games…** on an installed tool opens a searchable batch selection: assign that tool to selected
+installed games, or unassign selected games to return to Steam's automatic/configured default. Saved
+references for uninstalled apps can be cleared, but cannot be assigned to a new tool. On **Steam games
+& recovery**, **Compatibility…** selects a tool or removes the override for that game. Both tabs use
+the same guarded assignment transaction. Changing Steam's application-0/global default is intentionally
+left to Steam; an automatic/default selection does not prove a game uses Proton.
+
+Before saving, an exact preview lists games and configuration files. The update is installation-wide:
+it changes the canonical mapping and harmonizes existing local-user overrides for only those games,
+without creating unrelated per-user overrides. Fully exit Steam and Wine first; Hyprdeck does not
+silently shut them down. Complete config originals are preserved next to each changed file as
+`*.hyprdeck-backup-*`, retaining permissions/group ownership. Concurrent changes are refused, partial
+write failures roll back, and errors identify preserved recovery files if restoration cannot finish.
+Prefixes, saves, launch options, unrelated games and global defaults are never edited by assignments.
 
 ### Optional prefix-version parser repair
 

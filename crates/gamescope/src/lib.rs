@@ -8,11 +8,14 @@ mod overlay_page;
 mod overlay_preview;
 mod page;
 pub mod proton;
+pub mod proton_cpu;
 mod proton_page;
 pub mod proton_repair;
 pub mod recovery;
 pub mod startup;
 pub mod steam;
+pub mod steam_assign;
+mod vdf_edit;
 
 use anyhow::{Result, anyhow};
 use hyprdeck_core::ui::PageInfo;
