@@ -1,14 +1,13 @@
 //! Compatibility-tool inventory and explicit, staged installation. Merely listing
 //! targets/releases never changes a launcher, game mapping, prefix, or tool.
 use std::collections::BTreeSet;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::Duration;
@@ -17,10 +16,15 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use crate::proton_cpu::{CpuProfile, cpu_profile};
+
 #[path = "proton_archive.rs"]
 mod archive;
+#[path = "proton_manage.rs"]
+mod manage;
 #[path = "steam_catalog.rs"]
 mod steam_catalog;
+pub use manage::{Capabilities, capabilities, remove, rename};
 
 const RECEIPT: &str = ".hyprdeck-tool.json";
 const MAX_DOWNLOAD: u64 = 3 * 1024 * 1024 * 1024;
@@ -138,7 +142,7 @@ pub fn providers() -> Vec<Provider> {
             id: "proton-cachyos",
             name: "Proton-CachyOS",
             repo: "CachyOS/proton-cachyos",
-            description: "Portable Steam Linux Runtime builds; baseline architecture, never host-specific native packages.",
+            description: "Portable Steam Linux Runtime builds; selects the highest CPU-compatible ISA tier, never native distribution packages.",
             targets: ALL_TARGETS,
         },
         Provider {
@@ -609,37 +613,109 @@ fn archive_name(name: &str) -> bool {
         .any(|suffix| name.ends_with(suffix))
 }
 
-fn binary_matches(provider: &str, name: &str, arch: &str) -> bool {
+#[derive(Clone, Copy, Debug)]
+struct BinaryBuild {
+    architecture: &'static str,
+    x86_64_level: Option<u8>,
+}
+
+impl BinaryBuild {
+    fn compatible(self, cpu: &CpuProfile) -> bool {
+        self.architecture == cpu.architecture
+            && match self.x86_64_level {
+                Some(required) => cpu.x86_64_level.is_some_and(|usable| required <= usable),
+                None => true,
+            }
+    }
+
+    fn rank(self) -> u8 {
+        self.x86_64_level.unwrap_or(0)
+    }
+
+    fn description(self) -> String {
+        match self.x86_64_level {
+            Some(1) => "x86-64 baseline".into(),
+            Some(level) => format!("x86-64-v{level}"),
+            None => self.architecture.into(),
+        }
+    }
+}
+
+fn binary_build(provider: &str, name: &str) -> Option<BinaryBuild> {
     let lower = name.to_ascii_lowercase();
     if !archive_name(&lower)
-        || lower.contains("source")
-        || lower.contains("debug")
-        || lower.contains(".pkg.")
-        || lower.contains("x86_64_v")
-        || lower.contains("wow64")
+        || !lower
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-_+".contains(&byte))
+        || ["source", "debug", ".pkg.", "native", "wow64"]
+            .iter()
+            .any(|&part| lower.contains(part))
     {
-        return false;
+        return None;
     }
-    let arm = lower.contains("aarch64") || lower.contains("arm64");
-    if (arch == "aarch64") != arm || !matches!(arch, "x86_64" | "aarch64") {
-        return false;
-    }
-    match provider {
+    let stem = binary_stem(&lower);
+    let mut explicit_architecture = true;
+    let build = if stem.ends_with("-aarch64") || stem.ends_with("-arm64") {
+        BinaryBuild {
+            architecture: "aarch64",
+            x86_64_level: None,
+        }
+    } else if let Some((_, tier)) = stem
+        .rsplit_once("-x86_64_v")
+        .or_else(|| stem.rsplit_once("-x86_64-v"))
+        .or_else(|| stem.rsplit_once("-x86-64-v"))
+    {
+        let level = match tier {
+            "1" => 1,
+            "2" => 2,
+            "3" => 3,
+            "4" => 4,
+            _ => return None,
+        };
+        BinaryBuild {
+            architecture: "x86_64",
+            x86_64_level: Some(level),
+        }
+    } else if stem.ends_with("-x86_64") || stem.ends_with("-x86-64") {
+        BinaryBuild {
+            architecture: "x86_64",
+            x86_64_level: Some(1),
+        }
+    } else {
+        // Older GE and TKG assets had no architecture suffix. Never treat an
+        // unrecognized architecture or ISA suffix as one of those legacy builds.
+        if ["x86", "aarch", "arm", "i386", "i686", "riscv", "ppc"]
+            .iter()
+            .any(|&part| stem.contains(part))
+            || stem.as_bytes().windows(3).any(|part| {
+                matches!(part[0], b'_' | b'-') && part[1] == b'v' && part[2].is_ascii_digit()
+            })
+        {
+            return None;
+        }
+        explicit_architecture = false;
+        BinaryBuild {
+            architecture: "x86_64",
+            x86_64_level: Some(1),
+        }
+    };
+    let supported = match provider {
         "ge-proton" => lower.starts_with("ge-proton") || lower.starts_with("proton-ge"),
         "proton-cachyos" => {
-            lower.starts_with("proton-cachyos-")
-                && lower.contains("-slr-")
-                && (arm || lower.contains("-x86_64."))
+            lower.starts_with("proton-cachyos-") && lower.contains("-slr-") && explicit_architecture
         }
-        "proton-wineland" => {
-            lower.starts_with("proton-wineland-") && (arm || lower.contains("-x86_64."))
-        }
+        "proton-wineland" => lower.starts_with("proton-wineland-") && explicit_architecture,
         "proton-tkg" => {
-            arch == "x86_64"
+            build.architecture == "x86_64"
                 && (lower.starts_with("proton_tkg_") || lower.starts_with("proton-tkg"))
         }
         _ => false,
-    }
+    };
+    supported.then_some(build)
+}
+
+fn binary_matches(provider: &str, name: &str, cpu: &CpuProfile) -> bool {
+    binary_build(provider, name).is_some_and(|build| build.compatible(cpu))
 }
 
 fn binary_stem(name: &str) -> &str {
@@ -659,33 +735,49 @@ fn compression_rank(name: &str) -> u8 {
     }
 }
 
-fn asset(provider: &Provider, release: &Value) -> Result<Option<Artifact>> {
+fn asset(provider: &Provider, release: &Value, cpu: &CpuProfile) -> Result<Option<Artifact>> {
     let assets = release
         .get("assets")
         .and_then(Value::as_array)
         .context("GitHub release has no asset list")?;
-    let mut candidates: Vec<_> = assets
-        .iter()
-        .filter(|a| binary_matches(provider.id, text(a, "name"), host_arch()))
-        .collect();
-    candidates.sort_by_key(|asset| compression_rank(text(asset, "name")));
-    let Some(chosen) = candidates.first() else {
+    let mut selected: Option<(BinaryBuild, &Value)> = None;
+    let mut ambiguous = false;
+    for candidate in assets {
+        let Some(build) = binary_build(provider.id, text(candidate, "name")) else {
+            continue;
+        };
+        if !build.compatible(cpu) {
+            continue;
+        }
+        match selected {
+            None => selected = Some((build, candidate)),
+            Some((previous, _)) if build.rank() > previous.rank() => {
+                selected = Some((build, candidate));
+                ambiguous = false;
+            }
+            Some((previous, chosen)) if build.rank() == previous.rank() => {
+                ambiguous |=
+                    binary_stem(text(candidate, "name")) != binary_stem(text(chosen, "name"));
+                if compression_rank(text(candidate, "name"))
+                    < compression_rank(text(chosen, "name"))
+                {
+                    selected = Some((build, candidate));
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some((_, chosen)) = selected else {
         return Ok(None);
     };
-    let stem = binary_stem(text(chosen, "name"));
     ensure!(
-        candidates
-            .iter()
-            .all(|candidate| binary_stem(text(candidate, "name")) == stem),
-        "Release has multiple distinct baseline binary builds; refusing an ambiguous choice"
+        !ambiguous,
+        "Release has multiple distinct binary builds in the highest compatible ISA tier; refusing an ambiguous choice"
     );
     let url = text(chosen, "browser_download_url");
     ensure!(
-        url.starts_with(&format!(
-            "https://github.com/{}/releases/download/",
-            provider.repo
-        )),
-        "Release asset does not belong to the provider"
+        standard_asset_url(provider, text(chosen, "name"), url),
+        "Release asset URL does not match its provider and advertised filename"
     );
     let size = chosen
         .get("size")
@@ -702,25 +794,37 @@ fn asset(provider: &Provider, release: &Value) -> Result<Option<Artifact>> {
     }))
 }
 
-/// Detect the running host, not the architecture used to compile Hyprdeck.
-fn host_arch() -> &'static str {
-    static ARCH: OnceLock<String> = OnceLock::new();
-    ARCH.get_or_init(|| {
-        // SAFETY: uname fills this correctly sized structure and terminates machine.
-        let mut host: libc::utsname = unsafe { std::mem::zeroed() };
-        if unsafe { libc::uname(&mut host) } != 0 {
-            return "unknown".into();
-        }
-        let machine = unsafe { CStr::from_ptr(host.machine.as_ptr()) }.to_string_lossy();
-        match machine.as_ref() {
-            "arm64" => "aarch64".into(),
-            "amd64" => "x86_64".into(),
-            other => other.into(),
-        }
+fn standard_asset_url(provider: &Provider, name: &str, url: &str) -> bool {
+    url.strip_prefix(&format!(
+        "https://github.com/{}/releases/download/",
+        provider.repo
+    ))
+    .and_then(|path| path.split_once('/'))
+    .is_some_and(|(tag, filename)| {
+        !tag.is_empty()
+            && tag != "."
+            && tag != ".."
+            && !tag.contains('?')
+            && !tag.contains('#')
+            && filename == name
     })
 }
 
+/// Detect the running host, not the architecture used to compile Hyprdeck.
+fn host_arch() -> &'static str {
+    &crate::proton_cpu::host_profile().architecture
+}
+
 fn release_from(provider: &Provider, target: &Target, value: &Value) -> Result<Release> {
+    release_from_for_cpu(provider, target, value, crate::proton_cpu::host_profile())
+}
+
+fn release_from_for_cpu(
+    provider: &Provider,
+    target: &Target,
+    value: &Value,
+    cpu: &CpuProfile,
+) -> Result<Release> {
     let version = text(value, "tag_name");
     ensure!(!version.is_empty(), "Release is missing its version tag");
     let mut release = Release {
@@ -763,18 +867,21 @@ fn release_from(provider: &Provider, target: &Target, value: &Value) -> Result<R
             release.availability = "Install interpreted release script/data (not a compiled Proton build). No downloaded code executes during installation. Requires bash, awk, git, pgrep, pidof, pkill, tar, unzip, wget, xdotool, xprop, xrandr, xwininfo, xxd and Yad ≥ 7.2. SteamTinkerLaunch may download optional components when you explicitly run it.".into();
         }
     } else {
-        release.artifact = asset(provider, value)?;
-        release.availability = if release.artifact.is_some() {
-            format!(
-                "Install prebuilt {} baseline archive for {}. Restart the launcher to discover it; non-Steam Proton requires the launcher's UMU/Proton support.",
+        release.artifact = asset(provider, value, cpu)?;
+        release.availability = match release.artifact.as_ref().and_then(|artifact| {
+            binary_build(provider.id, &artifact.name).map(|build| (artifact, build))
+        }) {
+            Some((artifact, build)) => format!(
+                "Selected {}: prebuilt {} {} archive, CPU/OS-compatible with {}. Restart the launcher to discover it; non-Steam Proton requires the launcher's UMU/Proton support.",
+                artifact.name,
                 provider.name,
-                host_arch()
-            )
-        } else {
-            format!(
-                "No supported {} baseline binary in this release. Source archives and CPU-specific/native distribution packages are not installed.",
-                host_arch()
-            )
+                build.description(),
+                cpu.description()
+            ),
+            None => format!(
+                "No CPU/OS-compatible binary for {} in this release. Only supported architecture/ISA tiers are selected; source archives, alternate ABIs and native distribution packages are not installed.",
+                cpu.description()
+            ),
         };
     }
     Ok(release)
@@ -902,7 +1009,26 @@ pub fn steam_install(target: &Target, app: u32) -> Result<()> {
     ensure!(app != 0, "Invalid Steam tool application ID");
     steam_root(target)?;
     steam_catalog::Catalog::load(target)?.validate_app(app, host_arch())?;
-    let uri = format!("steam://install/{app}");
+    steam_uri(target, &format!("steam://install/{app}"))
+}
+
+/// Steam owns these package files; its client performs the uninstall confirmation.
+pub fn steam_uninstall(target: &Target, app: u32) -> Result<()> {
+    let inventory = crate::steam::inventory(std::slice::from_ref(target))?;
+    ensure!(
+        inventory.warnings.is_empty()
+            && inventory
+                .steam_tools
+                .iter()
+                .filter(|tool| tool.app_id == app)
+                .count()
+                == 1,
+        "This application is not an unambiguous installed Steam-managed tool"
+    );
+    steam_uri(target, &format!("steam://uninstall/{app}"))
+}
+
+fn steam_uri(target: &Target, uri: &str) -> Result<()> {
     let mut command = match steam_packaging(target)? {
         SteamPackaging::Flatpak => {
             let mut command = Command::new("flatpak");
@@ -967,7 +1093,7 @@ fn tkg_ci(target: &Target) -> Result<Vec<Release>> {
             if size == 0 || size > MAX_DOWNLOAD {
                 continue;
             }
-            releases.push(Release { id: format!("proton-tkg:ci-{id}"), version: format!("TKG Steam Runtime CI #{id}"), notes: format!("Upstream Valve experimental-bleeding-edge Steam Runtime build. Prerelease CI artifacts may regress and expire.\n\n{}", run.get("head_commit").map(|c| text(c, "message")).unwrap_or("")), url: text(run, "html_url").into(), published: text(artifact, "created_at").into(), prerelease: true, artifact: Some(Artifact { url: format!("https://nightly.link/{repo}/actions/runs/{id}/proton-tkg-build.zip"), name: "proton-tkg-build.zip".into(), size }), steam_app: None, availability: "Install upstream CI binary (nightly.link download of GitHub Actions artifact); experimental, x86_64 only.".into() });
+            releases.push(Release { id: format!("proton-tkg:ci-{id}"), version: format!("TKG Steam Runtime CI #{id}"), notes: format!("Upstream Valve experimental-bleeding-edge Steam Runtime build. Prerelease CI artifacts may regress and expire.\n\n{}", run.get("head_commit").map(|c| text(c, "message")).unwrap_or("")), url: text(run, "html_url").into(), published: text(artifact, "created_at").into(), prerelease: true, artifact: Some(Artifact { url: format!("https://nightly.link/{repo}/actions/runs/{id}/proton-tkg-build.zip"), name: "proton-tkg-build.zip".into(), size }), steam_app: None, availability: format!("Selected proton-tkg-build.zip: upstream CI binary (nightly.link download of GitHub Actions artifact), x86-64 baseline; CPU/OS-compatible with {}. Experimental.", crate::proton_cpu::host_profile().description()) });
         }
     }
     Ok(releases)
@@ -1127,6 +1253,14 @@ fn safe_name(value: &str) -> Result<String> {
 }
 
 fn check_artifact(target: &Target, release: &Release) -> Result<Provider> {
+    check_artifact_for_cpu(target, release, crate::proton_cpu::host_profile())
+}
+
+fn check_artifact_for_cpu(
+    target: &Target,
+    release: &Release,
+    cpu: &CpuProfile,
+) -> Result<Provider> {
     let (id, _) = release
         .id
         .split_once(':')
@@ -1144,10 +1278,7 @@ fn check_artifact(target: &Target, release: &Release) -> Result<Provider> {
             && artifact.name != "..",
         "Unsafe artifact filename"
     );
-    let standard = artifact.url.starts_with(&format!(
-        "https://github.com/{}/releases/download/",
-        provider.repo
-    ));
+    let standard = standard_asset_url(&provider, &artifact.name, &artifact.url);
     if id == "steamtinkerlaunch" {
         ensure!(
             !flatpak(target),
@@ -1166,7 +1297,7 @@ fn check_artifact(target: &Target, release: &Release) -> Result<Provider> {
             .strip_prefix("proton-tkg:ci-")
             .context("Invalid TKG CI release ID")?;
         ensure!(
-            host_arch() == "x86_64"
+            cpu.architecture == "x86_64"
                 && !run.is_empty()
                 && run.bytes().all(|c| c.is_ascii_digit())
                 && artifact.url
@@ -1177,8 +1308,9 @@ fn check_artifact(target: &Target, release: &Release) -> Result<Provider> {
         );
     } else {
         ensure!(
-            standard && binary_matches(id, &artifact.name, host_arch()),
-            "Artifact is not a supported native binary from this provider"
+            standard && binary_matches(id, &artifact.name, cpu),
+            "Artifact is not a CPU/OS-compatible binary from this provider for {}",
+            cpu.description()
         );
     }
     Ok(provider)
@@ -1519,32 +1651,6 @@ fn ensure_unreferenced(target: &Target, tool: &InstalledTool) -> Result<()> {
     Ok(())
 }
 
-/// Removes only an explicit receipt-owned immediate child, never system packages
-/// or manually installed tools. Saved Steam mappings are re-read before removal.
-pub fn remove(target: &Target, tool: &InstalledTool) -> Result<()> {
-    ensure!(
-        tool.managed && tool.target_id == target.id,
-        "Only this target's Hyprdeck-managed tools can be removed"
-    );
-    require_stopped(target)?;
-    let root = fs::canonicalize(&target.root)?;
-    ensure!(
-        tool.path.parent() == Some(root.as_path()),
-        "Tool path is outside its target root"
-    );
-    valid_receipt(target, &tool.path, &tool.name)?;
-    ensure_unreferenced(target, tool)?;
-    // Move out of the launcher's search path before deletion, on the same fs.
-    // A newly installed tool at the original name cannot be deleted by this call.
-    let stage = tempfile::Builder::new()
-        .prefix(".hyprdeck-remove-")
-        .tempdir_in(&root)?;
-    let destination = stage.path().join("owned-tool");
-    rename_noreplace(&tool.path, &destination)?;
-    fs::remove_dir_all(&destination).context("Removing the quarantined, receipt-owned tool")?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1588,17 +1694,68 @@ mod tests {
         ensure_unreferenced(&alias, &tool).unwrap();
     }
 
+    fn cpu(architecture: &str, x86_64_level: Option<u8>) -> CpuProfile {
+        CpuProfile {
+            architecture: architecture.into(),
+            x86_64_level,
+        }
+    }
+
+    fn release_assets(provider: &Provider, names: &[&str]) -> Value {
+        serde_json::json!({"tag_name": "fixture-release", "assets": names.iter().map(|name| {
+            serde_json::json!({"name": name, "size": 100, "browser_download_url": format!(
+                "https://github.com/{}/releases/download/fixture-release/{name}", provider.repo
+            )})
+        }).collect::<Vec<_>>()})
+    }
+
     #[test]
-    fn equivalent_compression_variants_do_not_hide_releases() {
+    fn compression_preference_applies_within_the_highest_compatible_tier() {
         let provider = provider("ge-proton").unwrap();
-        let stem = format!("GE-Proton10-28-{}", host_arch());
-        let release = serde_json::json!({"assets": [
-            {"name":format!("{stem}.tar.gz"),"size":100,"browser_download_url":format!("https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton10-28/{stem}.tar.gz")},
-            {"name":format!("{stem}.tar.zst"),"size":80,"browser_download_url":format!("https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton10-28/{stem}.tar.zst")}
-        ]});
+        let names = [
+            "GE-Proton42-1-x86_64.tar.zst",
+            "GE-Proton42-1-x86_64_v3.tar.gz",
+            "GE-Proton42-1-x86_64_v3.tar.xz",
+            "GE-Proton42-1-x86_64_v3.tar.zst",
+        ];
+        for (advertised, expected) in [(&names[..], names[3]), (&names[..3], names[2])] {
+            let value = release_assets(&provider, advertised);
+            assert_eq!(
+                asset(&provider, &value, &cpu("x86_64", Some(3)))
+                    .unwrap()
+                    .unwrap()
+                    .name,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn different_abi_builds_are_not_compression_duplicates() {
+        let provider = provider("ge-proton").unwrap();
+        let ambiguous = release_assets(
+            &provider,
+            &[
+                "GE-Proton42-1-x86_64_v3.tar.zst",
+                "GE-Proton42-1-musl-x86_64_v3.tar.xz",
+            ],
+        );
+        assert!(asset(&provider, &ambiguous, &cpu("x86_64", Some(3))).is_err());
+        // An ambiguous lower tier does not hide an unambiguous preferred tier.
+        let preferred = release_assets(
+            &provider,
+            &[
+                "GE-Proton42-1-x86_64.tar.zst",
+                "GE-Proton42-1-musl-x86_64.tar.xz",
+                "GE-Proton42-1-x86_64_v3.tar.xz",
+            ],
+        );
         assert_eq!(
-            asset(&provider, &release).unwrap().unwrap().name,
-            format!("{stem}.tar.zst")
+            asset(&provider, &preferred, &cpu("x86_64", Some(3)))
+                .unwrap()
+                .unwrap()
+                .name,
+            "GE-Proton42-1-x86_64_v3.tar.xz"
         );
     }
 
@@ -1614,57 +1771,180 @@ mod tests {
     }
 
     #[test]
-    fn selects_baseline_binaries_not_sources_native_packages_or_other_architectures() {
-        assert!(binary_matches(
-            "ge-proton",
-            "GE-Proton10-1.tar.gz",
-            "x86_64"
-        ));
-        assert!(binary_matches(
-            "ge-proton",
-            "GE-Proton11-9-x86_64.tar.gz",
-            "x86_64"
-        ));
-        assert!(!binary_matches(
-            "ge-proton",
-            "GE-Proton11-9-aarch64.tar.gz",
-            "x86_64"
-        ));
-        assert!(binary_matches(
-            "ge-proton",
-            "GE-Proton11-9-aarch64.tar.gz",
-            "aarch64"
-        ));
-        assert!(binary_matches(
-            "proton-cachyos",
+    fn baseline_remains_available_and_unsupported_advertised_tiers_are_skipped() {
+        let provider = provider("proton-cachyos").unwrap();
+        let names = [
             "proton-cachyos-42.0-fixture-slr-x86_64.tar.xz",
-            "x86_64"
-        ));
-        assert!(!binary_matches(
-            "proton-cachyos",
-            "proton-cachyos-11.0-native-x86_64.tar.xz",
-            "x86_64"
-        ));
-        assert!(!binary_matches(
-            "proton-cachyos",
-            "proton-cachyos-11.0-slr-x86_64_v3.tar.xz",
-            "x86_64"
-        ));
+            "proton-cachyos-42.0-fixture-slr-x86_64_v2.tar.xz",
+            "proton-cachyos-42.0-fixture-slr-x86_64_v3.tar.xz",
+            "proton-cachyos-42.0-fixture-slr-x86_64_v4.tar.xz",
+        ];
+        let baseline = release_assets(&provider, &names[..1]);
+        assert_eq!(
+            asset(&provider, &baseline, &cpu("x86_64", Some(4)))
+                .unwrap()
+                .unwrap()
+                .name,
+            names[0]
+        );
+        for level in 1..=4 {
+            // Reverse order exercises selection independently of upstream asset order.
+            let advertised = release_assets(&provider, &[names[3], names[2], names[1], names[0]]);
+            assert_eq!(
+                asset(&provider, &advertised, &cpu("x86_64", Some(level)))
+                    .unwrap()
+                    .unwrap()
+                    .name,
+                names[usize::from(level - 1)]
+            );
+        }
+        let too_new = release_assets(&provider, &names[3..]);
+        assert!(
+            asset(&provider, &too_new, &cpu("x86_64", Some(3)))
+                .unwrap()
+                .is_none()
+        );
+        let sparse = release_assets(&provider, &[names[3], names[1]]);
+        assert_eq!(
+            asset(&provider, &sparse, &cpu("x86_64", Some(3)))
+                .unwrap()
+                .unwrap()
+                .name,
+            names[1]
+        );
+    }
+
+    #[test]
+    fn current_architecture_suffixes_and_legacy_ge_assets_are_supported() {
+        let x86 = cpu("x86_64", Some(3));
+        let arm = cpu("aarch64", None);
+        let ge = provider("ge-proton").unwrap();
+        let ge_names = [
+            "GE-Proton42-1-x86_64.tar.gz",
+            "GE-Proton42-1-aarch64.tar.gz",
+        ];
+        let value = release_assets(&ge, &ge_names);
+        assert_eq!(asset(&ge, &value, &x86).unwrap().unwrap().name, ge_names[0]);
+        assert_eq!(asset(&ge, &value, &arm).unwrap().unwrap().name, ge_names[1]);
+        assert!(binary_matches("ge-proton", "GE-Proton42-1.tar.gz", &x86));
+        assert!(!binary_matches("ge-proton", "GE-Proton42-1.tar.gz", &arm));
+        let cachy = provider("proton-cachyos").unwrap();
+        let cachy_names = [
+            "proton-cachyos-42.0-fixture-slr-x86_64.tar.xz",
+            "proton-cachyos-42.0-fixture-slr-x86_64_v3.tar.xz",
+            "proton-cachyos-42.0-fixture-slr-arm64.tar.xz",
+        ];
+        let value = release_assets(&cachy, &cachy_names);
+        assert_eq!(
+            asset(&cachy, &value, &x86).unwrap().unwrap().name,
+            cachy_names[1]
+        );
+        assert_eq!(
+            asset(&cachy, &value, &arm).unwrap().unwrap().name,
+            cachy_names[2]
+        );
+        let wineland = provider("proton-wineland").unwrap();
+        let wineland_names = [
+            "proton-wineland-42.0-fixture-x86_64.tar.xz",
+            "proton-wineland-42.0-fixture-x86_64_v3.tar.xz",
+            "proton-wineland-42.0-fixture-x86_64_wow64.tar.xz",
+        ];
+        let value = release_assets(&wineland, &wineland_names);
+        assert_eq!(
+            asset(&wineland, &value, &x86).unwrap().unwrap().name,
+            wineland_names[1]
+        );
+        assert!(asset(&wineland, &value, &arm).unwrap().is_none());
+        assert!(
+            asset(&ge, &release_assets(&ge, &ge_names), &cpu("riscv64", None))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sources_native_packages_unknown_tiers_and_alternate_abis_are_not_selected() {
+        let x86 = cpu("x86_64", Some(4));
+        for (provider, name) in [
+            ("proton-cachyos", "proton-cachyos-42.0-native-x86_64.tar.xz"),
+            (
+                "proton-cachyos",
+                "proton-cachyos-42.0-native-slr-x86_64_v3.tar.xz",
+            ),
+            ("proton-cachyos", "proton-cachyos-42.0-slr-x86_64_v5.tar.xz"),
+            ("proton-tkg", "wine-tkg-staging-x86_64.pkg.tar.zst"),
+            ("proton-tkg", "proton-tkg-source.tar.gz"),
+            ("ge-proton", "GE-Proton42-1-debug-x86_64.tar.gz"),
+            ("ge-proton", "GE-Proton42-1-riscv64.tar.gz"),
+            ("ge-proton", "GE-Proton42-1-v4.tar.gz"),
+            (
+                "proton-wineland",
+                "proton-wineland-42.0-fixture-x86_64_wow64.tar.xz",
+            ),
+            (
+                "proton-wineland",
+                "proton-wineland-42.0-fixture-x86_64_v3.sha512sum",
+            ),
+        ] {
+            assert!(!binary_matches(provider, name, &x86), "{name}");
+        }
         assert!(binary_matches(
-            "proton-wineland",
-            "proton-wineland-11.0-20261015-x86_64.tar.xz",
-            "x86_64"
-        ));
-        assert!(!binary_matches(
             "proton-tkg",
-            "wine-tkg-staging-x86_64.pkg.tar.zst",
-            "x86_64"
+            "proton_tkg_42.0-valve.tar.gz",
+            &x86
         ));
-        assert!(!binary_matches(
-            "proton-tkg",
-            "proton-tkg-source.tar.gz",
-            "x86_64"
-        ));
+    }
+
+    #[test]
+    fn release_availability_records_selected_artifact_and_cpu_suitability() {
+        let provider = provider("proton-cachyos").unwrap();
+        let name = "proton-cachyos-42.0-fixture-slr-x86_64_v3.tar.xz";
+        let value = release_assets(&provider, &[name]);
+        let target = target(PathBuf::from("/fixture"));
+        let release =
+            release_from_for_cpu(&provider, &target, &value, &cpu("x86_64", Some(3))).unwrap();
+        assert!(release.availability.contains(name));
+        assert!(release.availability.contains("CPU/OS-compatible"));
+        assert!(release.availability.contains("usable x86-64-v3"));
+        let unsupported =
+            release_from_for_cpu(&provider, &target, &value, &cpu("x86_64", Some(2))).unwrap();
+        assert!(unsupported.artifact.is_none());
+        assert!(
+            unsupported
+                .availability
+                .contains("No CPU/OS-compatible binary")
+        );
+    }
+
+    #[test]
+    fn manual_artifacts_cannot_bypass_isa_architecture_or_filename_checks() {
+        let provider = provider("proton-cachyos").unwrap();
+        let names = [
+            "proton-cachyos-42.0-fixture-slr-x86_64_v3.tar.xz",
+            "proton-cachyos-42.0-fixture-slr-x86_64_v4.tar.xz",
+        ];
+        let target = target(PathBuf::from("/fixture"));
+        let mut release = release_from_for_cpu(
+            &provider,
+            &target,
+            &release_assets(&provider, &names),
+            &cpu("x86_64", Some(4)),
+        )
+        .unwrap();
+        assert!(check_artifact_for_cpu(&target, &release, &cpu("x86_64", Some(4))).is_ok());
+        assert!(check_artifact_for_cpu(&target, &release, &cpu("x86_64", Some(3))).is_err());
+        assert!(check_artifact_for_cpu(&target, &release, &cpu("aarch64", None)).is_err());
+        // A compatible label must not disguise a URL to an unsupported build.
+        release.artifact.as_mut().unwrap().name = names[0].into();
+        assert!(check_artifact_for_cpu(&target, &release, &cpu("x86_64", Some(3))).is_err());
+        release.artifact = asset(
+            &provider,
+            &release_assets(&provider, &names[..1]),
+            &cpu("x86_64", Some(3)),
+        )
+        .unwrap();
+        assert!(check_artifact_for_cpu(&target, &release, &cpu("x86_64", Some(3))).is_ok());
+        assert!(check_artifact_for_cpu(&target, &release, &cpu("x86_64", Some(2))).is_err());
     }
 
     #[test]
