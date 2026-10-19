@@ -22,7 +22,7 @@ loads last. Your hand-written config is never rewritten behind your back.
 | --- | --- |
 | **Startup Apps** | XDG autostart entries, systemd user services and `hl.on("hyprland.start")` commands in one list. Enable/disable for the next login, start/stop/restart now, view logs, add apps, and delete entries you own (with a preview of every file removed). |
 | **Displays** | Drag-to-arrange layout. Resolution, refresh rate, scale (only values Hyprland accepts), rotation, VRR, mirroring, color management and HDR (SDR brightness/saturation/luminance, EOTF, bit depth, ICC). Changes apply behind a 15 s keep-or-revert countdown. Brightness, contrast and input source over DDC/CI via `ddcutil`. |
-| **Gaming** | Native Wayland Gamescope + Steam Big Picture, Steam Input and overlay integration. Live session/PID status without navigation. Display-derived resolution, HDR and VRR; advanced rendering and input controls. A separate MangoHUD view provides presets, full native configuration and an actual embedded 3D overlay preview. Save profiles, inspect commands, and open existing sessions without duplicates. Desktop Steam restarts only after confirmation. |
+| **Gaming** | Native Wayland Gamescope + Steam Big Picture, display-derived HDR/VRR, live session status and input controls. Nested **Performance overlay** keeps a real MangoApp preview visible beside searchable settings. **Compatibility tools** discovers launchers, browses/downloads Proton releases, shows saved Steam game/tool associations and provides reversible prefix backup/reset/restore. |
 | **Input Devices** | Keyboard layouts, options and repeat; pointer, focus and touchpad behaviour; cursor; overrides per physical device. Every value shows where it comes from: config file:line, hyprdeck, or default. |
 | **Keybinds** | Every effective bind in readable form, grouped and searchable. Add, edit, disable and restore binds. Record key combos (even ones Hyprland already grabs). Pick an app, a shell action, a window/workspace action or any dispatcher. Warns before replacing an existing bind. |
 | **Audio** | Play through several outputs at once (a PipeWire combine sink) and route specific apps to specific outputs. Includes volumes, default output, a "what's playing where" overview, and a tray submenu. |
@@ -37,9 +37,9 @@ Pages and sections adapt to what's installed: missing `ddcutil`, `bluetoothd`, `
 uwsm, Noctalia or an NVIDIA driver hides or explains the related features instead of failing.
 
 The sidebar groups **Hardware** (displays, input, audio, Bluetooth), **Desktop** (startup, keybinds,
-default apps, Gaming), and **System** (updates, sleep/wake, tweaks). **Plugins** is a dedicated manager;
-installed integrations appear beneath it and open their own product experiences, without crowded
-management controls on device pages. Existing page ids and CLI commands stay unchanged.
+default apps, Gaming), and **System** (updates, sleep/wake, tweaks). Gaming has nested **Performance
+overlay** and **Compatibility tools** pages. **Plugins** is a dedicated manager; installed integrations
+appear beneath it and open their own product experiences. Existing page ids and CLI commands stay unchanged.
 
 ## Requirements
 
@@ -50,6 +50,7 @@ management controls on device pages. Existing page ids and CLI commands stay unc
   - BlueZ for Bluetooth
   - `ddcutil` with i2c access for monitor brightness
   - Native Steam, Gamescope and a systemd user manager (systemd 254+) for the Gaming launcher
+  - `curl` for compatibility-tool release/download metadata; Python 3 for optional parser inspection/repair
   - For the Updates page: Arch Linux or an Arch-based distro with `pacman-contrib`, a polkit agent (most shells
     include one), and `base-devel` + `git` for AUR packages. No AUR helper is needed.
 - Building from source: Rust 1.89+, GTK ≥ 4.20, libadwaita ≥ 1.8
@@ -174,6 +175,12 @@ Open **Gaming → Performance overlay** for MangoHUD/MangoApp. Install `mangohud
 injecting MangoHUD into Steam or every game. The toggle is off by default. A missing renderer is
 reported explicitly instead of silently launching without the requested overlay.
 
+The preview, Save overlay, Enabled and Live saves controls stay pinned while settings scroll
+independently. On wide windows the preview sits beside the editor; narrow windows keep it above
+the controls. Choose a category to show that section, or search across all categories by title/native
+option. **Controls**, **Editor** and **Updates** tabs separate visual editing, full configuration/presets
+and package management. `hyprdeck --page gamescope-overlay` opens this workspace directly.
+
 Searchable native controls cover MangoHUD metrics, layout, fonts, dimensions, offsets, RGB color
 pickers, graphs, thresholds, hotkeys, logging, media and network information. Each control can reset
 its override to the renderer's default. **FPS + temperatures** shows FPS, GPU usage, and GPU/CPU
@@ -229,6 +236,90 @@ includes `mangoapp`; optional `lib32-mangohud` supplies 32-bit injection librari
 must be installed through the distribution's package manager; the updater upgrades installed
 packages only. Non-pacman systems receive package-manager guidance, not an unsupported install
 button. Development (`-git`) packages retain the existing AUR commit-only update limitations.
+
+### Compatibility tools and Steam game associations
+
+Open **Gaming → Compatibility tools** (`hyprdeck --page gamescope-proton`). Native/Flatpak Steam,
+Lutris, Heroic and Bottles locations are detected, with Snap Steam also supported. **Add target…**
+adds a user-selected tool directory and launcher format; those choices live in
+`~/.config/hyprdeck/compatibility-tools.toml`. A target is a tool/runner directory, not a game prefix.
+
+**Download tools** lists upstream releases with readable notes, publication dates, prerelease status
+and the upstream release link. Providers include GE-Proton, Valve Proton, Proton-TKG (including
+available upstream CI artifacts), Proton-CachyOS, Proton-Wineland and SteamTinkerLaunch.
+Wineland currently uses its renamed `nanomatters/proton-salkim` repository. CPU-specific native
+packages and source archives are not substituted for portable Proton binaries. Equivalent compression
+formats are handled without confusing them with different builds. Unsupported launcher/architecture
+pairs and unavailable artifacts explain why installation is not offered.
+
+Valve Proton is installed/updated by the selected Steam packaging, not from GitHub's source archives.
+Series, Experimental and install app IDs come from that client's current `appcache/appinfo.vdf`,
+not a fixed version table. Missing, stale, ambiguous or unsupported metadata disables the action with
+an explanation; open the selected Steam client to refresh its Tools metadata. CPU architecture is
+detected on the running host. Installation ownership is kept separately from symlinked tool paths;
+custom display labels never decide native/Flatpak/Snap routing. Choosing a release series opens
+Steam's current build for that series. SteamTinkerLaunch is an
+interpreted wrapper: its release script/data are laid out without executing a downloaded installer,
+and its runtime dependencies must already be installed. Flatpak Steam uses the upstream STL extension
+instructions instead of a host-script installation. Lutris/other non-Steam Proton use requires the
+launcher's UMU/Proton support; Hyprdeck does not change individual game runner settings.
+
+Downloads expose progress/cancellation. Archives are validated for traversal, escaping links,
+duplicates and special files; installation stages on the destination filesystem and atomically
+commits without overwriting another version. No downloaded executable runs during installation.
+Restart the launcher to discover a new tool. Only Hyprdeck-receipt-owned installs can be removed;
+known Steam game associations block removal and running launchers/Wine must be closed. Manually
+installed/system-managed tools remain visible but are not deleted here.
+
+**Installed tools** lists custom runners and Steam-managed tools, with games explicitly assigned
+to each internal tool ID. **Steam games & recovery** reverses that view: installed games show their
+saved compatibility assignment, library/prefix location, a Steam shortcut and ProtonDB link.
+Configured global defaults are displayed separately: they do not prove a game actually uses Proton,
+and automatic or conflicting selections remain unknown. Steam-managed IDs use Steam's cached tool
+registrations when available; missing registrations are labelled, not guessed from folder names.
+Inventory is read-only; this view does not rewrite Steam's compatibility mappings.
+
+### Optional prefix-version parser repair
+
+**Repair recognized prefix parser (opt-in)** is available when installing a standalone Proton build.
+It is off by default. Hyprdeck structurally inspects the downloaded Python source as data and repairs
+only the exact recognized migration-parser defect: vendor-prefixed version markers must be split
+from the right and normalized before numeric version comparison. No particular vendor version,
+game ID, user path or prefix is hardcoded. The numeric comparisons and remaining upstream migration
+logic are retained. Unknown/edited layouts are refused, and an already normalized parser is left
+unchanged. Python 3 is required; no downloaded runner code executes during inspection or installation.
+
+The repair runs in private installation staging before atomic cutover. The complete original runner
+source and mode are preserved in `.hyprdeck-prefix-parser.json` inside the managed tool directory.
+Under **Installed tools → Prefix parser…**, inspect status, apply/reapply a verified repair or restore
+that original source. Changing an already-installed runner requires its launcher and Wine/Proton
+games to be stopped. Modified source that no longer matches the preserved repair is not overwritten.
+
+**This changes the runner, not a game prefix or compatibility assignment.** Correct parsing can allow
+normal upstream prefix migrations that were previously skipped: back up affected game prefixes
+before selecting the repaired runner. Restoring the runner does not undo migrations already performed.
+A parser workaround is not a guaranteed fix for game startup, driver, runtime or game-file problems.
+Existing runners, saves and per-game tool selections are never replaced by installing a new version.
+
+### Prefix backup, reset and restore
+
+In **Steam games & recovery**, expand a game and choose **Prefix backups / recovery…**. Fully exit
+Steam, all games, Wine and Proton first. **Back up and reset prefix…** moves the entire selected
+`steamapps/compatdata/<appid>` directory to a unique sibling `<appid>.hyprdeck-backup-*`; nothing is
+deleted and no replacement prefix is manufactured. Proton creates a fresh prefix on the next launch.
+Saves, mods, settings, launcher credentials and prerequisites can live inside a prefix: synchronize or
+back up saves first, and recover them from the preserved directory if necessary. **Restore…** preserves
+any current prefix in another backup before restoring the selected one; it never merges saves.
+Existing manual `<appid>.before-*` backups with real prefix structure are also listed.
+
+Recovery validates the application manifest and canonical library path, refuses symlinked prefix/
+backup parents, checks for running compatibility processes and uses no-overwrite same-filesystem
+renames. If process state cannot be inspected, recovery refuses rather than guesses. It is an explicit
+troubleshooting operation, not scheduled cleanup or a guaranteed game fix.
+Switching Proton versions can migrate registry/built-in files and temporarily change startup behavior;
+an “invalid prefix version” warning can also originate in the runner's migration parser. A reset does
+not repair a broken Proton build, game files, drivers or launch options. Hyprdeck never resets a
+prefix automatically after a failed launch.
 
 ### Session status and launch
 
@@ -288,6 +379,8 @@ hyprdeck --page display               # open on a page (startup, display, gamesc
                                       #   audio, bluetooth, defaults, updates, sleep, tweaks, plugins)
 hyprdeck display rescue               # DPMS off/on + reload: recovers a black screen after wake
 hyprdeck --page gamescope             # Gaming settings and launcher
+hyprdeck --page gamescope-overlay     # persistent MangoHUD preview/settings workspace
+hyprdeck --page gamescope-proton      # compatibility releases, associations and prefix recovery
 hyprdeck gamescope plan               # show the resolved display settings and command without launching
 hyprdeck gamescope launch             # launch from saved settings, or focus existing Big Picture
 hyprdeck audio toggle                 # simultaneous output on/off
@@ -334,6 +427,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p hd-display --example display_preview   # one feature's pages, standalone
 packaging/appimage/build-appimage.sh                # build dist/Hyprdeck-x86_64.AppImage
 ```
+
+The workspace tests require Python 3 for the isolated parser-repair fixtures.
 
 CI runs fmt, clippy, tests and an AppImage build in an Arch Linux container. Releases are automated:
 

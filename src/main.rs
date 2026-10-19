@@ -27,7 +27,8 @@ USAGE:
       plugins   list | install <folder|owner/repo> | enable <id> | disable <id>
                 state <id> | action <id> <action> [JSON args] | check [id] | update <id>
 
-Pages: startup, display, gamescope, input, keybinds, audio, bluetooth, defaults, updates, sleep, tweaks, plugins
+Pages: startup, display, gamescope, gamescope-overlay, gamescope-proton, input, keybinds,
+       audio, bluetooth, defaults, updates, sleep, tweaks, plugins
        plugin:<id> opens an installed integration";
 
 type Cli = fn(&[String]) -> Option<anyhow::Result<()>>;

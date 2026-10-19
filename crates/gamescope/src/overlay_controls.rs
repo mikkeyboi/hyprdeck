@@ -16,14 +16,47 @@ enum Input {
     Color(adw::EntryRow, gtk::ColorDialogButton, &'static str),
 }
 
+type Section = (adw::PreferencesGroup, Vec<(String, gtk::Widget)>);
+
 impl Controls {
-    pub(super) fn build(content: &gtk::Box, editor: &gtk::TextBuffer) -> Self {
+    pub(super) fn build(
+        content: &gtk::Box,
+        navigation: &gtk::Box,
+        scroller: &gtk::ScrolledWindow,
+        editor: &gtk::TextBuffer,
+    ) -> Self {
         let syncing = Rc::new(Cell::new(false));
         let mut rows = Vec::new();
-        let search = gtk::SearchEntry::builder()
-            .placeholder_text("Find a setting or native option…")
+        let category_names = gtk::StringList::new(&["All categories"]);
+        let categories = gtk::DropDown::builder()
+            .model(&category_names)
+            .enable_search(true)
+            .hexpand(true)
+            .tooltip_text("Choose a native settings category; searching checks all categories")
             .build();
-        content.append(&search);
+        let factory = gtk::SignalListItemFactory::new();
+        factory.connect_setup(|_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+            item.set_child(Some(
+                &gtk::Label::builder()
+                    .xalign(0.)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .max_width_chars(30)
+                    .build(),
+            ));
+        });
+        factory.connect_bind(|_, item| {
+            let item = item.downcast_ref::<gtk::ListItem>().unwrap();
+            let label = item.child().and_downcast::<gtk::Label>().unwrap();
+            let value = item.item().and_downcast::<gtk::StringObject>().unwrap();
+            label.set_label(&value.string());
+        });
+        categories.set_factory(Some(&factory));
+        navigation.append(&categories);
+        let search = gtk::SearchEntry::builder()
+            .placeholder_text("Search every category by setting or native key…")
+            .build();
+        navigation.append(&search);
         let mut sections = Vec::new();
         for (title, description, switches, entries) in [
             (
@@ -75,13 +108,10 @@ impl Controls {
                 "fps_limit|FPS limits (0 means unlimited);fps_limit_method|FPS limiter method (early/late);vulkan_present_mode|Vulkan present mode;vsync|Vulkan VSync (-1 default, 0–3);gl_vsync|OpenGL VSync (-2 default);picmip|Mip-map LOD bias (-16…16);af|Anisotropic filtering (0…16);gl_size_query|OpenGL size query (viewport/scissorbox);blacklist|Excluded executable names;fcat_overlay_width|FCAT width;fcat_screen_edge|FCAT edge (0…3)",
             ),
         ] {
+            category_names.append(title);
             let group = adw::PreferencesGroup::builder()
                 .title(title)
                 .description(description)
-                .build();
-            let expander = adw::ExpanderRow::builder()
-                .title(title)
-                .expanded(title.starts_with("FPS,"))
                 .build();
             let mut section_rows: Vec<(String, gtk::Widget)> = Vec::new();
             for item in switches.split(';').filter(|v| !v.is_empty()) {
@@ -103,7 +133,7 @@ impl Controls {
                         )
                     }
                 });
-                expander.add_row(&row);
+                group.add(&row);
                 section_rows.push((
                     format!("{title} {key}").to_lowercase(),
                     row.clone().upcast(),
@@ -120,7 +150,7 @@ impl Controls {
                     let syncing = syncing.clone();
                     move |row| update(&editor, &syncing, key, &row.text())
                 });
-                expander.add_row(&row);
+                group.add(&row);
                 section_rows.push((
                     format!("{title} {key}").to_lowercase(),
                     row.clone().upcast(),
@@ -152,7 +182,7 @@ impl Controls {
                         }
                     }
                 });
-                expander.add_row(&row);
+                group.add(&row);
                 section_rows.push(("position".into(), row.clone().upcast()));
                 rows.push(("position", Input::Choice(row, options)));
                 for (key, title, min, max, step, default, digits) in [
@@ -212,7 +242,7 @@ impl Controls {
                     ),
                 ] {
                     add_number(
-                        &expander,
+                        &group,
                         &mut rows,
                         &mut section_rows,
                         editor,
@@ -239,7 +269,7 @@ impl Controls {
                     ("log_interval", "Log interval (milliseconds)", 0.),
                 ] {
                     add_number(
-                        &expander,
+                        &group,
                         &mut rows,
                         &mut section_rows,
                         editor,
@@ -254,12 +284,11 @@ impl Controls {
                     );
                 }
             }
-            group.add(&expander);
             content.append(&group);
-            sections.push((group, expander, section_rows));
+            sections.push((group, section_rows));
         }
         let colors = adw::PreferencesGroup::builder().title("Colors").description("RGB hexadecimal colors. The picker updates the same native option as the text field.").build();
-        let expander = adw::ExpanderRow::builder().title("Colors").build();
+        category_names.append("Colors");
         let mut color_rows = Vec::new();
         for (key, title, default) in [
             ("text_color", "Text", "FFFFFF"),
@@ -313,28 +342,57 @@ impl Controls {
                     );
                 }
             });
-            expander.add_row(&row);
+            colors.add(&row);
             color_rows.push((
                 format!("{title} {key}").to_lowercase(),
                 row.clone().upcast(),
             ));
             rows.push((key, Input::Color(row, picker, default)));
         }
-        colors.add(&expander);
         content.append(&colors);
-        sections.push((colors, expander, color_rows));
-        search.connect_search_changed(move |search| {
-            let query = search.text().to_lowercase();
-            for (group, expander, rows) in &sections {
-                let mut visible = false;
-                for (keywords, row) in rows {
-                    let matches = keywords.contains(&query);
-                    row.set_visible(matches);
-                    visible |= matches;
+        sections.push((colors, color_rows));
+        let empty = gtk::Label::builder()
+            .label("No native settings match this search. Version-specific options remain available in the Editor tab.")
+            .wrap(true)
+            .visible(false)
+            .build();
+        empty.add_css_class("dim-label");
+        content.append(&empty);
+        let sections = Rc::new(sections);
+        categories.set_selected(1);
+        filter_sections(&sections, 1, "", &empty);
+        search.connect_search_changed({
+            let categories = categories.downgrade();
+            let sections = sections.clone();
+            let empty = empty.clone();
+            let scroller = scroller.downgrade();
+            move |search| {
+                let Some(categories) = categories.upgrade() else {
+                    return;
+                };
+                if !search.text().is_empty() && categories.selected() != 0 {
+                    categories.set_selected(0);
+                    return;
                 }
-                group.set_visible(visible);
-                if !query.is_empty() {
-                    expander.set_expanded(visible);
+                filter_sections(&sections, categories.selected(), &search.text(), &empty);
+                if let Some(scroller) = scroller.upgrade() {
+                    scroller.vadjustment().set_value(0.);
+                }
+            }
+        });
+        categories.connect_selected_notify({
+            let search = search.downgrade();
+            let scroller = scroller.downgrade();
+            move |categories| {
+                let Some(search) = search.upgrade() else {
+                    return;
+                };
+                if categories.selected() != 0 {
+                    search.set_text("");
+                }
+                filter_sections(&sections, categories.selected(), &search.text(), &empty);
+                if let Some(scroller) = scroller.upgrade() {
+                    scroller.vadjustment().set_value(0.);
                 }
             }
         });
@@ -384,6 +442,23 @@ impl Controls {
         }
         self.syncing.set(false);
     }
+}
+
+fn filter_sections(sections: &[Section], category: u32, query: &str, empty: &gtk::Label) {
+    let query = query.trim().to_lowercase();
+    let mut any = false;
+    for (index, (group, rows)) in sections.iter().enumerate() {
+        let selected = category == 0 || category as usize == index + 1;
+        let mut visible = false;
+        for (keywords, row) in rows {
+            let matches = selected && keywords.contains(&query);
+            row.set_visible(matches);
+            visible |= matches;
+        }
+        group.set_visible(visible);
+        any |= visible;
+    }
+    empty.set_visible(!any);
 }
 
 fn update(editor: &gtk::TextBuffer, syncing: &Cell<bool>, key: &str, value: &str) {
@@ -437,7 +512,7 @@ fn add_reset(
 
 #[allow(clippy::too_many_arguments)]
 fn add_number(
-    expander: &adw::ExpanderRow,
+    group: &adw::PreferencesGroup,
     rows: &mut Vec<(&'static str, Input)>,
     section_rows: &mut Vec<(String, gtk::Widget)>,
     editor: &gtk::TextBuffer,
@@ -460,7 +535,7 @@ fn add_number(
         let syncing = syncing.clone();
         move |row| update(&editor, &syncing, key, &row.value().to_string())
     });
-    expander.add_row(&row);
+    group.add(&row);
     section_rows.push((
         format!("{title} {key}").to_lowercase(),
         row.clone().upcast(),

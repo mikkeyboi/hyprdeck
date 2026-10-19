@@ -22,7 +22,7 @@ jobs:
     steps:
       - name: Install toolchain and libraries
         run: |
-          pacman -Syu --noconfirm --needed base-devel git rust gtk4 libadwaita dbus hyprland
+          pacman -Syu --noconfirm --needed base-devel git rust python gtk4 libadwaita dbus hyprland
       - uses: actions/checkout@v7
       - uses: actions/cache@v6
         with:
