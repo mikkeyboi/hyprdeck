@@ -94,7 +94,12 @@ struct Shell {
     installed: RefCell<Vec<hd_plugins::PluginPage>>,
 }
 
-fn navigation_row(title: &str, icon: &str, nested: bool, disabled: bool) -> gtk::ListBoxRow {
+fn navigation_row(
+    title: &str,
+    icon: &str,
+    nested: bool,
+    disabled: Option<bool>,
+) -> gtk::ListBoxRow {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     content.set_margin_top(6);
     content.set_margin_bottom(6);
@@ -108,7 +113,7 @@ fn navigation_row(title: &str, icon: &str, nested: bool, disabled: bool) -> gtk:
             .hexpand(true)
             .build(),
     );
-    if nested {
+    if let Some(disabled) = disabled {
         let state = gtk::Label::new(Some(if disabled { "Disabled" } else { "Enabled" }));
         state.add_css_class("caption");
         state.add_css_class("dim-label");
@@ -164,7 +169,7 @@ impl Shell {
             navigation_heading(&sidebar, heading);
             for id in ids {
                 if let Some(page) = pages.iter().find(|page| page.id == *id) {
-                    let row = navigation_row(page.title, page.icon, false, false);
+                    let row = navigation_row(page.title, page.icon, false, None);
                     sidebar.append(&row);
                     rows.push(NavigationRow {
                         id: page.id.into(),
@@ -172,11 +177,26 @@ impl Shell {
                         target: NavigationTarget::Builtin(*page),
                         row,
                     });
+                    if page.id == "gamescope" {
+                        for child in pages
+                            .iter()
+                            .filter(|candidate| candidate.id.starts_with("gamescope-"))
+                        {
+                            let row = navigation_row(child.title, child.icon, true, None);
+                            sidebar.append(&row);
+                            rows.push(NavigationRow {
+                                id: child.id.into(),
+                                title: format!("Gaming · {}", child.title),
+                                target: NavigationTarget::Builtin(*child),
+                                row,
+                            });
+                        }
+                    }
                 }
             }
         }
         if let Some(page) = pages.iter().find(|page| page.id == "plugins") {
-            let row = navigation_row(page.title, page.icon, false, false);
+            let row = navigation_row(page.title, page.icon, false, None);
             row.set_margin_top(12);
             sidebar.append(&row);
             rows.push(NavigationRow {
@@ -331,7 +351,7 @@ impl Shell {
                     &page.name,
                     "application-x-addon-symbolic",
                     true,
-                    !page.enabled,
+                    Some(!page.enabled),
                 );
                 self.sidebar.append(&row);
                 rows.push(NavigationRow {

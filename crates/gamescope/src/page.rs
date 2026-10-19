@@ -452,25 +452,10 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     });
     page.set_settings(&Settings::default());
     page.connect_controls();
-    overlay_row.connect_activated({
-        let weak = Rc::downgrade(&page);
-        move |_| {
-            let Some(page) = weak.upgrade() else {
-                return;
-            };
-            let Some(ctx) = page.context() else {
-                return;
-            };
-            let dialog = crate::overlay_page::present(&ctx);
-            dialog.connect_closed({
-                let weak = weak.clone();
-                move |_| {
-                    if let Some(page) = weak.upgrade() {
-                        page.request_plan();
-                    }
-                }
-            });
-        }
+    overlay_row.connect_activated(|_| {
+        hyprdeck_core::events::send(hyprdeck_core::events::AppEvent::ShowPage(
+            "gamescope-overlay".to_owned(),
+        ));
     });
     page.refresh.connect_clicked({
         let page = Rc::downgrade(&page);

@@ -7,18 +7,37 @@ mod overlay_controls;
 mod overlay_page;
 mod overlay_preview;
 mod page;
+pub mod proton;
+mod proton_page;
+pub mod proton_repair;
+pub mod recovery;
 pub mod startup;
+pub mod steam;
 
 use anyhow::{Result, anyhow};
 use hyprdeck_core::ui::PageInfo;
 
 pub fn pages() -> Vec<PageInfo> {
-    vec![PageInfo {
-        id: "gamescope",
-        title: "Gaming",
-        icon: "input-gaming-symbolic",
-        build: page::build,
-    }]
+    vec![
+        PageInfo {
+            id: "gamescope",
+            title: "Gaming",
+            icon: "input-gaming-symbolic",
+            build: page::build,
+        },
+        PageInfo {
+            id: "gamescope-overlay",
+            title: "Performance overlay",
+            icon: "utilities-system-monitor-symbolic",
+            build: overlay_page::build,
+        },
+        PageInfo {
+            id: "gamescope-proton",
+            title: "Compatibility tools",
+            icon: "package-x-generic-symbolic",
+            build: proton_page::build,
+        },
+    ]
 }
 
 /// If "Launch Steam Big Picture at login" is enabled, ensure the login entry uses
