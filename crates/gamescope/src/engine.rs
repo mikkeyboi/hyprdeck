@@ -767,7 +767,10 @@ fn start_service(plan: &Plan) -> Result<()> {
     ];
     // Preserve the caller's graphical/GPU environment, not the manager's stale
     // login environment. Do not inherit another service's notification/fd state.
-    for (key, _) in std::env::vars_os() {
+    let appdir = std::env::var("APPDIR")
+        .ok()
+        .filter(|_| std::env::var_os("APPIMAGE").is_some());
+    for (key, value) in std::env::vars_os() {
         let Some(key) = key.to_str() else {
             continue;
         };
@@ -790,7 +793,11 @@ fn start_service(plan: &Plan) -> Result<()> {
         {
             continue;
         }
-        args.push(format!("--setenv={key}"));
+        match appimage_inherit(key, value.to_str(), appdir.as_deref()) {
+            Inherit::Keep => args.push(format!("--setenv={key}")),
+            Inherit::Set(value) => args.push(format!("--setenv={key}={value}")),
+            Inherit::Skip => {}
+        }
     }
     for (key, value) in &plan.environment {
         args.push(format!("--setenv={key}={value}"));
@@ -803,6 +810,51 @@ fn start_service(plan: &Plan) -> Result<()> {
         "Starting the managed Gamescope service; ensure your systemd user manager is running",
     )?;
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Inherit {
+    Keep,
+    Set(String),
+    Skip,
+}
+
+/// An AppImage's runtime variables and mount point describe Hyprdeck's own
+/// bundle, not the Steam session: the mount disappears when Hyprdeck exits,
+/// and Steam, Proton and games inherit everything Gamescope receives.
+fn appimage_inherit(key: &str, value: Option<&str>, appdir: Option<&str>) -> Inherit {
+    let Some(appdir) = appdir
+        .map(|dir| dir.trim_end_matches('/'))
+        .filter(|dir| !dir.is_empty())
+    else {
+        return Inherit::Keep;
+    };
+    if matches!(
+        key,
+        "APPDIR" | "APPIMAGE" | "ARGV0" | "OWD" | "APPIMAGE_EXTRACT_AND_RUN"
+    ) {
+        return Inherit::Skip;
+    }
+    let Some(value) = value else {
+        return Inherit::Keep;
+    };
+    if !value.contains(appdir) {
+        return Inherit::Keep;
+    }
+    let inside = |entry: &str| entry == appdir || entry.starts_with(&format!("{appdir}/"));
+    if !value.contains(':') {
+        return if inside(value) {
+            Inherit::Skip
+        } else {
+            Inherit::Keep
+        };
+    }
+    let kept: Vec<&str> = value.split(':').filter(|entry| !inside(entry)).collect();
+    if kept.iter().all(|entry| entry.is_empty()) {
+        Inherit::Skip
+    } else {
+        Inherit::Set(kept.join(":"))
+    }
 }
 
 fn window_mode_matches(client: &Client, mode: WindowMode) -> bool {
@@ -1300,6 +1352,49 @@ mod tests {
         assert!(plan(&settings, &detected()).is_ok());
         settings.hide_cursor_delay += 1;
         assert!(plan(&settings, &detected()).is_err());
+    }
+
+    #[test]
+    fn appimage_bundle_environment_is_not_inherited_by_the_session() {
+        let dir = Some("/tmp/.mount_hyprdeABC");
+        assert_eq!(
+            appimage_inherit("APPDIR", Some("/tmp/.mount_hyprdeABC"), dir),
+            Inherit::Skip
+        );
+        assert_eq!(
+            appimage_inherit("ARGV0", Some("hyprdeck"), dir),
+            Inherit::Skip
+        );
+        assert_eq!(
+            appimage_inherit(
+                "XDG_DATA_DIRS",
+                Some("/tmp/.mount_hyprdeABC/usr/share:/usr/local/share:/usr/share"),
+                dir
+            ),
+            Inherit::Set("/usr/local/share:/usr/share".into())
+        );
+        assert_eq!(
+            appimage_inherit(
+                "GSETTINGS_SCHEMA_DIR",
+                Some("/tmp/.mount_hyprdeABC/usr/share/glib-2.0/schemas"),
+                dir
+            ),
+            Inherit::Skip
+        );
+        assert_eq!(
+            appimage_inherit("PATH", Some("/usr/bin"), dir),
+            Inherit::Keep
+        );
+        // A sibling mount with the same prefix is not the bundle.
+        assert_eq!(
+            appimage_inherit("X", Some("/tmp/.mount_hyprdeABCD/bin"), dir),
+            Inherit::Keep
+        );
+        // Outside an AppImage nothing is filtered.
+        assert_eq!(
+            appimage_inherit("ARGV0", Some("hyprdeck"), None),
+            Inherit::Keep
+        );
     }
 
     #[test]
