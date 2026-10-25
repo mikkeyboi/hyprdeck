@@ -53,7 +53,7 @@ app = os.environ.get("SteamAppId") or os.environ.get("SteamGameId") or ""
 games = os.path.join(here, "hyprdeck-games")
 profile = os.path.join(games, app + ".json")
 if not app or not os.path.isfile(profile):
-    profile = os.path.join(games, "default.json")
+    profile = os.path.join(games, "defaults.json")
 try:
     with open(profile) as f:
         for key, value in json.load(f).get("env", {}).items():
@@ -203,7 +203,7 @@ struct GameEnv<'a> {
     unsupported: &'a [&'static str],
 }
 
-/// Writes `default.json` from the global defaults and `<appid>.json` for each game with
+/// Writes `defaults.json` from the global defaults and `<appid>.json` for each game with
 /// overrides, already merged, so the launcher reads exactly one file.
 fn write_profiles(variant: &Path, family: Family, profiles: &Profiles) -> Result<()> {
     let games = variant.join(GAMES);
@@ -212,7 +212,7 @@ fn write_profiles(variant: &Path, family: Family, profiles: &Profiles) -> Result
         fs::remove_dir_all(&staging)?;
     }
     fs::create_dir(&staging)?;
-    let files = std::iter::once(("default".to_owned(), profiles.global.clone())).chain(
+    let files = std::iter::once(("defaults".to_owned(), profiles.global.clone())).chain(
         profiles
             .games
             .keys()
@@ -453,7 +453,7 @@ mod tests {
         assert!(env.contains("DXVK_HDR"));
         sync_profiles(tools.path(), &Profiles::default()).unwrap();
         assert!(!variant.join("hyprdeck-games/1091500.json").exists());
-        assert!(variant.join("hyprdeck-games/default.json").exists());
+        assert!(variant.join("hyprdeck-games/defaults.json").exists());
         assert_eq!(list(tools.path()).unwrap().len(), 1);
         assert!(remove(&source).is_err());
         assert!(source.join("proton").exists());

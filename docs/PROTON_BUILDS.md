@@ -84,7 +84,7 @@ Hyprdeck builds. Settings a runner does not support are shown as unavailable rat
 Hyprdeck creates a *variant* of a runner: a folder in `compatibilitytools.d` that hardlinks every file of the
 runner (falling back to reflinks or copies across filesystems) and replaces only the `proton` entry point with
 a small launcher. The original script stays in the variant as a hardlink named `proton.upstream`. Hyprdeck
-writes each variant a `hyprdeck-games/default.json` (the defaults) and an `<appid>.json` per game with
+writes each variant a `hyprdeck-games/defaults.json` (the defaults) and an `<appid>.json` per game with
 overrides, already merged and translated for that runner. The launcher reads the game's file, or the
 defaults when there is none, sets its variables and execs `proton.upstream`. Proton locates its files
 from the directory of the script it was started as, so the run uses the variant's files. Swapped DLL sets, such as the low-latency DXVK fork, also live in the variant, so the

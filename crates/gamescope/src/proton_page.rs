@@ -566,27 +566,51 @@ impl Page {
                         let index = selected
                             .and_then(|id| data.targets.iter().position(|t| t.id == id))
                             .unwrap_or(0);
-                        let message = if data.warnings.is_empty() {
-                            format!(
-                                "{} launcher targets · {} custom runners · {} Steam-managed tools · {} installed Steam apps. Changes require an explicit preview and approval.",
-                                data.targets.len(),
-                                data.tools.len(),
-                                data.steam.steam_tools.len(),
-                                data.steam.games.len()
+                        let (message, games) = if data.warnings.is_empty() {
+                            let variants = data
+                                .tools
+                                .iter()
+                                .filter(|e| matches!(e.origin, variants::Origin::Variant(_)))
+                                .count();
+                            (
+                                format!(
+                                    "{} · {} · {}. Installing, removing and reassigning always ask first.",
+                                    count(data.targets.len(), "launcher", "launchers"),
+                                    count(data.tools.len(), "custom runner", "custom runners"),
+                                    count(
+                                        data.steam.steam_tools.len(),
+                                        "Steam-managed tool",
+                                        "Steam-managed tools"
+                                    ),
+                                ),
+                                format!(
+                                    "{} · {} · {}",
+                                    count(data.steam.games.len(), "Steam game", "Steam games"),
+                                    count(variants, "Hyprdeck runner", "Hyprdeck runners"),
+                                    count(
+                                        data.profiles.games.len(),
+                                        "game with overrides",
+                                        "games with overrides"
+                                    ),
+                                ),
                             )
                         } else {
-                            format!("Partial inventory: {}", data.warnings.join("\n"))
+                            let partial =
+                                format!("Partial inventory: {}", data.warnings.join("\n"));
+                            (partial.clone(), partial)
                         };
                         page.syncing.set(true);
                         *page.inventory.borrow_mut() = Some(data);
                         page.target.set_model(Some(&model));
                         page.target.set_selected(index as u32);
                         page.syncing.set(false);
-                        if let Some(notice) = page.notice.borrow_mut().take() {
-                            page.say(&format!("{notice}\n{message}"));
-                        } else {
-                            page.say(&message);
-                        }
+                        let notice = page
+                            .notice
+                            .borrow_mut()
+                            .take()
+                            .map_or(String::new(), |notice| format!("{notice}\n"));
+                        page.status.set_label(&format!("{notice}{message}"));
+                        page.games_status.set_label(&format!("{notice}{games}"));
                         page.render_inventory();
                     }
                     Err(e) => page.say(&format!("Could not read compatibility tools: {e:#}")),
@@ -1987,6 +2011,9 @@ fn same_root(steam_root: &std::path::Path, target: &Target) -> bool {
 }
 pub(crate) fn same_steam_target(game: &Game, target: &Target) -> bool {
     target.kind == TargetKind::Steam && same_root(&game.steam_root, target)
+}
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 fn format_size(bytes: u64) -> String {
     if bytes == 0 {
