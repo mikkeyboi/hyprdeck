@@ -92,7 +92,7 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
 
     let runners = adw::PreferencesGroup::builder()
         .title("Runner variants")
-        .description("Create a variant once per runner, then pick “<runner> (Hyprdeck)” for a game under Compatibility tools or in Steam.")
+        .description("Create a variant once per runner, then pick “&lt;runner&gt; (Hyprdeck)” for a game under Compatibility tools or in Steam.")
         .build();
     content.append(&runners);
 
