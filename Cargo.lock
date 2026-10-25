@@ -917,6 +917,7 @@ dependencies = [
  "bitflags",
  "flate2",
  "gtk4",
+ "hd-protonbuild",
  "hd-startup",
  "hd-updates",
  "hyprdeck-core",

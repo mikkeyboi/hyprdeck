@@ -819,6 +819,30 @@ fn self_exe() -> Result<PathBuf> {
         .context("locating the hyprdeck executable")
 }
 
+/// Installs host tools another Hyprdeck feature needs (see [`crate::helper::INSTALLABLE_TOOLS`])
+/// with one password prompt. Output lines go to `line`; the error is user-facing.
+pub fn install_tools(
+    names: &[String],
+    cancel: &AtomicBool,
+    line: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let mut helper = RealSystem
+        .start_helper(cancel)
+        .map_err(|e| e.explanation())?;
+    let result = helper.request(
+        &Request::InstallTools {
+            names: names.to_vec(),
+        },
+        line,
+    );
+    helper.close();
+    match result {
+        Ok(0) => Ok(()),
+        Ok(status) => Err(format!("pacman exited with status {status}")),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
 pub struct RealSystem;
 
 impl System for RealSystem {

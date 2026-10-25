@@ -264,6 +264,52 @@ impl GameProfile {
         out
     }
 
+    fn flag_mut(&mut self, key: &str) -> Option<&mut bool> {
+        Some(match key {
+            "hdr" => &mut self.hdr,
+            "wayland" => &mut self.wayland,
+            "dlss_upgrade" => &mut self.dlss_upgrade,
+            "dlss_indicator" => &mut self.dlss_indicator,
+            "fsr4_upgrade" => &mut self.fsr4_upgrade,
+            "xess_upgrade" => &mut self.xess_upgrade,
+            "vulkan_reflex" => &mut self.vulkan_reflex,
+            "low_latency_layer" => &mut self.low_latency_layer,
+            "low_latency_dxvk" => &mut self.low_latency_dxvk,
+            "low_latency_vkd3d" => &mut self.low_latency_vkd3d,
+            "local_shader_cache" => &mut self.local_shader_cache,
+            "disable_ntsync" => &mut self.disable_ntsync,
+            "proton_log" => &mut self.proton_log,
+            _ => return None,
+        })
+    }
+
+    /// The on/off value of a [`SETTINGS`] key; `None` for numeric settings.
+    pub fn flag(&self, key: &str) -> Option<bool> {
+        self.clone().flag_mut(key).map(|v| *v)
+    }
+
+    /// Sets an on/off [`SETTINGS`] key; returns false for unknown or numeric keys.
+    pub fn set_flag(&mut self, key: &str, on: bool) -> bool {
+        match self.flag_mut(key) {
+            Some(value) => {
+                *value = on;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `family` can honor `key`, judged by turning on only that setting.
+    pub fn supported(key: &str, family: Family) -> bool {
+        let mut probe = Self::default();
+        if key == "frame_rate_limit" {
+            probe.frame_rate_limit = 60;
+        } else if !probe.set_flag(key, true) {
+            return false;
+        }
+        probe.resolve(family).unsupported.is_empty()
+    }
+
     pub fn is_empty(&self) -> bool {
         self == &Self::default()
     }
@@ -382,6 +428,23 @@ mod tests {
         let mut keys = keys;
         keys.sort();
         assert_eq!(keys, settings);
+    }
+
+    #[test]
+    fn flags_are_addressable_by_setting_key() {
+        let mut profile = GameProfile::default();
+        for setting in SETTINGS {
+            if setting.key == "frame_rate_limit" {
+                assert_eq!(profile.flag(setting.key), None);
+                continue;
+            }
+            assert!(profile.set_flag(setting.key, true), "{}", setting.key);
+            assert_eq!(profile.flag(setting.key), Some(true));
+        }
+        assert!(!profile.set_flag("nope", true));
+        assert!(GameProfile::supported("frame_rate_limit", Family::Valve));
+        assert!(!GameProfile::supported("low_latency_dxvk", Family::Ge));
+        assert!(GameProfile::supported("low_latency_dxvk", Family::CachyOs));
     }
 
     #[test]

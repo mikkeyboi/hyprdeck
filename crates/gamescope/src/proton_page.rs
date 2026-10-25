@@ -2012,7 +2012,7 @@ fn same_root(steam_root: &std::path::Path, target: &Target) -> bool {
         .as_deref()
         .is_some_and(|root| root == steam_root)
 }
-fn same_steam_target(game: &Game, target: &Target) -> bool {
+pub(crate) fn same_steam_target(game: &Game, target: &Target) -> bool {
     target.kind == TargetKind::Steam && same_root(&game.steam_root, target)
 }
 fn format_size(bytes: u64) -> String {

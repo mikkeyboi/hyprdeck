@@ -379,6 +379,49 @@ fn run_command(
     Ok(())
 }
 
+pub const BUILD_RECEIPT: &str = ".hyprdeck-build.json";
+
+/// Copies a finished build into `tools_dir`, replacing an earlier Hyprdeck build of the
+/// same name but never a folder Hyprdeck did not install.
+pub fn install(plan: &Plan, tools_dir: &Path) -> Result<PathBuf> {
+    let output = plan.output();
+    ensure!(
+        output.join("proton").is_file() && output.join("compatibilitytool.vdf").is_file(),
+        "No finished build at {}",
+        output.display()
+    );
+    let name = plan.recipe.build_name();
+    let target = tools_dir.join(&name);
+    if target.exists() {
+        ensure!(
+            target.join(BUILD_RECEIPT).is_file(),
+            "{} exists and was not installed by Hyprdeck",
+            target.display()
+        );
+    }
+    std::fs::create_dir_all(tools_dir)?;
+    let staging = tools_dir.join(format!(".{name}.staging"));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    let status = Command::new("cp")
+        .args(["-a", "--reflink=auto"])
+        .arg(&output)
+        .arg(&staging)
+        .status()
+        .context("Starting cp")?;
+    ensure!(status.success(), "Copying the build failed ({status})");
+    std::fs::write(
+        staging.join(BUILD_RECEIPT),
+        serde_json::to_string_pretty(&plan.recipe)? + "\n",
+    )?;
+    if target.exists() {
+        std::fs::remove_dir_all(&target)?;
+    }
+    std::fs::rename(&staging, &target)?;
+    Ok(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +511,25 @@ mod tests {
         .unwrap();
         assert_eq!(lines.first().unwrap(), "==> flaky");
         assert!(lines.contains(&"first".to_owned()) && lines.contains(&"second".to_owned()));
+    }
+
+    #[test]
+    fn install_copies_output_and_refuses_foreign_folders() {
+        let work = tempfile::tempdir().unwrap();
+        let tools = work.path().join("compatibilitytools.d");
+        let recipe = Recipe::new("GE-Proton11-1", FlagProfile::O3);
+        let plan = plan(&recipe, work.path(), 4);
+        let output = plan.output();
+        std::fs::create_dir_all(output.join("files")).unwrap();
+        std::fs::write(output.join("proton"), "script").unwrap();
+        std::fs::write(output.join("compatibilitytool.vdf"), "vdf").unwrap();
+        let installed = install(&plan, &tools).unwrap();
+        assert_eq!(installed, tools.join("hyprdeck-ge-proton11-1-o3"));
+        assert!(installed.join(BUILD_RECEIPT).is_file());
+        // Reinstalling replaces Hyprdeck's own build.
+        install(&plan, &tools).unwrap();
+        std::fs::remove_file(installed.join(BUILD_RECEIPT)).unwrap();
+        assert!(install(&plan, &tools).is_err());
     }
 
     #[test]
