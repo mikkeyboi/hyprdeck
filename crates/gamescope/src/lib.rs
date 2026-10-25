@@ -1,5 +1,6 @@
 //! Nested Gamescope launcher for Steam Big Picture, with display-derived settings.
 
+mod builder_page;
 pub mod config;
 pub mod engine;
 pub mod overlay;
@@ -7,6 +8,7 @@ mod overlay_controls;
 mod overlay_page;
 mod overlay_preview;
 mod page;
+mod profiles_page;
 pub mod proton;
 pub mod proton_cpu;
 mod proton_page;
@@ -39,6 +41,18 @@ pub fn pages() -> Vec<PageInfo> {
             title: "Compatibility tools",
             icon: "package-x-generic-symbolic",
             build: proton_page::build,
+        },
+        PageInfo {
+            id: "gamescope-profiles",
+            title: "Game settings",
+            icon: "preferences-system-symbolic",
+            build: profiles_page::build,
+        },
+        PageInfo {
+            id: "gamescope-builder",
+            title: "Proton builder",
+            icon: "applications-engineering-symbolic",
+            build: builder_page::build,
         },
     ]
 }

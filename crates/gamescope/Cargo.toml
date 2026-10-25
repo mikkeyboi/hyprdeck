@@ -9,6 +9,7 @@ publish.workspace = true
 hyprdeck-core.workspace = true
 hd-startup.workspace = true
 hd-updates.workspace = true
+hd-protonbuild.workspace = true
 adw.workspace = true
 gtk.workspace = true
 anyhow.workspace = true

@@ -48,6 +48,9 @@ pub fn start_background() {
     state::start();
 }
 
+pub use apply::install_tools;
+pub use helper::INSTALLABLE_TOOLS;
+
 pub fn cli(args: &[String]) -> Option<Result<()>> {
     if args.first().map(String::as_str) != Some("updates") {
         return None;

@@ -917,6 +917,7 @@ dependencies = [
  "bitflags",
  "flate2",
  "gtk4",
+ "hd-protonbuild",
  "hd-startup",
  "hd-updates",
  "hyprdeck-core",
@@ -966,6 +967,17 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "hd-protonbuild"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

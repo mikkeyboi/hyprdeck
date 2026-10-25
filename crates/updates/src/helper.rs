@@ -24,6 +24,10 @@ pub enum Request {
     InstallDeps {
         names: Vec<String>,
     },
+    /// `pacman -S --needed` of tools other Hyprdeck features need, from a fixed allowlist.
+    InstallTools {
+        names: Vec<String>,
+    },
     /// `pacman -U` of packages built by the user in the AUR cache.
     InstallBuilt {
         files: Vec<String>,
@@ -49,6 +53,8 @@ const PACMAN: &str = "/usr/bin/pacman";
 const STDBUF: &str = "/usr/bin/stdbuf";
 const COMMON: [&str; 4] = ["--noconfirm", "--noprogressbar", "--color", "never"];
 const PACKAGE_SUFFIXES: [&str; 2] = [".pkg.tar.zst", ".pkg.tar.xz"];
+/// Packages [`Request::InstallTools`] may install explicitly (the Proton builder's host tools).
+pub const INSTALLABLE_TOOLS: [&str; 5] = ["podman", "docker", "git", "make", "rsync"];
 
 /// The validated session parameters.
 #[derive(Debug, Clone)]
@@ -214,6 +220,19 @@ fn prepare(request: &Request, session: &Session, exec: &dyn Exec) -> Result<Prep
                 .map_err(|e| anyhow!("not installable from the repositories: {e}"))?;
             Prepared {
                 args: with(&["-S", "--needed", "--asdeps"], names),
+                _staged: None,
+            }
+        }
+        Request::InstallTools { names } => {
+            validate_names(names)?;
+            if let Some(other) = names
+                .iter()
+                .find(|n| !INSTALLABLE_TOOLS.contains(&n.as_str()))
+            {
+                bail!("{other:?} is not an installable tool");
+            }
+            Prepared {
+                args: with(&["-S", "--needed"], names),
                 _staged: None,
             }
         }
@@ -698,6 +717,41 @@ mod tests {
         assert_eq!(*exec.staged.borrow(), ["built package"]);
         // Staged copies are removed after the transaction.
         assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn installs_only_allowlisted_tools_explicitly() {
+        let t = TempDir::new("tools");
+        let session = Session {
+            uid: uid(),
+            cache: t.0.clone(),
+            staging: t.0.clone(),
+        };
+        let exec = FakePacman::new();
+        let input = [
+            r#"{"op":"InstallTools","names":["podman","rsync"]}"#,
+            r#"{"op":"InstallTools","names":["cmake"]}"#,
+            r#"{"op":"InstallTools","names":["--overwrite=*"]}"#,
+            r#"{"op":"Exit"}"#,
+        ]
+        .join("\n");
+        let events = run(&session, &exec, &input);
+        let rejected: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Rejected { error } => Some(error.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rejected.len(), 2, "{rejected:?}");
+        assert!(rejected[0].contains("not an installable tool"));
+        assert!(rejected[1].contains("invalid package name"));
+        let calls = exec.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].join(" "),
+            "-S --needed --noconfirm --noprogressbar --color never -- podman rsync"
+        );
     }
 
     #[test]
