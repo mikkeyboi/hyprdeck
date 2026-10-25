@@ -767,7 +767,8 @@ fn start_service(plan: &Plan) -> Result<()> {
     ];
     // Preserve the caller's graphical/GPU environment, not the manager's stale
     // login environment. Do not inherit another service's notification/fd state.
-    for (key, _) in std::env::vars_os() {
+    let appdir = std::env::var("APPDIR").ok().filter(|dir| !dir.is_empty());
+    for (key, value) in std::env::vars_os() {
         let Some(key) = key.to_str() else {
             continue;
         };
@@ -790,7 +791,11 @@ fn start_service(plan: &Plan) -> Result<()> {
         {
             continue;
         }
-        args.push(format!("--setenv={key}"));
+        match appimage_variable(key, value.to_str(), appdir.as_deref()) {
+            AppImageVariable::Inherit => args.push(format!("--setenv={key}")),
+            AppImageVariable::Drop => {}
+            AppImageVariable::Replace(value) => args.push(format!("--setenv={key}={value}")),
+        }
     }
     for (key, value) in &plan.environment {
         args.push(format!("--setenv={key}={value}"));
@@ -803,6 +808,39 @@ fn start_service(plan: &Plan) -> Result<()> {
         "Starting the managed Gamescope service; ensure your systemd user manager is running",
     )?;
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AppImageVariable {
+    Inherit,
+    Drop,
+    Replace(String),
+}
+
+/// Hyprdeck's AppImage runtime exports its mount and prepends it to search paths.
+/// Steam and games must not see that private, transient mount.
+fn appimage_variable(key: &str, value: Option<&str>, appdir: Option<&str>) -> AppImageVariable {
+    let Some(appdir) = appdir else {
+        return AppImageVariable::Inherit;
+    };
+    if matches!(key, "APPDIR" | "APPIMAGE" | "ARGV0" | "OWD") || key.starts_with("APPIMAGE_") {
+        return AppImageVariable::Drop;
+    }
+    let Some(value) = value.filter(|value| value.contains(appdir)) else {
+        return AppImageVariable::Inherit;
+    };
+    let inside = |entry: &str| {
+        entry == appdir
+            || entry
+                .strip_prefix(appdir)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    let kept: Vec<&str> = value.split(':').filter(|entry| !inside(entry)).collect();
+    if kept.iter().all(|entry| entry.is_empty()) {
+        AppImageVariable::Drop
+    } else {
+        AppImageVariable::Replace(kept.join(":"))
+    }
 }
 
 fn window_mode_matches(client: &Client, mode: WindowMode) -> bool {
@@ -1300,6 +1338,51 @@ mod tests {
         assert!(plan(&settings, &detected()).is_ok());
         settings.hide_cursor_delay += 1;
         assert!(plan(&settings, &detected()).is_err());
+    }
+
+    #[test]
+    fn appimage_runtime_does_not_leak_into_steam() {
+        let dir = Some("/tmp/.mount_hyprdeAbc123");
+        assert_eq!(
+            appimage_variable("APPDIR", Some("/tmp/.mount_hyprdeAbc123"), dir),
+            AppImageVariable::Drop
+        );
+        assert_eq!(
+            appimage_variable("APPIMAGE", Some("/opt/Hyprdeck.AppImage"), dir),
+            AppImageVariable::Drop
+        );
+        assert_eq!(
+            appimage_variable("OWD", Some("/home/user"), dir),
+            AppImageVariable::Drop
+        );
+        assert_eq!(
+            appimage_variable(
+                "XDG_DATA_DIRS",
+                Some("/tmp/.mount_hyprdeAbc123/usr/share:/usr/local/share:/usr/share"),
+                dir
+            ),
+            AppImageVariable::Replace("/usr/local/share:/usr/share".into())
+        );
+        assert_eq!(
+            appimage_variable(
+                "LD_LIBRARY_PATH",
+                Some("/tmp/.mount_hyprdeAbc123/usr/lib"),
+                dir
+            ),
+            AppImageVariable::Drop
+        );
+        assert_eq!(
+            appimage_variable("PATH", Some("/tmp/.mount_hyprdeAbc123x/bin:/usr/bin"), dir),
+            AppImageVariable::Replace("/tmp/.mount_hyprdeAbc123x/bin:/usr/bin".into())
+        );
+        assert_eq!(
+            appimage_variable("HOME", Some("/home/user"), dir),
+            AppImageVariable::Inherit
+        );
+        assert_eq!(
+            appimage_variable("OWD", Some("/home/user"), None),
+            AppImageVariable::Inherit
+        );
     }
 
     #[test]

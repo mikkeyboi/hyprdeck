@@ -19,10 +19,22 @@ const PLANNER: &str = include_str!("proton_repair.py");
 pub const WARNING: &str = "Optional workaround for an exact, recognized upstream prefix-version parser defect. The original runner source is preserved for restoration. Repair changes the runner, not a prefix, saves or game assignments. Correct parsing can enable normal upstream prefix migrations that were previously skipped: back up game prefixes before using the repaired runner. Restoring the runner does not undo migrations already performed. Unknown or edited source is refused; this is not a guaranteed game-launch fix.";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Status {
-    Available { version: String },
-    Applied { version: String },
-    Restored { version: String },
-    NotApplicable { reason: String },
+    Available {
+        version: String,
+    },
+    Applied {
+        version: String,
+    },
+    /// An earlier Hyprdeck repair that misreads markers such as `GE-Proton11-11`.
+    Outdated {
+        version: String,
+    },
+    Restored {
+        version: String,
+    },
+    NotApplicable {
+        reason: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -33,6 +45,9 @@ struct Plan {
     #[serde(default)]
     reason: String,
     patched: Option<String>,
+    /// Earlier repairs of the same original source, still accepted for upgrade/restore.
+    #[serde(default)]
+    legacy: Vec<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Record {
@@ -165,6 +180,11 @@ fn inspect_files(path: &Path) -> Result<Status> {
                 version: planned.version,
             });
         }
+        if planned.legacy.contains(&source) {
+            return Ok(Status::Outdated {
+                version: planned.version,
+            });
+        }
         ensure!(
             source == record.original,
             "Runner changed since repair; automatic restoration is refused"
@@ -226,7 +246,7 @@ fn apply_files(path: &Path) -> Result<Status> {
             });
         }
         ensure!(
-            source == record.original,
+            source == record.original || planned.legacy.contains(&source),
             "Runner changed since repair; it was not modified"
         );
         (planned, record.original_mode)
@@ -289,11 +309,11 @@ fn restore_files(path: &Path) -> Result<Status> {
         .context("No verified repaired parser is recorded")?;
     let (source, _) = read_owned(&path.join("proton"), MAX_SOURCE)?;
     ensure!(
-        source == patched || source == record.original,
+        source == patched || source == record.original || planned.legacy.contains(&source),
         "Runner changed since repair; restoring it automatically would overwrite unknown changes"
     );
     if source != record.original {
-        replace_source(path, &patched, &record.original, record.original_mode)?;
+        replace_source(path, &source, &record.original, record.original_mode)?;
     }
     Ok(Status::Restored {
         version: planned.version,
@@ -349,7 +369,59 @@ mod tests {
             exercise(&changed, "invalid-marker"),
             serde_json::json!("invalid")
         );
+        assert_eq!(
+            exercise(&changed, "GE-Proton11-11"),
+            serde_json::json!([11, 0, 11, 42, 7, "11"])
+        );
         assert_eq!(plan(&changed).unwrap().kind, "fixed");
+    }
+    #[test]
+    fn ge_runners_read_vendor_markers() {
+        let source = SOURCE.replace("'Vendor-42.7-900'", "'GE-Proton11-11'");
+        assert_eq!(
+            exercise(&source, "CachyOS-11.0-100"),
+            serde_json::json!("invalid")
+        );
+        let changed = plan(&source).unwrap().patched.unwrap();
+        assert_eq!(
+            exercise(&changed, "CachyOS-11.0-100"),
+            serde_json::json!([11, 0, 100, 11, 0, "11.0"])
+        );
+    }
+    #[test]
+    fn upgrades_and_restores_earlier_repairs() {
+        let (dir, original) = fixture();
+        let legacy = plan(SOURCE).unwrap().legacy.remove(0);
+        assert_eq!(
+            exercise(&legacy, "GE-Proton11-11"),
+            serde_json::json!("invalid")
+        );
+        let backup = Record {
+            schema: 1,
+            original: original.clone(),
+            original_mode: 0o755,
+        };
+        fs::write(
+            dir.path().join(RECORD),
+            serde_json::to_string(&backup).unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.path().join("proton"), &legacy).unwrap();
+        assert!(matches!(
+            inspect_files(dir.path()).unwrap(),
+            Status::Outdated { .. }
+        ));
+        apply_files(dir.path()).unwrap();
+        assert!(matches!(
+            inspect_files(dir.path()).unwrap(),
+            Status::Applied { .. }
+        ));
+        fs::write(dir.path().join("proton"), &legacy).unwrap();
+        restore_files(dir.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("proton")).unwrap(),
+            original
+        );
     }
     #[test]
     fn keeps_original_and_round_trips_without_touching_prefix_data() {

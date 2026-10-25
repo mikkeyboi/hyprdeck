@@ -1524,6 +1524,11 @@ impl Page {
                         status.set_label(&format!("Repair is applied · prefix format {version}. The original upstream source is preserved in the tool directory."));
                         restore.set_sensitive(true);
                     }
+                    Ok(proton_repair::Status::Outdated { version }) => {
+                        status.set_label(&format!("An earlier repair is applied · prefix format {version}. It cannot read GE-Proton prefix markers; update the repair or restore the original source."));
+                        apply.set_sensitive(true);
+                        restore.set_sensitive(true);
+                    }
                     Ok(proton_repair::Status::Restored { version }) => {
                         status.set_label(&format!("Original upstream parser restored · prefix format {version}. The preserved source remains available."));
                         apply.set_sensitive(true);
