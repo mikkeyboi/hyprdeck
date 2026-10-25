@@ -36,6 +36,7 @@ hd-updates = { path = "crates/updates" }
 hd-system = { path = "crates/system" }
 hd-defaults = { path = "crates/defaults" }
 hd-plugins = { path = "crates/plugins" }
+hd-protonbuild = { path = "crates/protonbuild" }
 
 [package]
 name = "hyprdeck"
