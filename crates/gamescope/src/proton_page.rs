@@ -1,4 +1,9 @@
-//! Compatibility-tool releases, installed inventory and non-destructive prefix recovery.
+//! The one inventory of compatibility tools (downloaded, built and Hyprdeck variants) and of
+//! Steam games (runner, Hyprdeck settings and prefix recovery). Gaming > Compatibility tools
+//! and Gaming > Games are two views of the same [`Page`], so a refresh updates both.
+mod games;
+mod variants;
+
 use crate::{
     proton::{self, InstalledTool, Provider, Release, Target, TargetKind},
     proton_repair, recovery,
@@ -7,6 +12,7 @@ use crate::{
 };
 use adw::prelude::*;
 use gtk::glib;
+use hd_protonbuild::profile::{self, Profiles};
 use hyprdeck_core::{
     rt, store,
     ui::{self, Ctx},
@@ -14,6 +20,7 @@ use hyprdeck_core::{
 use serde::{Deserialize, Serialize};
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeSet,
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -53,11 +60,14 @@ impl CustomTarget {
 struct ToolEntry {
     tool: InstalledTool,
     capabilities: proton::Capabilities,
+    origin: variants::Origin,
 }
 struct Inventory {
     targets: Vec<Target>,
     tools: Vec<ToolEntry>,
     steam: steam::Inventory,
+    /// Hyprdeck game settings: global defaults and per-game overrides.
+    profiles: Profiles,
     warnings: Vec<String>,
 }
 fn inventory() -> anyhow::Result<Inventory> {
@@ -92,7 +102,12 @@ fn inventory() -> anyhow::Result<Inventory> {
                                 reason: format!("{error:#}"),
                             }
                         });
-                    tools.push(ToolEntry { tool, capabilities });
+                    let origin = variants::origin(&tool.path);
+                    tools.push(ToolEntry {
+                        tool,
+                        capabilities,
+                        origin,
+                    });
                 }
             }
             Err(e) => warnings.push(format!("{}: {e:#}", target.name)),
@@ -100,15 +115,30 @@ fn inventory() -> anyhow::Result<Inventory> {
     }
     let steam = steam::inventory(&targets)?;
     warnings.extend(steam.warnings.clone());
+    let profiles = profile::profiles_dir()
+        .and_then(|dir| Profiles::load(&dir))
+        .unwrap_or_else(|error| {
+            warnings.push(format!("Game settings: {error:#}"));
+            Profiles::default()
+        });
     Ok(Inventory {
         targets,
         tools,
         steam,
+        profiles,
         warnings,
     })
 }
 struct Page {
     ctx: Ctx,
+    tools_root: gtk::Widget,
+    games_root: gtk::Widget,
+    game_target: adw::ComboRow,
+    game_targets: RefCell<Vec<Target>>,
+    games_status: gtk::Label,
+    game_search: gtk::SearchEntry,
+    global: gtk::Box,
+    expanded: RefCell<BTreeSet<u32>>,
     target: adw::ComboRow,
     provider: adw::ComboRow,
     providers: Vec<Provider>,
@@ -136,7 +166,38 @@ struct Page {
     notice: RefCell<Option<String>>,
 }
 
+thread_local! {
+    static SHARED: RefCell<Option<Rc<Page>>> = const { RefCell::new(None) };
+}
+
+fn shared(ctx: &Ctx) -> Rc<Page> {
+    SHARED.with(|shared| {
+        shared
+            .borrow_mut()
+            .get_or_insert_with(|| create(ctx))
+            .clone()
+    })
+}
+
+/// Gaming > Compatibility tools.
 pub fn build(ctx: &Ctx) -> gtk::Widget {
+    shared(ctx).tools_root.clone()
+}
+
+/// Gaming > Games.
+pub fn build_games(ctx: &Ctx) -> gtk::Widget {
+    shared(ctx).games_root.clone()
+}
+
+/// Rereads the inventory after something outside these views changed it, such as a build.
+pub(crate) fn changed() {
+    let page = SHARED.with(|shared| shared.borrow().clone());
+    if let Some(page) = page {
+        page.reload();
+    }
+}
+
+fn create(ctx: &Ctx) -> Rc<Page> {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     root.set_margin_top(12);
     root.set_margin_bottom(12);
@@ -258,43 +319,53 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         "folder-download-symbolic",
     );
     let search = gtk::SearchEntry::builder()
-        .placeholder_text("Search installed tools or games…")
+        .placeholder_text("Search installed tools…")
         .build();
     let installed = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    let games = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    for (id, title, icon, body) in [
-        (
-            "installed",
-            "Installed tools",
-            "package-x-generic-symbolic",
-            &installed,
-        ),
-        (
-            "games",
-            "Steam games & recovery",
-            "input-gaming-symbolic",
-            &games,
-        ),
-    ] {
-        stack.add_titled_with_icon(
-            &gtk::ScrolledWindow::builder()
-                .hscrollbar_policy(gtk::PolicyType::Never)
-                .vexpand(true)
-                .child(body)
-                .build(),
-            Some(id),
-            title,
-            icon,
-        );
-    }
+    stack.add_titled_with_icon(
+        &gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&installed)
+            .build(),
+        Some("installed"),
+        "Installed tools",
+        "package-x-generic-symbolic",
+    );
+    stack.add_titled_with_icon(
+        &crate::builder_page::build(ctx),
+        Some("build"),
+        "Build",
+        "applications-engineering-symbolic",
+    );
+    stack.set_visible_child_name("installed");
+    search.set_visible(true);
+    stack.connect_visible_child_name_notify({
+        let search = search.clone();
+        move |stack| search.set_visible(stack.visible_child_name().as_deref() == Some("installed"))
+    });
     root.append(&search);
     root.append(&stack);
+    let games_view = games::Widgets::new();
     let providers = proton::providers();
     provider.set_model(Some(&gtk::StringList::new(
         &providers.iter().map(|p| p.name).collect::<Vec<_>>(),
     )));
+    let responsive = adw::BreakpointBin::builder()
+        .child(&root)
+        .width_request(340)
+        .height_request(480)
+        .build();
     let page = Rc::new(Page {
         ctx: ctx.clone(),
+        tools_root: responsive.clone().upcast(),
+        games_root: games_view.root.upcast(),
+        game_target: games_view.target,
+        game_targets: RefCell::default(),
+        games_status: games_view.status,
+        game_search: games_view.search,
+        global: games_view.global,
+        expanded: RefCell::default(),
         target,
         provider,
         providers,
@@ -303,7 +374,7 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         fetch,
         status,
         installed,
-        games,
+        games: games_view.list,
         releases,
         notes: notes.buffer(),
         release_title,
@@ -322,15 +393,16 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
         notice: RefCell::new(None),
     });
     root.connect_destroy({
-        let owner = RefCell::new(Some(page.clone()));
+        let weak = Rc::downgrade(&page);
         move |_| {
-            if let Some(page) = owner.borrow_mut().take()
+            if let Some(page) = weak.upgrade()
                 && let Some(flag) = page.cancel_flag.borrow().as_ref()
             {
                 flag.store(true, Ordering::Relaxed);
             }
         }
     });
+    page.connect_games(&games_view.refresh);
     page.refresh.connect_clicked({
         let weak = Rc::downgrade(&page);
         move |_| {
@@ -409,16 +481,10 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
                 && let Some(flag) = page.cancel_flag.borrow().as_ref()
             {
                 flag.store(true, Ordering::Relaxed);
-                page.status
-                    .set_label("Cancelling download; staged files will be removed.");
+                page.say("Cancelling download; staged files will be removed.");
             }
         }
     });
-    let responsive = adw::BreakpointBin::builder()
-        .child(&root)
-        .width_request(340)
-        .height_request(480)
-        .build();
     let breakpoint = adw::Breakpoint::new(
         adw::BreakpointCondition::parse("max-width: 650sp").expect("valid condition"),
     );
@@ -429,10 +495,15 @@ pub fn build(ctx: &Ctx) -> gtk::Widget {
     );
     responsive.add_breakpoint(breakpoint);
     page.reload();
-    responsive.upcast()
+    page
 }
 
 impl Page {
+    /// Status for both views; the Games view has no other place to report.
+    fn say(&self, text: &str) {
+        self.status.set_label(text);
+        self.games_status.set_label(text);
+    }
     fn selected_target(&self) -> Option<Target> {
         self.inventory
             .borrow()
@@ -480,8 +551,7 @@ impl Page {
         }
         let selected = self.selected_target().map(|t| t.id);
         self.set_busy(true);
-        self.status
-            .set_label("Detecting launchers, installed tools and Steam game assignments…");
+        self.say("Detecting launchers, installed tools and Steam game assignments…");
         glib::spawn_future_local({
             let weak = Rc::downgrade(self);
             async move {
@@ -513,15 +583,13 @@ impl Page {
                         page.target.set_selected(index as u32);
                         page.syncing.set(false);
                         if let Some(notice) = page.notice.borrow_mut().take() {
-                            page.status.set_label(&format!("{notice}\n{message}"));
+                            page.say(&format!("{notice}\n{message}"));
                         } else {
-                            page.status.set_label(&message);
+                            page.say(&message);
                         }
                         page.render_inventory();
                     }
-                    Err(e) => page
-                        .status
-                        .set_label(&format!("Could not read compatibility tools: {e:#}")),
+                    Err(e) => page.say(&format!("Could not read compatibility tools: {e:#}")),
                 }
                 page.set_busy(false);
             }
@@ -532,23 +600,26 @@ impl Page {
             return;
         }
         let Some(target) = self.selected_target() else {
-            self.status.set_label(
-                "No launcher target found. Add a target or install a supported launcher.",
-            );
+            self.say("No launcher target found. Add a target or install a supported launcher.");
             return;
         };
         let Some(provider) = self.providers.get(self.provider.selected() as usize) else {
             return;
         };
         if !provider.targets.contains(&target.kind) {
-            self.status.set_label("This provider does not supply runners for the selected launcher type. Select a compatible launcher/provider pair.");
+            self.say("This provider does not supply runners for the selected launcher type. Select a compatible launcher/provider pair.");
             return;
         }
         let id = provider.id.to_owned();
+        let none = if provider.id == "hyprdeck-proton" {
+            "No Hyprdeck Proton releases are published yet. Build one locally in the Build tab."
+        } else {
+            "This provider has no published releases."
+        };
         self.clear_releases();
         let revision = self.revision.get();
         self.set_busy(true);
-        self.status.set_label("Reading upstream release metadata…");
+        self.say("Reading upstream release metadata…");
         glib::spawn_future_local({
             let weak = Rc::downgrade(self);
             async move {
@@ -580,14 +651,16 @@ impl Page {
                         let count = releases.len();
                         *page.release_data.borrow_mut() = releases;
                         page.syncing.set(syncing);
-                        page.status.set_label(&format!("{count} upstream releases. Read notes and availability before installing; upstream tools execute as your user when selected by a launcher."));
+                        if count == 0 {
+                            page.say(none);
+                        } else {
+                            page.say(&format!("{count} upstream releases. Read notes and availability before installing; upstream tools execute as your user when selected by a launcher."));
+                        }
                         if let Some(row) = page.releases.row_at_index(0) {
                             page.releases.select_row(Some(&row));
                         }
                     }
-                    Err(e) => page
-                        .status
-                        .set_label(&format!("Could not load releases: {e:#}")),
+                    Err(e) => page.say(&format!("Could not load releases: {e:#}")),
                 }
                 page.set_busy(false);
             }
@@ -729,7 +802,7 @@ impl Page {
                     };
                     match event {
                         DownloadEvent::Progress(progress) => {
-                            page.status.set_label(&progress.message);
+                            page.say(&progress.message);
                             if let Some(f) = progress.fraction {
                                 page.progress.set_fraction(f.clamp(0., 1.));
                             } else {
@@ -749,9 +822,7 @@ impl Page {
                                     ));
                                     page.reload();
                                 }
-                                Err(e) => page
-                                    .status
-                                    .set_label(&format!("Installation did not complete: {e}")),
+                                Err(e) => page.say(&format!("Installation did not complete: {e}")),
                             }
                             break;
                         }
@@ -761,8 +832,8 @@ impl Page {
         });
     }
     fn render_inventory(self: &Rc<Self>) {
+        self.render_games();
         ui::clear(&self.installed);
-        ui::clear(&self.games);
         let inventory = self.inventory.borrow();
         let Some(data) = inventory.as_ref() else {
             return;
@@ -782,6 +853,7 @@ impl Page {
         {
             let tool = &entry.tool;
             let capabilities = &entry.capabilities;
+            let origin = &entry.origin;
             let associated: Vec<_> = data
                 .steam
                 .games
@@ -810,12 +882,9 @@ impl Page {
                 "{} · {} associated games · {}",
                 tool.name,
                 associated.len(),
-                if tool.managed {
-                    "Hyprdeck-managed"
-                } else {
-                    "Externally managed"
-                }
+                origin.label(tool.managed)
             ));
+            self.lineage_rows(&row, entry, data);
             row.add_row(&action_row(
                 "Installed path",
                 &tool.path.display().to_string(),
@@ -880,8 +949,13 @@ impl Page {
                     }
                 });
             }
+            if target.kind == TargetKind::Steam && tool.path.join("proton").is_file() {
+                self.variant_button(&row, &target, entry, data);
+            }
             let remove = gtk::Button::with_label("Remove…");
-            remove.set_sensitive(capabilities.removable && data.warnings.is_empty());
+            remove.set_sensitive(
+                (capabilities.removable || origin.removable()) && data.warnings.is_empty(),
+            );
             remove.set_tooltip_text(Some(&capabilities.reason));
             remove.set_valign(gtk::Align::Center);
             row.add_suffix(&remove);
@@ -895,7 +969,7 @@ impl Page {
                     }
                 }
             });
-            if !capabilities.editable || !capabilities.removable {
+            if !capabilities.editable || !(capabilities.removable || origin.removable()) {
                 row.add_row(&action_row("Management limits", &capabilities.reason));
             }
             group.add(&row);
@@ -976,99 +1050,6 @@ impl Page {
             group.add(&action_row("No matching installed tools","Download a compatible release or adjust the search. Steam-managed tools are installed through Steam."));
         }
         self.installed.append(&group);
-        let game_group=adw::PreferencesGroup::builder().title("Installed Steam games and prefix recovery").description("Back up and reset only as a troubleshooting step, not routine cleanup. Close Steam, Wine and all games first. Saves, launcher state and mods can live inside a prefix; a reset may require reinstalling prerequisites or restoring saves from the backup.").build();
-        let mut game_count = 0;
-        for game in data
-            .steam
-            .games
-            .iter()
-            .filter(|g| same_steam_target(g, &target))
-        {
-            if !format!(
-                "{} {} {}",
-                game.name,
-                game.app_id,
-                game.tool.as_deref().unwrap_or("")
-            )
-            .to_lowercase()
-            .contains(&query)
-            {
-                continue;
-            }
-            game_count += 1;
-            let row = adw::ExpanderRow::builder().use_markup(false).build();
-            row.set_title(&game.name);
-            row.set_subtitle(&format!(
-                "{} · {} · {}",
-                game.app_id,
-                game.tool.as_deref().unwrap_or("Automatic / unknown"),
-                game.assignment
-            ));
-            row.add_row(&action_row("Library", &game.library.display().to_string()));
-            row.add_row(&action_row(
-                "Game installation",
-                &game.install_path.display().to_string(),
-            ));
-            row.add_row(&action_row(
-                "Prefix location",
-                &game.compatdata.display().to_string(),
-            ));
-            let links = game_link(game);
-            row.add_row(&links);
-            let recovery = gtk::Button::with_label("Prefix backups / recovery…");
-            recovery.set_valign(gtk::Align::Center);
-            row.add_suffix(&recovery);
-            recovery.connect_clicked({
-                let weak = Rc::downgrade(self);
-                let game = game.clone();
-                move |_| {
-                    if let Some(page) = weak.upgrade() {
-                        page.prefix_dialog(game.clone());
-                    }
-                }
-            });
-            let assignment = gtk::Button::with_label("Compatibility…");
-            assignment.set_valign(gtk::Align::Center);
-            row.add_suffix(&assignment);
-            assignment.connect_clicked({
-                let weak = Rc::downgrade(self);
-                let target = target.clone();
-                let game = game.clone();
-                move |_| {
-                    if let Some(page) = weak.upgrade() {
-                        page.game_assignment(target.clone(), game.clone());
-                    }
-                }
-            });
-            game_group.add(&row);
-        }
-        if game_count == 0 {
-            game_group.add(&action_row("No matching Steam games","Game assignments and Steam prefix recovery are available for detected Steam libraries; Lutris, Heroic and Bottles retain their own per-game configuration."));
-        }
-        self.games.append(&game_group);
-        if !data.steam.mappings.is_empty() {
-            let mappings = adw::PreferencesGroup::builder()
-                .title("Saved Steam compatibility mappings")
-                .build();
-            for mapping in data
-                .steam
-                .mappings
-                .iter()
-                .filter(|m| same_root(&m.steam_root, &target))
-            {
-                if mapping.app_id == 0 {
-                    mappings.add(&action_row(
-                        "Configured default",
-                        &format!(
-                            "{} · {}",
-                            mapping.tool.as_deref().unwrap_or("Automatic"),
-                            mapping.source
-                        ),
-                    ));
-                }
-            }
-            self.games.append(&mappings);
-        }
     }
     fn tool_choices(&self, target: &Target) -> Vec<(String, String)> {
         let inventory = self.inventory.borrow();
@@ -1300,8 +1281,7 @@ impl Page {
             return;
         }
         self.set_busy(true);
-        self.status
-            .set_label("Preparing an exact compatibility-assignment preview…");
+        self.say("Preparing an exact compatibility-assignment preview…");
         glib::spawn_future_local({
             let weak = Rc::downgrade(self);
             async move {
@@ -1313,8 +1293,7 @@ impl Page {
                 let plan = match result {
                     Ok(plan) => plan,
                     Err(error) => {
-                        page.status
-                            .set_label(&format!("Could not prepare assignment changes: {error:#}"));
+                        page.say(&format!("Could not prepare assignment changes: {error:#}"));
                         return;
                     }
                 };
@@ -1396,9 +1375,7 @@ impl Page {
                         }
                         page.reload();
                     }
-                    Err(error) => page
-                        .status
-                        .set_label(&format!("Assignments did not complete: {error:#}")),
+                    Err(error) => page.say(&format!("Assignments did not complete: {error:#}")),
                 }
             }
         });
@@ -1445,9 +1422,7 @@ impl Page {
                         ));
                         page.reload();
                     }
-                    Err(error) => page
-                        .status
-                        .set_label(&format!("Could not edit tool: {error:#}")),
+                    Err(error) => page.say(&format!("Could not edit tool: {error:#}")),
                 }
             }
         });
@@ -1674,16 +1649,14 @@ impl Page {
                     return;
                 }
                 page.set_busy(true);
-                let result = rt::blocking(move || proton::remove(&target, &tool)).await;
+                let result = rt::blocking(move || variants::remove(&target, &tool)).await;
                 page.set_busy(false);
                 match result {
                     Ok(()) => {
                         *page.notice.borrow_mut()=Some("Standalone compatibility tool removed. Game prefixes and saves were not touched.".into());
                         page.reload();
                     }
-                    Err(e) => page
-                        .status
-                        .set_label(&format!("Could not remove tool: {e:#}")),
+                    Err(e) => page.say(&format!("Could not remove tool: {e:#}")),
                 }
             }
         });

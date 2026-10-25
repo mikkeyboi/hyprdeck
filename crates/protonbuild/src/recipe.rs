@@ -116,6 +116,15 @@ impl Recipe {
     }
 }
 
+/// Whether `tag` is safe to pass to `git clone --branch`: a plain release tag name.
+pub fn valid_base(tag: &str) -> bool {
+    !tag.is_empty()
+        && !tag.starts_with(['-', '.'])
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// Pins for GE tags whose build downloads files that upstream mirrors have since removed.
 pub fn known_pins(base: &str) -> Vec<MakePin> {
     let mut pins = Vec::new();
@@ -396,6 +405,8 @@ cpp_args = [$$(call list-quote,$$($(2)_$(3)_INCFLAGS) $$($(2)_CFLAGS) $$($(3)_CF
     fn pins_and_names_follow_the_base() {
         let recipe = Recipe::new("GE-Proton11-1", FlagProfile::V3);
         assert_eq!(recipe.build_name(), "hyprdeck-ge-proton11-1-v3");
+        assert!(valid_base("GE-Proton11-1"));
+        assert!(!valid_base("--upload-pack=x") && !valid_base("a b") && !valid_base(""));
         assert_eq!(recipe.make_args(), ["UNZIP_DEBIAN_REVISION=29+deb13u1"]);
         assert!(
             Recipe::new("GE-Proton11-11", FlagProfile::Stock)

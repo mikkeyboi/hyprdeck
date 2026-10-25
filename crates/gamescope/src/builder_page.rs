@@ -1,4 +1,5 @@
-//! Builds GE-Proton from source with Hyprdeck's optional compiler flags and installs it.
+//! Compatibility tools > Build: builds GE-Proton from source with Hyprdeck's optional
+//! compiler flags and installs it.
 use crate::{
     proton::{self, TargetKind},
     proton_cpu,
@@ -7,7 +8,7 @@ use adw::prelude::*;
 use gtk::glib;
 use hd_protonbuild::{
     builder::{self, Requirement},
-    recipe::{FlagProfile, Recipe},
+    recipe::{self, FlagProfile, Recipe},
 };
 use hyprdeck_core::{
     rt,
@@ -69,9 +70,9 @@ struct Page {
 pub fn build(ctx: &Ctx) -> gtk::Widget {
     let (scroller, content) = ui::page_scaffold();
     let intro = adw::PreferencesGroup::builder()
-        .title("Proton builder")
+        .title("Build Hyprdeck Proton")
         .description(format!(
-            "Build GE-Proton from source with optional optimizations and install it as a Steam compatibility tool. The build runs inside the Steam Runtime SDK container (about 9.4 GB, downloaded once) and needs about {} GB free. HDR, DLSS and latency settings don't need a build; set them under Game settings.",
+            "Build GE-Proton from source with optional optimizations and install it as a Steam compatibility tool. The build runs inside the Steam Runtime SDK container (about 9.4 GB, downloaded once) and needs about {} GB free. HDR, DLSS and latency settings don't need a build; set them under Gaming > Games.",
             builder::REQUIRED_FREE_BYTES / 1_000_000_000
         ))
         .build();
@@ -357,10 +358,7 @@ impl Page {
             return;
         }
         let base = self.base.text().trim().to_owned();
-        let valid = base
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-        if base.is_empty() || !valid || base.starts_with(['-', '.']) {
+        if !recipe::valid_base(&base) {
             self.phase
                 .set_label("Enter a GE-Proton release tag such as GE-Proton11-1.");
             return;
@@ -419,8 +417,9 @@ impl Page {
                                     .unwrap_or_default()
                                     .to_string_lossy()
                                     .into_owned();
-                                page.phase.set_label(&format!("Built and installed {name} in {time}. Restart Steam, then pick it for a game or create a Hyprdeck variant of it under Game settings."));
+                                page.phase.set_label(&format!("Built and installed {name} in {time}. It is listed under Installed tools. Restart Steam, then pick it for a game, or create a Hyprdeck variant of it so Gaming > Games settings apply."));
                                 page.ctx.toast(format!("Installed {name}"));
+                                crate::proton_page::changed();
                             }
                             Err(e) => page
                                 .phase

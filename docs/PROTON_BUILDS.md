@@ -1,6 +1,14 @@
 # Game profiles and Hyprdeck Proton builds
 
-Status: design, not implemented yet.
+Status: implemented, except launch health. The UI lives in two places under Gaming:
+
+- **Compatibility tools** is the one inventory of runners. *Download tools* lists upstream forks and Hyprdeck
+  Proton releases, *Installed tools* lists everything in `compatibilitytools.d` (downloads, local builds and
+  variants, each with its lineage) and *Build* compiles Hyprdeck Proton locally.
+- **Games** lists Steam games with their runner, Hyprdeck settings and prefix recovery. Global defaults sit at
+  the top; a game overrides only the settings it needs.
+
+Both are views of the same inventory, so a refresh, install or build in one shows up in the other.
 
 Hyprdeck's Gaming section manages Proton in two layers. Most of what people want (HDR, DLSS, Reflex and
 other low-latency options, ntsync) is a runtime setting that any modern Proton already understands, so it
@@ -57,12 +65,15 @@ Findings that the builder has to handle:
 
 ## Per-game profiles
 
-A profile is a small TOML file per Steam app id under `~/.config/hyprdeck/games/`. The Gaming section shows
-it as a few switches grouped by what people care about:
+Settings live in `~/.config/hyprdeck/games/`: `defaults.json` holds the global defaults and `<appid>.json`
+holds only the settings a game overrides. A game's effective settings are the defaults with its overrides on
+top, so changing a default reaches every game that did not override it. Games shows them grouped by what
+people care about:
 
 - **Display**: HDR, native Wayland.
 - **Upscaling**: DLSS upgrade and HUD, FSR 4 upgrade, XeSS upgrade.
-- **Latency**: Reflex, low-latency layer, low-latency DXVK/vkd3d.
+- **Latency**: Reflex, low-latency layer, low-latency DXVK/vkd3d, frame rate limit.
+- **Performance**: per-game shader cache.
 - **Troubleshooting**: ntsync off, logging.
 
 Each switch maps to the runner's own variable name, so one profile works on GE-Proton, Proton-CachyOS and
@@ -72,10 +83,17 @@ Hyprdeck builds. Settings a runner does not support are shown as unavailable rat
 
 Hyprdeck creates a *variant* of a runner: a folder in `compatibilitytools.d` that hardlinks every file of the
 runner (falling back to reflinks or copies across filesystems) and replaces only the `proton` entry point with
-a small launcher. The original script stays in the variant as a hardlink named `proton.upstream`. The launcher
-reads the profile for `SteamAppId`, sets its variables and execs `proton.upstream`. Proton locates its files
+a small launcher. The original script stays in the variant as a hardlink named `proton.upstream`. Hyprdeck
+writes each variant a `hyprdeck-games/default.json` (the defaults) and an `<appid>.json` per game with
+overrides, already merged and translated for that runner. The launcher reads the game's file, or the
+defaults when there is none, sets its variables and execs `proton.upstream`. Proton locates its files
 from the directory of the script it was started as, so the run uses the variant's files. Swapped DLL sets, such as the low-latency DXVK fork, also live in the variant, so the
 original runner is never modified and a new upstream release only needs its variant regenerated.
+
+Variants are created from Installed tools. The dialog shows the lineage (the runner, and the recipe when the
+runner is a Hyprdeck build), the settings the variant will apply and a progress bar while files are linked.
+Each variant records that lineage in `.hyprdeck-variant.json`, so Installed tools can show it even after the
+original runner is removed.
 
 Assigning a game to a variant uses the existing compatibility-tool assignment flow, so it inherits the same
 Steam-closed checks, backups and rollback. Steam launch options are left alone.
@@ -90,17 +108,25 @@ means no controllers reach the game. Hyprdeck shows these next to the runner in 
 
 The builder turns a recipe into an installed Hyprdeck Proton. A recipe names an upstream base (a GE-Proton
 tag first), a flag profile (`stock`, `O3`, `v3`), optional component overrides and the pinned download fixes
-above. The Gaming section shows it under an Advanced heading:
+above. It is the Build tab of Compatibility tools:
 
 1. A requirements check for a container engine, git, make, rsync and free disk space, with an install button
    that uses the same pacman and polkit flow as the Updates page.
 2. Recipe options and an estimate based on the timings above.
-3. A progress view with the live build log, and install into `compatibilitytools.d` when it finishes.
+3. A progress view with the live build log, and install into `compatibilitytools.d` when it finishes. The
+   install carries `.hyprdeck-build.json` with the recipe, which Installed tools shows as the build's lineage.
 
 ## CI releases
 
-The same recipe runs in GitHub Actions on tagged releases, publishing tarballs named like other Proton forks
-so Hyprdeck's compatibility-tool browser can list them next to GE-Proton and Proton-CachyOS.
+`.github/workflows/proton.yml` runs the same recipe through `hyprdeck-protonbuild`, a small command-line
+front end in `crates/protonbuild` that needs no GTK. It is started by hand with a GE-Proton tag and a
+revision, builds the `O3` and `v3` profiles in parallel and publishes a `proton-<tag>-<revision>` release in
+this repository with `hyprdeck-<tag>-o3-x86_64.tar.gz` and `hyprdeck-<tag>-v3-x86_64_v3.tar.gz` plus
+checksums. The release is never marked latest, because the app updater follows the latest release.
+
+Download tools lists these under *Hyprdeck Proton* and picks the highest x86-64 level the CPU supports, the
+same way it handles Proton-CachyOS. Each archive carries its recipe, so installed releases show their lineage
+like local builds.
 
 ## Portability
 

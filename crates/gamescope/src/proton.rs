@@ -115,8 +115,19 @@ pub struct Progress {
     pub fraction: Option<f64>,
 }
 
+/// Hyprdeck's own Proton builds are releases of this repository tagged `proton-…`,
+/// next to the app's `v…` releases.
+const HYPRDECK_TAG_PREFIX: &str = "proton-";
+
 pub fn providers() -> Vec<Provider> {
     vec![
+        Provider {
+            id: "hyprdeck-proton",
+            name: "Hyprdeck Proton",
+            repo: "mikkeyboi/hyprdeck",
+            description: "Hyprdeck's own GE-Proton builds: -O3, or x86-64-v3 on CPUs that support it. Published by Hyprdeck's CI from the same recipe as the Build tab.",
+            targets: STEAM,
+        },
         Provider {
             id: "ge-proton",
             name: "GE-Proton",
@@ -705,6 +716,7 @@ fn binary_build(provider: &str, name: &str) -> Option<BinaryBuild> {
             lower.starts_with("proton-cachyos-") && lower.contains("-slr-") && explicit_architecture
         }
         "proton-wineland" => lower.starts_with("proton-wineland-") && explicit_architecture,
+        "hyprdeck-proton" => lower.starts_with("hyprdeck-") && explicit_architecture,
         "proton-tkg" => {
             build.architecture == "x86_64"
                 && (lower.starts_with("proton_tkg_") || lower.starts_with("proton-tkg"))
@@ -1204,7 +1216,9 @@ pub fn releases(id: &str, target: &Target) -> Result<Vec<Release>> {
     if id == "valve-proton" {
         return official_releases(&provider, target);
     }
-    let data = github(&format!("{}/releases?per_page=30", provider.repo))?;
+    // The app's own releases share Hyprdeck's repository, so read further back for it.
+    let per_page = if id == "hyprdeck-proton" { 100 } else { 30 };
+    let data = github(&format!("{}/releases?per_page={per_page}", provider.repo))?;
     let mut result = Vec::new();
     if id == "proton-tkg" {
         match tkg_ci(target) {
@@ -1216,7 +1230,10 @@ pub fn releases(id: &str, target: &Target) -> Result<Vec<Release>> {
         .as_array()
         .context("GitHub did not return a release list")?
     {
-        if value.get("draft").and_then(Value::as_bool) == Some(true) {
+        if value.get("draft").and_then(Value::as_bool) == Some(true)
+            || (id == "hyprdeck-proton"
+                && !text(value, "tag_name").starts_with(HYPRDECK_TAG_PREFIX))
+        {
             continue;
         }
         result.push(release_from(&provider, target, value)?);
@@ -1842,6 +1859,24 @@ mod tests {
         assert_eq!(
             asset(&cachy, &value, &arm).unwrap().unwrap().name,
             cachy_names[2]
+        );
+        let hyprdeck = provider("hyprdeck-proton").unwrap();
+        let hyprdeck_names = [
+            "hyprdeck-ge-proton11-1-o3-x86_64.tar.gz",
+            "hyprdeck-ge-proton11-1-v3-x86_64_v3.tar.gz",
+            "hyprdeck-ge-proton11-1-v3-x86_64_v3.tar.gz.sha512sum",
+        ];
+        let value = release_assets(&hyprdeck, &hyprdeck_names);
+        assert_eq!(
+            asset(&hyprdeck, &value, &x86).unwrap().unwrap().name,
+            hyprdeck_names[1]
+        );
+        assert_eq!(
+            asset(&hyprdeck, &value, &cpu("x86_64", Some(2)))
+                .unwrap()
+                .unwrap()
+                .name,
+            hyprdeck_names[0]
         );
         let wineland = provider("proton-wineland").unwrap();
         let wineland_names = [
