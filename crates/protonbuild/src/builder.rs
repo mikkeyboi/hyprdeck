@@ -422,6 +422,66 @@ pub fn install(plan: &Plan, tools_dir: &Path) -> Result<PathBuf> {
     Ok(target)
 }
 
+/// The recipe of a build [`install`] or a Hyprdeck Proton release put in place.
+pub fn installed_recipe(tool: &Path) -> Option<Recipe> {
+    let text = std::fs::read_to_string(tool.join(BUILD_RECEIPT)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Removes a build [`install`] put in place; refuses folders without its receipt.
+pub fn uninstall(tool: &Path) -> Result<()> {
+    ensure!(
+        tool.join(BUILD_RECEIPT).is_file(),
+        "{} was not installed by the Proton builder",
+        tool.display()
+    );
+    std::fs::remove_dir_all(tool).with_context(|| format!("Removing {}", tool.display()))
+}
+
+/// Release asset name: Hyprdeck's installer picks the highest x86-64 level a CPU supports
+/// from the `-x86_64` / `-x86_64_vN` suffix.
+pub fn asset_name(recipe: &Recipe) -> String {
+    match recipe.flags.required_x86_64_level() {
+        1 => format!("{}-x86_64.tar.gz", recipe.build_name()),
+        level => format!("{}-x86_64_v{level}.tar.gz", recipe.build_name()),
+    }
+}
+
+/// Packs a finished build for a release, with its recipe inside so installs keep their
+/// lineage, plus a `.sha512sum` file. Returns the archive path.
+pub fn package(plan: &Plan, out_dir: &Path) -> Result<PathBuf> {
+    let output = plan.output();
+    ensure!(
+        output.join("proton").is_file(),
+        "No finished build at {}",
+        output.display()
+    );
+    std::fs::write(
+        output.join(BUILD_RECEIPT),
+        serde_json::to_string_pretty(&plan.recipe)? + "\n",
+    )?;
+    std::fs::create_dir_all(out_dir)?;
+    let name = asset_name(&plan.recipe);
+    let archive = out_dir.join(&name);
+    let status = Command::new("tar")
+        .arg("-C")
+        .arg(&plan.build)
+        .arg("-czf")
+        .arg(&archive)
+        .arg(plan.recipe.build_name())
+        .status()
+        .context("Starting tar")?;
+    ensure!(status.success(), "Packing the build failed ({status})");
+    let sum = Command::new("sha512sum")
+        .arg(&name)
+        .current_dir(out_dir)
+        .output()
+        .context("Starting sha512sum")?;
+    ensure!(sum.status.success(), "sha512sum failed ({})", sum.status);
+    std::fs::write(out_dir.join(format!("{name}.sha512sum")), sum.stdout)?;
+    Ok(archive)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +615,34 @@ mod tests {
             },
         ];
         assert_eq!(missing_packages(&reqs), ["podman"]);
+    }
+
+    #[test]
+    fn release_assets_carry_their_cpu_level_and_recipe() {
+        assert_eq!(
+            asset_name(&Recipe::new("GE-Proton11-1", FlagProfile::O3)),
+            "hyprdeck-ge-proton11-1-o3-x86_64.tar.gz"
+        );
+        let recipe = Recipe::new("GE-Proton11-1", FlagProfile::V3);
+        assert_eq!(
+            asset_name(&recipe),
+            "hyprdeck-ge-proton11-1-v3-x86_64_v3.tar.gz"
+        );
+        let work = tempfile::tempdir().unwrap();
+        let plan = plan(&recipe, work.path(), 4);
+        let output = plan.output();
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("proton"), "").unwrap();
+        let archive = package(&plan, &work.path().join("dist")).unwrap();
+        assert!(archive.is_file());
+        assert!(
+            work.path()
+                .join("dist")
+                .join(format!("{}.sha512sum", asset_name(&recipe)))
+                .is_file()
+        );
+        assert_eq!(installed_recipe(&output), Some(recipe));
+        uninstall(&output).unwrap();
+        assert!(uninstall(work.path()).is_err());
     }
 }

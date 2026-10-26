@@ -1,0 +1,84 @@
+name: Hyprdeck Proton
+
+# Builds Hyprdeck Proton from a GE-Proton tag with the same recipe as the app's
+# Build tab, and publishes it as a `proton-<tag>-<revision>` release. Hyprdeck
+# lists these under Compatibility tools > Download tools > Hyprdeck Proton and
+# installs the highest x86-64 level the CPU supports.
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: GE-Proton release tag to build from
+        required: true
+        default: GE-Proton11-1
+      revision:
+        description: Hyprdeck revision of this base (bump to republish the same tag)
+        required: true
+        default: "1"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BASE: ${{ inputs.base }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.flags }}
+    runs-on: ubuntu-latest
+    # A cold build on 4 cores is about 90 minutes.
+    timeout-minutes: 300
+    strategy:
+      matrix:
+        flags: [o3, v3]
+    steps:
+      - name: Free disk space
+        run: |
+          # Source, one build tree and the Steam Runtime SDK image need about 45 GB.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo mkdir -p /mnt/proton && sudo chown "$USER" /mnt/proton
+          df -h / /mnt
+      - uses: actions/checkout@v7
+      - name: Build the build tool
+        run: cargo build --release --locked -p hd-protonbuild --bin hyprdeck-protonbuild
+      - name: Build Proton
+        run: |
+          [[ "$BASE" =~ ^GE-Proton[0-9A-Za-z._-]+$ ]] || { echo "invalid base tag $BASE"; exit 1; }
+          target/release/hyprdeck-protonbuild "$BASE" ${{ matrix.flags }} \
+            --work /mnt/proton --jobs "$(nproc)" --package dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: proton-${{ matrix.flags }}
+          path: dist/*
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      REVISION: ${{ inputs.revision }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$REVISION" =~ ^[0-9]+$ ]] || { echo "invalid revision $REVISION"; exit 1; }
+          tag="proton-$BASE-$REVISION"
+          cat > notes.md <<EOF
+          Hyprdeck Proton built from [$BASE](https://github.com/GloriousEggroll/proton-ge-custom/releases/tag/$BASE).
+
+          - \`-x86_64\`: -O3 for any x86-64 CPU.
+          - \`-x86_64_v3\`: Proton-CachyOS style x86-64-v3 (-O3, v3 scheduling and BMI instructions, no AVX). Needs a Haswell or Zen CPU or newer.
+
+          Install it from Hyprdeck under Gaming > Compatibility tools > Download tools > Hyprdeck Proton, which picks the right file for your CPU. Each archive carries \`.hyprdeck-build.json\` with its recipe.
+          EOF
+          # Never mark these latest: the app updater follows the latest release.
+          gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Hyprdeck Proton $BASE ($REVISION)" --notes-file notes.md --latest=false

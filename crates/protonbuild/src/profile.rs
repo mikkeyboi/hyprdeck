@@ -315,6 +315,122 @@ impl GameProfile {
     }
 }
 
+/// A game's departures from the global defaults; settings it leaves out follow them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Overrides {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub flags: BTreeMap<String, bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_rate_limit: Option<u32>,
+}
+
+impl Overrides {
+    /// The settings a game runs with: the global defaults with this game's overrides on top.
+    pub fn apply(&self, global: &GameProfile) -> GameProfile {
+        let mut profile = global.clone();
+        for (key, on) in &self.flags {
+            profile.set_flag(key, *on);
+        }
+        if let Some(fps) = self.frame_rate_limit {
+            profile.frame_rate_limit = fps;
+        }
+        profile
+    }
+
+    /// Overrides an on/off key, or follows the global default again with `None`.
+    pub fn set_flag(&mut self, key: &str, value: Option<bool>) {
+        if GameProfile::default().flag(key).is_none() {
+            return;
+        }
+        match value {
+            Some(on) => self.flags.insert(key.to_owned(), on),
+            None => self.flags.remove(key),
+        };
+    }
+
+    pub fn len(&self) -> usize {
+        self.flags.len() + usize::from(self.frame_rate_limit.is_some())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl GameProfile {
+    /// Titles of the settings that are on, for summaries such as "HDR, Upgrade DLSS".
+    pub fn enabled_titles(&self) -> Vec<String> {
+        SETTINGS
+            .iter()
+            .filter_map(|s| match self.flag(s.key) {
+                Some(true) => Some(s.title.to_owned()),
+                None if s.key == "frame_rate_limit" && self.frame_rate_limit > 0 => {
+                    Some(format!("{} FPS limit", self.frame_rate_limit))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Global defaults and every game's overrides, as saved under [`profiles_dir`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Profiles {
+    pub global: GameProfile,
+    pub games: BTreeMap<u32, Overrides>,
+}
+
+impl Profiles {
+    pub fn effective(&self, app: u32) -> GameProfile {
+        match self.games.get(&app) {
+            Some(overrides) => overrides.apply(&self.global),
+            None => self.global.clone(),
+        }
+    }
+
+    /// Reads `defaults.json` and every `<appid>.json` in `dir`; missing files are defaults.
+    pub fn load(dir: &Path) -> Result<Self> {
+        let mut profiles = Self {
+            global: read_json(&dir.join(GLOBAL))?.unwrap_or_default(),
+            games: BTreeMap::new(),
+        };
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(profiles),
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            let Some(app) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".json"))
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if let Some(overrides) = read_json::<Overrides>(&path)?
+                && !overrides.is_empty()
+            {
+                profiles.games.insert(app, overrides);
+            }
+        }
+        Ok(profiles)
+    }
+
+    pub fn save_global(dir: &Path, global: &GameProfile) -> Result<()> {
+        write_json(dir, GLOBAL, global, global.is_empty())
+    }
+
+    /// Saves one game's overrides; a game with none left has its file removed.
+    pub fn save_game(dir: &Path, app: u32, overrides: &Overrides) -> Result<()> {
+        write_json(dir, &format!("{app}.json"), overrides, overrides.is_empty())
+    }
+}
+
+const GLOBAL: &str = "defaults.json";
+
 /// `~/.config/hyprdeck/games`, honoring `XDG_CONFIG_HOME`.
 pub fn profiles_dir() -> Result<PathBuf> {
     let config = std::env::var_os("XDG_CONFIG_HOME")
@@ -325,53 +441,30 @@ pub fn profiles_dir() -> Result<PathBuf> {
     Ok(config.join("hyprdeck/games"))
 }
 
-pub fn load(dir: &Path, app: u32) -> Result<GameProfile> {
-    let path = dir.join(format!("{app}.json"));
-    match fs::read_to_string(&path) {
-        Ok(text) => {
-            serde_json::from_str(&text).with_context(|| format!("Reading {}", path.display()))
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(GameProfile::default()),
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .with_context(|| format!("Reading {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).with_context(|| format!("Reading {}", path.display())),
     }
 }
 
-/// Saves atomically; an all-default profile removes the file.
-pub fn save(dir: &Path, app: u32, profile: &GameProfile) -> Result<()> {
-    let path = dir.join(format!("{app}.json"));
-    if profile.is_empty() {
+/// Writes atomically, or removes the file when `empty`.
+fn write_json(dir: &Path, name: &str, value: &impl Serialize, empty: bool) -> Result<()> {
+    let path = dir.join(name);
+    if empty {
         return match fs::remove_file(&path) {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
             _ => Ok(()),
         };
     }
     fs::create_dir_all(dir)?;
-    let staging = dir.join(format!(".{app}.json.tmp"));
-    fs::write(&staging, serde_json::to_string_pretty(profile)? + "\n")?;
+    let staging = dir.join(format!(".{name}.tmp"));
+    fs::write(&staging, serde_json::to_string_pretty(value)? + "\n")?;
     fs::rename(&staging, &path)?;
     Ok(())
-}
-
-/// Every saved profile, keyed by Steam app id.
-pub fn load_all(dir: &Path) -> Result<BTreeMap<u32, GameProfile>> {
-    let mut all = BTreeMap::new();
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(all),
-        Err(err) => return Err(err.into()),
-    };
-    for entry in entries {
-        let name = entry?.file_name();
-        let Some(app) = name
-            .to_str()
-            .and_then(|n| n.strip_suffix(".json"))
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        all.insert(app, load(dir, app)?);
-    }
-    Ok(all)
 }
 
 #[cfg(test)]
@@ -448,17 +541,38 @@ mod tests {
     }
 
     #[test]
-    fn profiles_round_trip_and_defaults_delete_the_file() {
+    fn games_follow_global_defaults_unless_overridden() {
         let dir = tempfile::tempdir().unwrap();
-        let profile = GameProfile {
+        let global = GameProfile {
             hdr: true,
+            dlss_upgrade: true,
+            frame_rate_limit: 117,
             ..Default::default()
         };
-        save(dir.path(), 1091500, &profile).unwrap();
-        assert_eq!(load(dir.path(), 1091500).unwrap(), profile);
-        assert_eq!(load_all(dir.path()).unwrap().len(), 1);
-        save(dir.path(), 1091500, &GameProfile::default()).unwrap();
+        let mut overrides = Overrides::default();
+        overrides.set_flag("hdr", Some(false));
+        overrides.set_flag("proton_log", Some(true));
+        overrides.set_flag("frame_rate_limit", Some(true));
+        assert_eq!(overrides.len(), 2);
+        Profiles::save_global(dir.path(), &global).unwrap();
+        Profiles::save_game(dir.path(), 1091500, &overrides).unwrap();
+
+        let profiles = Profiles::load(dir.path()).unwrap();
+        assert_eq!(profiles.global, global);
+        let game = profiles.effective(1091500);
+        assert!(!game.hdr && game.dlss_upgrade && game.proton_log);
+        assert_eq!(game.frame_rate_limit, 117);
+        assert_eq!(profiles.effective(42), global);
+        assert_eq!(
+            global.enabled_titles(),
+            ["HDR", "Upgrade DLSS", "117 FPS limit"]
+        );
+
+        overrides.set_flag("hdr", None);
+        overrides.set_flag("proton_log", None);
+        Profiles::save_game(dir.path(), 1091500, &overrides).unwrap();
         assert!(!dir.path().join("1091500.json").exists());
-        assert_eq!(load(dir.path(), 42).unwrap(), GameProfile::default());
+        Profiles::save_global(dir.path(), &GameProfile::default()).unwrap();
+        assert_eq!(Profiles::load(dir.path()).unwrap(), Profiles::default());
     }
 }
