@@ -28,5 +28,5 @@ png = "0.18"
 tar = "0.4"
 flate2 = "1"
 xz2 = "0.1"
-zstd = "0.13"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zstd = "0.14"
+zip = { version = "9", default-features = false, features = ["deflate"] }
