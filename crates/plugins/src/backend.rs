@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use hyprdeck_core::{rt, store};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
@@ -19,8 +20,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::process;
 use crate::protocol::{
-    API_VERSION, ControllerFrame, ControllerStream, MAX_DOCUMENT, MAX_INPUT_FRAME, Manifest,
-    Request, Response, State, action_name, valid_id,
+    API_VERSION, ControllerFrame, HOST_FEATURES, KeyboardFrame, LiveStream, MAX_DOCUMENT,
+    MAX_INPUT_FRAME, Manifest, Request, Response, State, action_name, valid_id,
 };
 
 static OPERATIONS: Mutex<()> = Mutex::const_new(());
@@ -228,6 +229,7 @@ pub async fn request_in(
         method: if action.is_some() { "action" } else { "state" },
         action,
         args,
+        host_features: HOST_FEATURES,
     };
     let input = serde_json::to_vec(&request)?;
     ensure!(input.len() <= MAX_DOCUMENT, "request is too large");
@@ -280,13 +282,29 @@ impl Drop for InputStream {
     }
 }
 
-pub(crate) fn input_stream(
+/// One validated NDJSON snapshot of a visualization's live input stream.
+pub(crate) trait Frame: DeserializeOwned + std::fmt::Debug + Send + Sync + 'static {
+    fn validate(&self) -> Result<()>;
+}
+
+impl Frame for ControllerFrame {
+    fn validate(&self) -> Result<()> {
+        ControllerFrame::validate(self)
+    }
+}
+
+impl Frame for KeyboardFrame {
+    fn validate(&self) -> Result<()> {
+        KeyboardFrame::validate(self)
+    }
+}
+
+pub(crate) type FrameReceiver<F> = mpsc::Receiver<std::result::Result<F, String>>;
+
+pub(crate) fn input_stream<F: Frame>(
     id: String,
-    stream: ControllerStream,
-) -> (
-    InputStream,
-    mpsc::Receiver<std::result::Result<ControllerFrame, String>>,
-) {
+    stream: LiveStream,
+) -> (InputStream, FrameReceiver<F>) {
     let (stop, cancel) = oneshot::channel();
     let (sender, receiver) = mpsc::channel(8);
     rt::spawn(async move {
@@ -308,11 +326,11 @@ impl Drop for InputProcessGroup {
     }
 }
 
-async fn run_input_stream(
+async fn run_input_stream<F: Frame>(
     id: &str,
-    stream: &ControllerStream,
+    stream: &LiveStream,
     mut cancel: oneshot::Receiver<()>,
-    sender: &mpsc::Sender<std::result::Result<ControllerFrame, String>>,
+    sender: &mpsc::Sender<std::result::Result<F, String>>,
 ) -> Result<()> {
     stream.validate()?;
     let prepare = async {
@@ -384,15 +402,15 @@ async fn run_input_stream(
     Ok(())
 }
 
-async fn read_input_frames(
+async fn read_input_frames<F: Frame>(
     stdout: impl AsyncRead + Unpin,
-    sender: &mpsc::Sender<std::result::Result<ControllerFrame, String>>,
+    sender: &mpsc::Sender<std::result::Result<F, String>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
     loop {
         read_input_line(&mut reader, &mut line).await?;
-        let frame: ControllerFrame =
+        let frame: F =
             serde_json::from_slice(&line).context("invalid input stream NDJSON frame")?;
         frame.validate()?;
         sender.send(Ok(frame)).await.context("input view closed")?;
@@ -671,7 +689,8 @@ mod tests {
     #[tokio::test]
     async fn input_reader_keeps_button_edges_and_reports_disconnect() {
         let bytes = b"{\"inputs\":[{\"id\":\"a\",\"label\":\"A\",\"detail\":\"\",\"pressed\":true}],\"status\":\"Live input\"}\n{\"inputs\":[{\"id\":\"a\",\"label\":\"A\",\"detail\":\"\",\"pressed\":false}],\"status\":\"Live input\"}\n";
-        let (sender, mut receiver) = mpsc::channel(8);
+        let (sender, mut receiver) =
+            mpsc::channel::<std::result::Result<ControllerFrame, String>>(8);
         let error = read_input_frames(bytes.as_slice(), &sender)
             .await
             .unwrap_err();
@@ -693,6 +712,44 @@ mod tests {
                 .contains("invalid")
         );
     }
+    #[tokio::test]
+    async fn keyboard_frames_are_parsed_validated_and_bounded() {
+        let bytes = b"{\"status\":\"Live keys\",\"pressed\":[\"a\",\"l-shift\"]}\n{\"status\":\"Unavailable\",\"pressed\":null}\n";
+        let (sender, mut receiver) = mpsc::channel::<std::result::Result<KeyboardFrame, String>>(8);
+        let error = read_input_frames(bytes.as_slice(), &sender)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("EOF"));
+        let first = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(
+            (first.status.as_str(), first.pressed.as_deref()),
+            (
+                "Live keys",
+                Some(&["a".to_owned(), "l-shift".to_owned()][..])
+            )
+        );
+        assert!(receiver.recv().await.unwrap().unwrap().pressed.is_none());
+        // Validation failures end the stream instead of reaching the view.
+        let bytes = b"{\"status\":\"Live keys\",\"pressed\":[\"a\",\"a\"]}\n";
+        assert!(
+            read_input_frames(bytes.as_slice(), &sender)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+        // A controller frame is not a keyboard frame: the stream type is per view.
+        let bytes = b"{\"inputs\":[],\"status\":\"Live\",\"pressed\":7}\n";
+        assert!(
+            read_input_frames(bytes.as_slice(), &sender)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("invalid")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
@@ -810,6 +867,36 @@ mod tests {
                 .unwrap()
                 .title,
             "Previous runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_tell_plugins_which_host_features_exist() {
+        let _fixture = process::FIXTURE_LOCK.lock().await;
+        let temp = Temp::new();
+        let dir = temp.0.join("features");
+        let manifest = fixture(
+            &dir,
+            "1.0.0",
+            r#"{"api_version":1,"state":{"title":"Without features","groups":[]}}"#,
+        );
+        // Echo success only when the request carries the advertised feature list.
+        let script = concat!(
+            "#!/bin/sh\n",
+            "IFS= read -r request || [ -n \"$request\" ] || exit 8\n",
+            "case \"$request\" in\n",
+            "  *'\"host_features\":[\"keyboard_visualization\"]'*)\n",
+            "    printf '%s' '{\"api_version\":1,\"state\":{\"title\":\"Features\",\"groups\":[]}}' ;;\n",
+            "  *) exit 9 ;;\n",
+            "esac\n"
+        );
+        std::fs::write(dir.join(&manifest.executable), script).unwrap();
+        assert_eq!(
+            request_in(&dir, &manifest, Some("set"), Map::new())
+                .await
+                .unwrap()
+                .title,
+            "Features"
         );
     }
 

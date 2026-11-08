@@ -3,6 +3,7 @@ mod backend;
 mod controller;
 mod dpi;
 mod illustration;
+mod keyboard;
 mod page;
 mod process;
 mod products;

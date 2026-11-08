@@ -8,11 +8,11 @@ use adw::prelude::*;
 use gtk::{cairo, glib};
 
 use crate::backend::{self, InputStream};
-use crate::protocol::{Control, ControllerInput, ControllerStream, Visualization};
+use crate::protocol::{Control, ControllerFrame, ControllerInput, LiveStream, Visualization};
 
 const WIDTH: f64 = 800.0;
 const HEIGHT: f64 = 450.0;
-const GREEN: (f64, f64, f64) = (0.48, 0.94, 0.67);
+pub(crate) const GREEN: (f64, f64, f64) = (0.48, 0.94, 0.67);
 const CSS: &str = "
 .hd-controller { padding: 18px; }
 .hd-controller .hd-controller-eyebrow {
@@ -259,7 +259,7 @@ pub(crate) struct ControllerView {
 }
 struct Inner {
     plugin_id: String,
-    stream: RefCell<Option<ControllerStream>>,
+    stream: RefCell<Option<LiveStream>>,
     stream_lease: RefCell<Option<InputStream>>,
     stream_generation: Cell<u64>,
     stream_failed: Cell<bool>,
@@ -523,7 +523,10 @@ impl ControllerView {
             status,
             inputs,
             stream,
-        } = visualization;
+        } = visualization
+        else {
+            return;
+        };
         set_text(&self.inner.name, name);
         set_text(&self.inner.connection, connection);
         if *self.inner.stream.borrow() != *stream {
@@ -586,7 +589,8 @@ impl Inner {
             return;
         };
         let generation = self.stream_generation.get();
-        let (lease, mut receiver) = backend::input_stream(self.plugin_id.clone(), stream);
+        let (lease, mut receiver) =
+            backend::input_stream::<ControllerFrame>(self.plugin_id.clone(), stream);
         *self.stream_lease.borrow_mut() = Some(lease);
         self.status.set_text("Starting live input…");
         self.status.remove_css_class("error");
@@ -957,7 +961,7 @@ impl Inner {
     }
 }
 
-fn text(value: &str, class: &str) -> gtk::Label {
+pub(crate) fn text(value: &str, class: &str) -> gtk::Label {
     let label = gtk::Label::builder()
         .label(value)
         .wrap(true)
@@ -968,12 +972,12 @@ fn text(value: &str, class: &str) -> gtk::Label {
     }
     label
 }
-fn set_text(label: &gtk::Label, value: &str) {
+pub(crate) fn set_text(label: &gtk::Label, value: &str) {
     if label.text().as_str() != value {
         label.set_text(value);
     }
 }
-fn ensure_css() {
+pub(crate) fn ensure_css() {
     thread_local! { static INSTALLED: Cell<bool> = const { Cell::new(false) }; }
     if INSTALLED.get() {
         return;
@@ -1079,7 +1083,14 @@ fn grips(cr: &cairo::Context) {
         let _ = cr.restore();
     }
 }
-fn rounded_rect(cr: &cairo::Context, x: f64, y: f64, width: f64, height: f64, radius: f64) {
+pub(crate) fn rounded_rect(
+    cr: &cairo::Context,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    radius: f64,
+) {
     let r = radius.min(width * 0.5).min(height * 0.5);
     cr.new_sub_path();
     cr.arc(x + width - r, y + r, r, -PI * 0.5, 0.0);

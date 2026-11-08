@@ -1,0 +1,68 @@
+{
+  "api_version": 1,
+  "error": null,
+  "state": {
+    "title": "Example keyboards",
+    "description": "Fixture for the keyboard visualization kind",
+    "groups": [
+      {
+        "id": "board-overview",
+        "title": "Keyboard",
+        "description": "Per-key colours and live key presses",
+        "rows": [
+          {"id": "effect", "title": "Onboard effect", "subtitle": "Static"}
+        ],
+        "visualization": {
+          "kind": "keyboard",
+          "name": "Example keyboard",
+          "connection": "USB",
+          "status": "Static colour from the onboard effect",
+          "layout": {"width": 6.25, "height": 4.0},
+          "keys": [
+            {"id": "esc", "label": "Esc", "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "color": "#FF2200", "remap": "default"},
+            {"id": "f1", "label": "F1", "x": 1.25, "y": 0.0, "w": 1.0, "h": 1.0, "color": "#FF2200", "remap": "default"},
+            {"id": "f2", "label": "F2", "x": 2.25, "y": 0.0, "w": 1.0, "h": 1.0, "color": "#FF2200", "remap": "f13"},
+            {"id": "f3", "label": "F3", "x": 3.25, "y": 0.0, "w": 1.0, "h": 1.0, "color": null, "detail": "Colour unknown"},
+            {"id": "tab", "label": "Tab", "x": 0.0, "y": 1.0, "w": 1.5, "h": 1.0, "color": "#2060FF"},
+            {"id": "q", "label": "Q", "x": 1.5, "y": 1.0, "w": 1.0, "h": 1.0, "color": "#2060FF", "pressed": false},
+            {"id": "w", "label": "W", "x": 2.5, "y": 1.0, "w": 1.0, "h": 1.0, "color": "#FFFFFF", "pressed": false},
+            {"id": "e", "label": "E", "x": 3.5, "y": 1.0, "w": 1.0, "h": 1.0, "color": "#2060FF"},
+            {"id": "enter", "label": "Enter", "detail": "ISO Enter (tall)", "x": 4.75, "y": 1.0, "w": 1.5, "h": 2.0, "color": "#20C060"},
+            {"id": "caps", "label": "Caps", "x": 0.0, "y": 2.0, "w": 1.75, "h": 1.0, "color": "#2060FF"},
+            {"id": "a", "label": "A", "x": 1.75, "y": 2.0, "w": 1.0, "h": 1.0, "color": "#2060FF"},
+            {"id": "s", "label": "S", "x": 2.75, "y": 2.0, "w": 1.0, "h": 1.0, "color": "#2060FF"},
+            {"id": "d", "label": "D", "x": 3.75, "y": 2.0, "w": 1.0, "h": 1.0, "color": "#2060FF"},
+            {"id": "l-shift", "label": "Shift", "x": 0.0, "y": 3.0, "w": 2.25, "h": 1.0, "color": "#2060FF"},
+            {"id": "z", "label": "Z", "x": 2.25, "y": 3.0, "w": 1.0, "h": 1.0, "color": "#2060FF"},
+            {"id": "x", "label": "X", "x": 3.25, "y": 3.0, "w": 1.0, "h": 1.0, "color": "#2060FF"},
+            {"id": "r-shift", "label": "Shift", "x": 4.25, "y": 3.0, "w": 2.0, "h": 1.0, "color": "#2060FF"}
+          ],
+          "paint": {"label": "Apply colour to selected keys", "action": "set-key-colors", "args": {"device": "example-1"}},
+          "remap": {
+            "label": "Assign selected key",
+            "action": "remap-key",
+            "args": {"device": "example-1"},
+            "options": [
+              {"value": "default", "label": "Default"},
+              {"value": "f13", "label": "F13"},
+              {"value": "disabled", "label": "Disabled"}
+            ]
+          },
+          "stream": {"args": ["--input-stream", "example-1"]}
+        }
+      }
+    ],
+    "products": [
+      {
+        "id": "example-1",
+        "name": "Example keyboard",
+        "kind": "keyboard",
+        "description": "Fixture",
+        "status": "Connected",
+        "connection": "USB",
+        "battery": null,
+        "sections": [{"id": "overview", "title": "Overview", "groups": ["board-overview"]}]
+      }
+    ]
+  }
+}

@@ -8,6 +8,9 @@ use serde_json::{Map, Value};
 
 pub const API_VERSION: u32 = 1;
 pub const MAX_DOCUMENT: usize = 1024 * 1024;
+/// Optional renderer features this host supports, advertised in every request.
+/// Plugins may use them to omit fallback-only output; older hosts send none.
+pub const HOST_FEATURES: &[&str] = &["keyboard_visualization"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -117,6 +120,7 @@ pub struct Request<'a> {
     pub method: &'a str,
     pub action: Option<&'a str>,
     pub args: Map<String, Value>,
+    pub host_features: &'a [&'a str],
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -271,8 +275,76 @@ pub enum Visualization {
         status: String,
         inputs: Vec<ControllerInput>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        stream: Option<ControllerStream>,
+        stream: Option<LiveStream>,
     },
+    /// Free-form key rectangles in key units ("u"), drawn and hit-tested by the host.
+    Keyboard {
+        name: String,
+        connection: String,
+        status: String,
+        layout: KeyboardLayout,
+        keys: Vec<KeyboardKey>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        paint: Option<KeyPaint>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remap: Option<KeyRemap>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream: Option<LiveStream>,
+    },
+}
+
+pub(crate) const MAX_KEYS: usize = 512;
+const MAX_KEY_LABEL: usize = 32;
+const MAX_LAYOUT_UNITS: f64 = 64.0;
+// Tolerates decimal key-unit sums such as 0.1 + 0.2 at the layout edge.
+const LAYOUT_EPSILON: f64 = 1e-6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct KeyboardLayout {
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyboardKey {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub detail: String,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    /// `#RRGGBB`, or null when the colour is unknown (no readback, animated effect).
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub pressed: Option<bool>,
+    /// Current target, one of the visualization's `remap.options` values.
+    #[serde(default)]
+    pub remap: Option<String>,
+    #[serde(default)]
+    pub control: Option<Control>,
+}
+
+/// Host-submitted: `args.value = {"keys": [selected ids in layout order], "color": "#RRGGBB"}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyPaint {
+    pub label: String,
+    pub action: String,
+    #[serde(default)]
+    pub args: Map<String, Value>,
+}
+
+/// Host-submitted: `args.value = {"key": "<id>", "target": "<option value>"}`. Options are
+/// shared by every key so large target lists are not repeated per key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyRemap {
+    pub label: String,
+    pub action: String,
+    #[serde(default)]
+    pub args: Map<String, Value>,
+    pub options: Vec<OptionItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -293,26 +365,27 @@ pub struct ControllerInput {
 }
 
 /// Arguments for the enabled plugin's own installed executable, never a command.
+/// Shared by every visualization kind that offers a live input stream.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ControllerStream {
+pub struct LiveStream {
     pub args: Vec<String>,
 }
 
-impl ControllerStream {
+impl LiveStream {
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             !self.args.is_empty() && self.args.len() <= 16,
-            "controller stream requires 1..16 arguments"
+            "input stream requires 1..16 arguments"
         );
         let mut total = 0;
         for arg in &self.args {
             ensure!(
                 !arg.is_empty() && arg.len() <= 256 && !arg.chars().any(char::is_control),
-                "invalid controller stream argument"
+                "invalid input stream argument"
             );
             total += arg.len();
         }
-        ensure!(total <= 2048, "controller stream arguments are too large");
+        ensure!(total <= 2048, "input stream arguments are too large");
         Ok(())
     }
 }
@@ -329,6 +402,32 @@ impl ControllerFrame {
     pub(crate) fn validate(&self) -> Result<()> {
         text(&self.status, "controller stream status", false)?;
         validate_controller_inputs(&self.inputs)
+    }
+}
+
+/// One complete key-tester snapshot: every declared key not listed is released.
+/// `pressed: null` means live key state is unavailable (for example, no permission).
+#[derive(Debug, Deserialize)]
+pub(crate) struct KeyboardFrame {
+    pub status: String,
+    #[serde(default)]
+    pub pressed: Option<Vec<String>>,
+}
+
+impl KeyboardFrame {
+    pub(crate) fn validate(&self) -> Result<()> {
+        text(&self.status, "keyboard stream status", false)?;
+        if let Some(pressed) = &self.pressed {
+            ensure!(pressed.len() <= MAX_KEYS, "too many pressed keys");
+            let mut ids = HashSet::new();
+            for id in pressed {
+                ensure!(
+                    valid_id(id) && ids.insert(id),
+                    "invalid or duplicate pressed key id"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -350,9 +449,111 @@ impl Visualization {
                     stream.validate()?;
                 }
             }
+            Self::Keyboard {
+                name,
+                connection,
+                status,
+                layout,
+                keys,
+                paint,
+                remap,
+                stream,
+            } => {
+                text(name, "keyboard name", true)?;
+                text(connection, "keyboard connection", false)?;
+                text(status, "keyboard status", false)?;
+                if let Some(paint) = paint {
+                    text(&paint.label, "keyboard paint label", true)?;
+                    action_name(&paint.action)?;
+                }
+                let options = match remap {
+                    Some(remap) => {
+                        text(&remap.label, "keyboard remap label", true)?;
+                        action_name(&remap.action)?;
+                        ensure!(
+                            !remap.options.is_empty() && remap.options.len() <= 1024,
+                            "keyboard remap must have 1–1024 options"
+                        );
+                        let mut values = HashSet::new();
+                        for option in &remap.options {
+                            text(&option.value, "keyboard remap option", false)?;
+                            text(&option.label, "keyboard remap option label", true)?;
+                            ensure!(
+                                values.insert(option.value.as_str()),
+                                "duplicate keyboard remap option"
+                            );
+                        }
+                        Some(values)
+                    }
+                    None => None,
+                };
+                validate_keyboard_keys(layout, keys, options.as_ref())?;
+                if let Some(stream) = stream {
+                    stream.validate()?;
+                }
+            }
         }
         Ok(())
     }
+}
+
+fn validate_keyboard_keys(
+    layout: &KeyboardLayout,
+    keys: &[KeyboardKey],
+    remap: Option<&HashSet<&str>>,
+) -> Result<()> {
+    let units = 1.0..=MAX_LAYOUT_UNITS;
+    ensure!(
+        units.contains(&layout.width) && units.contains(&layout.height),
+        "keyboard layout must be 1–64 units in each dimension"
+    );
+    ensure!(
+        !keys.is_empty() && keys.len() <= MAX_KEYS,
+        "keyboard must have 1–{MAX_KEYS} keys"
+    );
+    let mut ids = HashSet::new();
+    for key in keys {
+        ensure!(
+            valid_id(&key.id) && ids.insert(key.id.as_str()),
+            "invalid or duplicate keyboard key id {:?}",
+            key.id
+        );
+        text(&key.label, "keyboard key label", true)?;
+        ensure!(
+            key.label.len() <= MAX_KEY_LABEL && !key.label.chars().any(char::is_control),
+            "keyboard key label for {} must be at most {MAX_KEY_LABEL} bytes without control characters",
+            key.id
+        );
+        text(&key.detail, "keyboard key detail", false)?;
+        ensure!(
+            [key.x, key.y, key.w, key.h]
+                .iter()
+                .all(|value| value.is_finite())
+                && key.x >= 0.0
+                && key.y >= 0.0
+                && key.w > 0.0
+                && key.h > 0.0
+                && key.x + key.w <= layout.width + LAYOUT_EPSILON
+                && key.y + key.h <= layout.height + LAYOUT_EPSILON,
+            "keyboard key {} lies outside the layout",
+            key.id
+        );
+        ensure!(
+            key.color.as_deref().is_none_or(color_value),
+            "keyboard key color must be #RRGGBB or null"
+        );
+        if let Some(value) = &key.remap {
+            ensure!(
+                remap.is_some_and(|options| options.contains(value.as_str())),
+                "keyboard key {} remap value is absent from remap options",
+                key.id
+            );
+        }
+        if let Some(control) = &key.control {
+            control.validate()?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_controller_inputs(inputs: &[ControllerInput]) -> Result<()> {
@@ -841,7 +1042,7 @@ mod tests {
             legacy,
             Visualization::Controller { stream: None, .. }
         ));
-        let stream = ControllerStream {
+        let stream = LiveStream {
             args: vec!["--input-stream".into(), "usb:1-8".into()],
         };
         assert!(stream.validate().is_ok());
@@ -854,7 +1055,7 @@ mod tests {
             vec!["x".into(); 17],
             vec!["x".repeat(256); 9],
         ] {
-            assert!(ControllerStream { args }.validate().is_err());
+            assert!(LiveStream { args }.validate().is_err());
         }
     }
 
@@ -888,6 +1089,182 @@ mod tests {
                 .unwrap()
                 .validate()
                 .is_err()
+        );
+    }
+
+    fn keyboard() -> Value {
+        serde_json::json!({
+            "kind": "keyboard", "name": "Keyboard", "connection": "USB", "status": "",
+            "layout": {"width": 15.0, "height": 5.0},
+            "keys": [
+                {"id": "esc", "label": "Esc", "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0,
+                 "color": "#FF2200", "pressed": null, "remap": "default"},
+                {"id": "enter", "label": "Enter", "x": 12.75, "y": 2.0, "w": 2.25, "h": 1.0}
+            ],
+            "paint": {"label": "Apply colour", "action": "set-key-colors", "args": {"device": "kb"}},
+            "remap": {"label": "Assign key", "action": "remap-key", "args": {"device": "kb"},
+                      "options": [{"value": "default", "label": "Default"},
+                                  {"value": "f13", "label": "F13"}]},
+            "stream": {"args": ["--input-stream", "kb"]}
+        })
+    }
+
+    fn keyboard_result(value: Value) -> Result<()> {
+        serde_json::from_value::<Visualization>(value)?.validate()
+    }
+
+    #[test]
+    fn keyboard_visualization_accepts_valid_and_legacy_minimal_documents() {
+        assert!(keyboard_result(keyboard()).is_ok());
+        let minimal = serde_json::json!({
+            "kind": "keyboard", "name": "Keyboard", "connection": "", "status": "",
+            "layout": {"width": 1.0, "height": 1.0},
+            "keys": [{"id": "a", "label": "A", "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}]
+        });
+        let parsed: Visualization = serde_json::from_value(minimal).unwrap();
+        assert!(parsed.validate().is_ok());
+        let Visualization::Keyboard {
+            paint,
+            remap,
+            stream,
+            keys,
+            ..
+        } = &parsed
+        else {
+            panic!("expected keyboard");
+        };
+        assert!(paint.is_none() && remap.is_none() && stream.is_none());
+        assert_eq!((keys[0].color.as_ref(), keys[0].pressed), (None, None));
+        // Optional fields stay absent when the host re-serializes a state.
+        let round_trip = serde_json::to_value(&parsed).unwrap();
+        assert!(round_trip.get("paint").is_none() && round_trip.get("stream").is_none());
+        assert_eq!(
+            serde_json::from_value::<Visualization>(round_trip).unwrap(),
+            parsed
+        );
+        // Decimal key-unit sums at the layout edge are not rejected by rounding.
+        // In binary floating point 1.1 + 2.2 exceeds 3.3.
+        let mut edge = keyboard();
+        edge["layout"] = serde_json::json!({"width": 3.3, "height": 1.0});
+        edge["keys"] = serde_json::json!([
+            {"id": "a", "label": "A", "x": 1.1, "y": 0.0, "w": 2.2, "h": 1.0}
+        ]);
+        assert!(keyboard_result(edge).is_ok());
+    }
+
+    #[test]
+    fn keyboard_visualization_rejects_invalid_identity_geometry_and_values() {
+        type Mutation = (&'static str, fn(&mut Value));
+        let mutations: Vec<Mutation> = vec![
+            ("empty name", |v| v["name"] = " ".into()),
+            ("zero layout", |v| v["layout"]["width"] = 0.5.into()),
+            ("huge layout", |v| v["layout"]["height"] = 65.0.into()),
+            ("no keys", |v| v["keys"] = serde_json::json!([])),
+            ("duplicate id", |v| v["keys"][1]["id"] = "esc".into()),
+            ("invalid id", |v| v["keys"][0]["id"] = "Esc".into()),
+            ("empty label", |v| v["keys"][0]["label"] = "".into()),
+            ("long label", |v| {
+                v["keys"][0]["label"] = "x".repeat(33).into()
+            }),
+            ("control label", |v| v["keys"][0]["label"] = "a\nb".into()),
+            ("negative x", |v| v["keys"][0]["x"] = (-0.5).into()),
+            ("zero width", |v| v["keys"][0]["w"] = 0.0.into()),
+            ("outside x", |v| v["keys"][1]["x"] = 13.0.into()),
+            ("outside y", |v| v["keys"][1]["h"] = 3.5.into()),
+            ("bad color", |v| v["keys"][0]["color"] = "red".into()),
+            ("unknown remap", |v| v["keys"][0]["remap"] = "f99".into()),
+            ("remap without action", |v| {
+                v.as_object_mut().unwrap().remove("remap");
+            }),
+            ("empty remap options", |v| {
+                v["remap"]["options"] = serde_json::json!([])
+            }),
+            ("duplicate remap option", |v| {
+                v["remap"]["options"][1]["value"] = "default".into();
+            }),
+            ("empty paint action", |v| v["paint"]["action"] = "".into()),
+            ("empty paint label", |v| v["paint"]["label"] = "".into()),
+            ("bad stream", |v| {
+                v["stream"]["args"] = serde_json::json!([])
+            }),
+            ("bad control", |v| {
+                v["keys"][0]["control"] =
+                    serde_json::json!({"kind": "color", "value": "red", "action": "set"});
+            }),
+        ];
+        for (what, mutate) in mutations {
+            let mut value = keyboard();
+            mutate(&mut value);
+            assert!(keyboard_result(value).is_err(), "{what} was accepted");
+        }
+        for value in [f64::NAN, f64::INFINITY] {
+            let Ok(mut visualization) = serde_json::from_value::<Visualization>(keyboard()) else {
+                panic!("valid fixture");
+            };
+            if let Visualization::Keyboard { keys, .. } = &mut visualization {
+                keys[0].x = value;
+            }
+            assert!(visualization.validate().is_err());
+        }
+        let mut many = keyboard();
+        many["layout"] = serde_json::json!({"width": 64.0, "height": 64.0});
+        many["keys"] = (0..=MAX_KEYS)
+            .map(|index| {
+                serde_json::json!({"id": format!("k{index}"), "label": "K",
+                    "x": (index % 64) as f64, "y": (index / 64) as f64, "w": 1.0, "h": 1.0})
+            })
+            .collect();
+        assert!(keyboard_result(many.clone()).is_err());
+        many["keys"].as_array_mut().unwrap().pop();
+        assert!(keyboard_result(many).is_ok());
+    }
+
+    #[test]
+    fn keyboard_frames_list_unique_valid_pressed_ids_or_null() {
+        let frame = |value: Value| {
+            serde_json::from_value::<KeyboardFrame>(value)
+                .map_err(anyhow::Error::from)
+                .and_then(|frame| frame.validate().map(|()| frame))
+        };
+        let parsed =
+            frame(serde_json::json!({"status": "Live keys", "pressed": ["a", "l-shift"]})).unwrap();
+        assert_eq!(parsed.pressed.unwrap(), ["a", "l-shift"]);
+        assert!(
+            frame(serde_json::json!({"status": "No permission", "pressed": null}))
+                .unwrap()
+                .pressed
+                .is_none()
+        );
+        assert!(frame(serde_json::json!({"status": "x", "pressed": ["a", "a"]})).is_err());
+        assert!(frame(serde_json::json!({"status": "x", "pressed": ["A"]})).is_err());
+        assert!(frame(serde_json::json!({"status": "x\0", "pressed": []})).is_err());
+        let too_many: Vec<_> = (0..=MAX_KEYS).map(|index| format!("k{index}")).collect();
+        assert!(frame(serde_json::json!({"status": "x", "pressed": too_many})).is_err());
+    }
+
+    #[test]
+    fn keyboard_example_fixture_is_a_valid_state() {
+        let response: Response = serde_json::from_str(include_str!(
+            "../../../docs/examples/keyboard-visualization.json"
+        ))
+        .unwrap();
+        assert_eq!(response.api_version, API_VERSION);
+        response.state.unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn requests_advertise_host_features() {
+        let request = Request {
+            api_version: API_VERSION,
+            method: "state",
+            action: None,
+            args: Map::new(),
+            host_features: HOST_FEATURES,
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({"api_version": 1, "method": "state", "action": null,
+                "args": {}, "host_features": ["keyboard_visualization"]})
         );
     }
 

@@ -8,9 +8,89 @@ use gtk::glib;
 
 use crate::controller::ControllerView;
 use crate::illustration;
+use crate::keyboard::{ActionBinder, KeyboardView};
 use crate::protocol::{Control, Group, Product, State, Visualization};
 
 type ControlRenderer = Rc<dyn Fn(&adw::ActionRow, Control)>;
+
+/// Host services shared by every native visualization: row controls and actions
+/// both run through the page's ordinary feedback and `run_action` path.
+#[derive(Clone)]
+pub(crate) struct ViewHost {
+    pub render_control: ControlRenderer,
+    pub bind_action: Rc<ActionBinder>,
+}
+
+/// One native visualization of whichever kind the plugin declared.
+pub(crate) enum VisualView {
+    Controller(ControllerView),
+    Keyboard(KeyboardView),
+}
+
+impl VisualView {
+    pub(crate) fn new(plugin_id: &str, visualization: &Visualization, host: &ViewHost) -> Self {
+        let render = host.render_control.clone();
+        let on_control = move |row: &adw::ActionRow, control| render(row, control);
+        match visualization {
+            Visualization::Controller { .. } => {
+                Self::Controller(ControllerView::new(plugin_id, visualization, on_control))
+            }
+            Visualization::Keyboard { .. } => {
+                let bind = host.bind_action.clone();
+                Self::Keyboard(KeyboardView::new(
+                    plugin_id,
+                    visualization,
+                    on_control,
+                    move |row| bind(row),
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn widget(&self) -> &gtk::Widget {
+        match self {
+            Self::Controller(view) => &view.widget,
+            Self::Keyboard(view) => &view.widget,
+        }
+    }
+
+    /// Whether `visualization` can update this view in place; a kind change
+    /// must rebuild it.
+    pub(crate) fn accepts(&self, visualization: &Visualization) -> bool {
+        matches!(
+            (self, visualization),
+            (Self::Controller(_), Visualization::Controller { .. })
+                | (Self::Keyboard(_), Visualization::Keyboard { .. })
+        )
+    }
+
+    pub(crate) fn update(&self, visualization: &Visualization) {
+        match self {
+            Self::Controller(view) => view.update(visualization),
+            Self::Keyboard(view) => view.update(visualization),
+        }
+    }
+
+    pub(crate) fn show_header(&self, visible: bool) {
+        match self {
+            Self::Controller(view) => view.show_header(visible),
+            Self::Keyboard(view) => view.show_header(visible),
+        }
+    }
+
+    pub(crate) fn disconnect(&self) {
+        match self {
+            Self::Controller(view) => view.disconnect(),
+            Self::Keyboard(view) => view.disconnect(),
+        }
+    }
+}
+
+pub(crate) fn visualization_name(visualization: &Visualization) -> &str {
+    match visualization {
+        Visualization::Controller { name, .. } | Visualization::Keyboard { name, .. } => name,
+    }
+}
 
 pub(crate) struct Products {
     pub widget: gtk::Box,
@@ -18,7 +98,7 @@ pub(crate) struct Products {
     navigation: gtk::Stack,
     plugin_id: String,
     views: RefCell<HashMap<String, ProductView>>,
-    render_control: ControlRenderer,
+    host: ViewHost,
 }
 
 struct ProductView {
@@ -36,6 +116,7 @@ struct ProductView {
     tabs: gtk::StackSwitcher,
     groups: HashMap<String, HashMap<String, GroupView>>,
     section_boxes: HashMap<String, gtk::Box>,
+    illustrations: HashMap<String, gtk::Widget>,
     empty_sections: HashMap<String, gtk::Label>,
     navigation_id: String,
 }
@@ -45,7 +126,7 @@ struct GroupView {
     list: gtk::ListBox,
     expander: Option<adw::ExpanderRow>,
     rows: Vec<adw::ActionRow>,
-    controller: Option<ControllerView>,
+    visual: Option<VisualView>,
     state: Group,
 }
 
@@ -197,11 +278,7 @@ pub(crate) fn compatible_control(old: &Control, new: &Control) -> bool {
     }
 }
 impl Products {
-    pub(crate) fn new(
-        plugin_id: &str,
-        navigation: &gtk::Stack,
-        render_control: impl Fn(&adw::ActionRow, Control) + 'static,
-    ) -> Self {
+    pub(crate) fn new(plugin_id: &str, navigation: &gtk::Stack, host: ViewHost) -> Self {
         ensure_products_css();
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 16);
         let intro = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -228,7 +305,7 @@ impl Products {
             navigation: navigation.clone(),
             plugin_id: plugin_id.into(),
             views: RefCell::new(HashMap::new()),
-            render_control: Rc::new(render_control),
+            host,
         }
     }
 
@@ -273,7 +350,7 @@ impl Products {
                     product,
                     state,
                     &self.plugin_id,
-                    &self.render_control,
+                    &self.host,
                     preserve_edits,
                     focus,
                 );
@@ -287,8 +364,8 @@ impl Products {
                 .set_text("Backend unavailable · Controls paused");
             for groups in view.groups.values() {
                 for group in groups.values() {
-                    if let Some(controller) = &group.controller {
-                        controller.disconnect();
+                    if let Some(visual) = &group.visual {
+                        visual.disconnect();
                     }
                 }
             }
@@ -480,6 +557,7 @@ impl ProductView {
             tabs,
             groups: HashMap::new(),
             section_boxes: HashMap::new(),
+            illustrations: HashMap::new(),
             empty_sections: HashMap::new(),
             navigation_id,
         }
@@ -490,7 +568,7 @@ impl ProductView {
         product: &Product,
         state: &State,
         plugin_id: &str,
-        render: &ControlRenderer,
+        host: &ViewHost,
         preserve: bool,
         focus: Option<&gtk::Widget>,
     ) {
@@ -541,6 +619,7 @@ impl ProductView {
             if let Some(widget) = self.section_boxes.remove(&id) {
                 self.sections.remove(&widget);
             }
+            self.illustrations.remove(&id);
             self.empty_sections.remove(&id);
         }
         // Nested identity maps avoid rebuilding composite strings on every live sample.
@@ -554,14 +633,29 @@ impl ProductView {
             self.groups.remove(&id);
         }
         for section in &product.sections {
+            let assigned = || {
+                section
+                    .groups
+                    .iter()
+                    .filter_map(|id| state.groups.iter().find(|group| &group.id == id))
+            };
+            let visualized = assigned().any(|group| group.visualization.is_some());
             if !self.section_boxes.contains_key(&section.id) {
                 let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
                 if section.id == "overview" && product.kind != "controller" {
-                    content.append(&illustration::product(&product.kind, true));
+                    let artwork = illustration::product(&product.kind, true);
+                    content.append(&artwork);
+                    self.illustrations
+                        .insert(section.id.clone(), artwork.upcast());
                 }
                 self.sections
                     .add_titled(&content, Some(&section.id), &section.title);
                 self.section_boxes.insert(section.id.clone(), content);
+            }
+            // A native visualization is the product's picture; generic artwork
+            // returns if the plugin stops providing one.
+            if let Some(artwork) = self.illustrations.get(&section.id) {
+                artwork.set_visible(!visualized);
             }
             let section_box = self
                 .section_boxes
@@ -602,13 +696,7 @@ impl ProductView {
                     section_box.remove(&group.widget);
                 }
             }
-            let prioritize_diagram = section.id == "overview" && product.kind == "controller";
-            let assigned = || {
-                section
-                    .groups
-                    .iter()
-                    .filter_map(|id| state.groups.iter().find(|group| &group.id == id))
-            };
+            let prioritize_diagram = section.id == "overview" && visualized;
             let ordered = assigned()
                 .filter(|group| prioritize_diagram && group.visualization.is_some())
                 .chain(
@@ -617,15 +705,16 @@ impl ProductView {
             let mut previous: Option<gtk::Widget> = None;
             for group in ordered {
                 if !groups.contains_key(&group.id) {
-                    let rendered = GroupView::new(group, plugin_id, render);
+                    let rendered = GroupView::new(group, plugin_id, host);
                     section_box.append(&rendered.widget);
                     groups.insert(group.id.clone(), rendered);
                 }
                 let rendered = groups.get_mut(&group.id).expect("group inserted");
-                rendered.update(group, plugin_id, render, preserve, focus);
-                if let Some(controller) = &rendered.controller {
-                    let duplicate = matches!(&group.visualization, Some(Visualization::Controller { name, .. }) if name == &product.name);
-                    controller.show_header(!duplicate);
+                rendered.update(group, plugin_id, host, preserve, focus);
+                if let (Some(visual), Some(visualization)) =
+                    (&rendered.visual, &group.visualization)
+                {
+                    visual.show_header(visualization_name(visualization) != product.name);
                 }
                 if rendered.widget.prev_sibling() != previous {
                     section_box.reorder_child_after(&rendered.widget, previous.as_ref());
@@ -671,14 +760,11 @@ impl GroupView {
         }
     }
 
-    fn new(state: &Group, plugin_id: &str, render: &ControlRenderer) -> Self {
+    fn new(state: &Group, plugin_id: &str, host: &ViewHost) -> Self {
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        let controller = state.visualization.as_ref().map(|visualization| {
-            let render = render.clone();
-            let view = ControllerView::new(plugin_id, visualization, move |row, control| {
-                render(row, control)
-            });
-            widget.append(&view.widget);
+        let visual = state.visualization.as_ref().map(|visualization| {
+            let view = VisualView::new(plugin_id, visualization, host);
+            widget.append(view.widget());
             view
         });
         let list = gtk::ListBox::builder()
@@ -715,7 +801,7 @@ impl GroupView {
             list,
             expander,
             rows: Vec::with_capacity(state.rows.len()),
-            controller,
+            visual,
             state: state.clone(),
         };
         for item in &state.rows {
@@ -723,7 +809,7 @@ impl GroupView {
             row.set_title(&item.title);
             row.set_subtitle(&item.subtitle);
             if let Some(control) = &item.control {
-                render(&row, control.clone());
+                (host.render_control)(&row, control.clone());
             }
             view.append_row(&row);
             view.rows.push(row);
@@ -735,15 +821,14 @@ impl GroupView {
         &mut self,
         state: &Group,
         plugin_id: &str,
-        render: &ControlRenderer,
+        host: &ViewHost,
         preserve: bool,
         focus: Option<&gtk::Widget>,
     ) {
+        let render = &host.render_control;
         if self.state == *state {
-            if let (Some(controller), Some(visualization)) =
-                (&self.controller, &state.visualization)
-            {
-                controller.update(visualization);
+            if let (Some(visual), Some(visualization)) = (&self.visual, &state.visualization) {
+                visual.update(visualization);
             }
             return;
         }
@@ -760,20 +845,23 @@ impl GroupView {
             !state.rows.is_empty()
                 || (state.visualization.is_none() && !state.description.is_empty()),
         );
-        match (&self.controller, &state.visualization) {
-            (Some(controller), Some(visualization)) => controller.update(visualization),
-            (Some(controller), None) => {
-                self.widget.remove(&controller.widget);
-                self.controller = None;
+        match (&self.visual, &state.visualization) {
+            (Some(visual), Some(visualization)) if visual.accepts(visualization) => {
+                visual.update(visualization);
+            }
+            (Some(visual), next) => {
+                // Removal, or a different kind: never feed one view another's data.
+                self.widget.remove(visual.widget());
+                self.visual = next.as_ref().map(|visualization| {
+                    let view = VisualView::new(plugin_id, visualization, host);
+                    self.widget.prepend(view.widget());
+                    view
+                });
             }
             (None, Some(visualization)) => {
-                let render = render.clone();
-                let controller =
-                    ControllerView::new(plugin_id, visualization, move |row, control| {
-                        render(row, control)
-                    });
-                self.widget.prepend(&controller.widget);
-                self.controller = Some(controller);
+                let view = VisualView::new(plugin_id, visualization, host);
+                self.widget.prepend(view.widget());
+                self.visual = Some(view);
             }
             (None, None) => {}
         }
