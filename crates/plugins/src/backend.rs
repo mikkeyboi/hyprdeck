@@ -5,7 +5,6 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -16,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::process;
 use crate::protocol::{
@@ -269,18 +268,15 @@ pub async fn request(id: &str, action: Option<&str>, args: Map<String, Value>) -
     request_in(&root().join(id), &manifest, action, args).await
 }
 
-/// Dropping the page's lease requests termination; the runtime task always reaps.
-pub(crate) struct InputStream {
-    stop: Option<oneshot::Sender<()>>,
+static INPUT_STREAMS: std::sync::LazyLock<process::StreamRegistry> =
+    std::sync::LazyLock::new(process::StreamRegistry::default);
+
+/// Stop active streams and reject queued/future startup before the app exits.
+pub(crate) fn shutdown_streams() {
+    INPUT_STREAMS.shutdown();
 }
 
-impl Drop for InputStream {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-    }
-}
+pub(crate) type InputStream = process::StreamLease;
 
 /// One validated NDJSON snapshot of a visualization's live input stream.
 pub(crate) trait Frame: DeserializeOwned + std::fmt::Debug + Send + Sync + 'static {
@@ -305,31 +301,24 @@ pub(crate) fn input_stream<F: Frame>(
     id: String,
     stream: LiveStream,
 ) -> (InputStream, FrameReceiver<F>) {
-    let (stop, cancel) = oneshot::channel();
+    let lease = INPUT_STREAMS.lease();
+    let task_lease = lease.clone();
     let (sender, receiver) = mpsc::channel(8);
     rt::spawn(async move {
-        if let Err(error) = run_input_stream(&id, &stream, cancel, &sender).await {
-            let _ = sender
-                .send(Err(format!("Live input disconnected: {error:#}")))
-                .await;
+        if let Err(error) = run_input_stream(&id, &stream, &task_lease, &sender).await {
+            // Never keep a terminated task alive behind a full UI channel. On
+            // overflow the receiver observes closure after its bounded backlog;
+            // both views treat closure as a disconnection as well.
+            let _ = sender.try_send(Err(format!("Live input disconnected: {error:#}")));
         }
     });
-    (InputStream { stop: Some(stop) }, receiver)
-}
-
-struct InputProcessGroup(u32);
-impl Drop for InputProcessGroup {
-    fn drop(&mut self) {
-        unsafe {
-            libc::kill(-(self.0 as i32), libc::SIGKILL);
-        }
-    }
+    (lease, receiver)
 }
 
 async fn run_input_stream<F: Frame>(
     id: &str,
     stream: &LiveStream,
-    mut cancel: oneshot::Receiver<()>,
+    lease: &InputStream,
     sender: &mpsc::Sender<std::result::Result<F, String>>,
 ) -> Result<()> {
     stream.validate()?;
@@ -339,29 +328,36 @@ async fn run_input_stream<F: Frame>(
         let manifest = installed(id)?;
         let dir = root().join(id);
         let executable = check_executable(&dir, &manifest)?;
-        let mut command = Command::new(executable);
-        command
-            .args(&stream.args)
-            .current_dir(dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
-        command
-            .spawn()
-            .context("starting installed plugin input stream")
+        let mut command = std::process::Command::new(executable);
+        command.args(&stream.args).current_dir(dir);
+        // Keep the installation lock until spawn completes: replacement must
+        // not swap the validated executable between check and exec.
+        lease.spawn(command).await
     };
-    let mut child = tokio::select! {
+    let child = tokio::select! {
         biased;
-        _ = &mut cancel => return Ok(()),
+        _ = lease.cancelled() => return Ok(()),
+        _ = sender.closed() => return Ok(()),
         child = prepare => child?,
     };
-    let group = child.id().map(InputProcessGroup);
-    let stdout = child.stdout.take().context("missing input stream stdout")?;
-    let mut stderr = child.stderr.take().context("missing input stream stderr")?;
+    supervise_input_stream(child, lease, sender).await
+}
+
+async fn supervise_input_stream<F: Frame>(
+    child: process::StreamChild,
+    lease: &InputStream,
+    sender: &mpsc::Sender<std::result::Result<F, String>>,
+) -> Result<()> {
+    let process::StreamChild {
+        stdout,
+        stderr,
+        mut exit,
+        lease: _process_guard,
+    } = child;
+    let stdout = tokio::process::ChildStdout::from_std(stdout)?;
+    let mut stderr = tokio::process::ChildStderr::from_std(stderr)?;
     let mut diagnostics = Vec::new();
-    let result = {
+    let (result, reaped) = {
         let read = async {
             tokio::try_join!(
                 read_input_frames(stdout, sender),
@@ -371,35 +367,37 @@ async fn run_input_stream<F: Frame>(
         };
         tokio::select! {
             biased;
-            _ = &mut cancel => None,
-            result = read => Some(result),
+            status = &mut exit => {
+                let status = status.context("input supervisor closed")??;
+                (Err(anyhow::anyhow!("input process exited with {status}")), true)
+            }
+            _ = lease.cancelled() => {
+                // The supervisor also marks cancellation on leader exit. Await
+                // its reaped status so this path cannot silently hide a death.
+                let status = (&mut exit).await.context("input supervisor closed")??;
+                (Err(anyhow::anyhow!("input process exited with {status}")), true)
+            }
+            _ = sender.closed() => return Ok(()),
+            result = read => (result, false),
         }
     };
-    // Kill the whole group, including children that might retain a pipe, then
-    // wait explicitly. Dropping a GTK view never abandons a zombie or daemon.
-    let exited = child.try_wait().ok().flatten();
-    drop(group);
-    let _ = child.start_kill();
-    child.wait().await.context("reaping plugin input stream")?;
-    if let Some(result) = result {
-        // stdout may close before stderr has been polled. Drain the terminated
-        // group's remaining diagnostics, still bounded in both time and memory.
-        let _ = tokio::time::timeout(
-            Duration::from_millis(50),
-            input_diagnostics(&mut stderr, &mut diagnostics),
-        )
-        .await;
-        let diagnostics = String::from_utf8_lossy(&diagnostics);
-        let diagnostics = diagnostics.trim();
-        if !diagnostics.is_empty() {
-            return result.with_context(|| format!("plugin diagnostics: {diagnostics}"));
-        }
-        if let Some(status) = exited {
-            return result.with_context(|| format!("input process exited with {status}"));
-        }
-        result?;
+    // Explicit cleanup on read/validation errors; task/page guards also cover
+    // every early return and task abort. Reaping runs outside the async runtime.
+    lease.stop();
+    if !reaped {
+        exit.await.context("input supervisor closed")??;
     }
-    Ok(())
+    let _ = tokio::time::timeout(
+        Duration::from_millis(50),
+        input_diagnostics(&mut stderr, &mut diagnostics),
+    )
+    .await;
+    let diagnostics = String::from_utf8_lossy(&diagnostics);
+    if diagnostics.trim().is_empty() {
+        result
+    } else {
+        result.with_context(|| format!("plugin diagnostics: {}", diagnostics.trim()))
+    }
 }
 
 async fn read_input_frames<F: Frame>(
@@ -748,6 +746,135 @@ mod tests {
                 .contains("invalid")
         );
         assert!(receiver.try_recv().is_err());
+    }
+
+    async fn retained_pipe_disconnection<F: Frame>(frame: &str) {
+        let registry = process::StreamRegistry::default();
+        let lease = registry.lease();
+        let fixture = process::stream_fixture::Fixture::new();
+        let child = lease.spawn(fixture.command(frame)).await.unwrap();
+        let (sender, mut receiver) = mpsc::channel(8);
+        let task_lease = lease.clone();
+        let task = tokio::spawn(async move {
+            let result = supervise_input_stream::<F>(child, &task_lease, &sender).await;
+            let _ = sender.try_send(Err(format!(
+                "Live input disconnected: {}",
+                result.unwrap_err()
+            )));
+        });
+        let pids = fixture.pids().await;
+        assert!(receiver.recv().await.unwrap().is_ok());
+        fixture.trigger("exit");
+        let error = tokio::time::timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("disconnected"));
+        task.await.unwrap();
+        process::stream_fixture::Fixture::assert_reaped_and_killed(pids);
+    }
+
+    #[tokio::test]
+    async fn keyboard_leader_exit_disconnects_without_pipe_eof_or_cancel() {
+        retained_pipe_disconnection::<KeyboardFrame>(
+            r#"{"api_version":1,"status":"pressed","pressed":["a"]}"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn controller_leader_exit_disconnects_without_pipe_eof_or_cancel() {
+        retained_pipe_disconnection::<ControllerFrame>(
+            r#"{"api_version":1,"status":"pressed","inputs":[{"id":"a","label":"A","detail":"","pressed":true}]}"#,
+        ).await;
+    }
+
+    #[tokio::test]
+    async fn full_channel_does_not_hide_leader_exit_or_block_cleanup() {
+        let registry = process::StreamRegistry::default();
+        let lease = registry.lease();
+        let fixture = process::stream_fixture::Fixture::new();
+        let child = lease
+            .spawn(fixture.command(r#"{"api_version":1,"status":"pressed","pressed":["a"]}"#))
+            .await
+            .unwrap();
+        let pids = fixture.pids().await;
+        let (sender, mut receiver) = mpsc::channel(1);
+        let task_lease = lease.clone();
+        let task = tokio::spawn(async move {
+            let result = supervise_input_stream::<KeyboardFrame>(child, &task_lease, &sender).await;
+            assert!(result.is_err());
+            assert!(sender.try_send(Err("disconnected".into())).is_err());
+        });
+        fixture.trigger("flood");
+        // Wait for the channel to fill but do not consume it.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while receiver.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fixture.trigger("exit");
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        process::stream_fixture::Fixture::assert_reaped_and_killed(pids);
+        assert!(receiver.recv().await.unwrap().is_ok());
+        // Views must clear pressed samples on channel closure if the explicit
+        // disconnection could not fit behind the last buffered frame.
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropped_receiver_cancels_idle_stream_with_retained_pipes() {
+        let registry = process::StreamRegistry::default();
+        let lease = registry.lease();
+        let fixture = process::stream_fixture::Fixture::new();
+        let child = lease
+            .spawn(fixture.command(r#"{"api_version":1,"status":"pressed","pressed":["a"]}"#))
+            .await
+            .unwrap();
+        let pids = fixture.pids().await;
+        let (sender, mut receiver) = mpsc::channel(8);
+        let task_lease = lease.clone();
+        let task = tokio::spawn(async move {
+            supervise_input_stream::<KeyboardFrame>(child, &task_lease, &sender).await
+        });
+        assert!(receiver.recv().await.unwrap().is_ok());
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        process::stream_fixture::Fixture::assert_reaped_and_killed(pids);
+    }
+
+    #[tokio::test]
+    async fn startup_cancelled_while_waiting_for_installation_lock_never_launches() {
+        let registry = process::StreamRegistry::default();
+        let lease = registry.lease();
+        // No XDG/plugin access occurs while the operations lock is held. Cancel
+        // must win before settings, manifest lookup, or executable preparation.
+        let _operations = OPERATIONS.lock().await;
+        let (sender, _receiver) = mpsc::channel(8);
+        let stream = LiveStream {
+            args: vec!["--input-stream".into()],
+        };
+        let mut startup = Box::pin(run_input_stream::<KeyboardFrame>(
+            "not-installed",
+            &stream,
+            &lease,
+            &sender,
+        ));
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(std::future::Future::poll(startup.as_mut(), &mut context).is_pending());
+        lease.stop();
+        assert!(startup.await.is_ok());
     }
 
     struct Temp(PathBuf);

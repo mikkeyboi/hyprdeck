@@ -220,8 +220,14 @@ The stream runs only while its controller view is mapped; it is not subject to t
 ordinary-request deadline and does not hold the request/action lock for its lifetime. State and
 actions still use `--request`, including capability/control metadata. Frames update the native
 view without polling state for each sample. EOF, invalid frames or backend failure clear live
-readings and show an explicit disconnection; remapping the view retries the stream. Leaving or
-destroying the view terminates and reaps the subprocess and its process-group descendants.
+readings and show an explicit disconnection. A successful state refresh authorizes one retry
+while mapped, with exponential backoff of 1, 2, 4, 8, 16, then at most 30 seconds. Repeated
+refreshes do not shorten that delay; a failed retry needs another successful refresh. A valid
+frame resets backoff. Healthy streams, including idle streams and unavailable-input frames,
+are never restarted by refreshes. Remapping the view starts a fresh attempt; a backend state
+error pauses streaming until a successful refresh. Unmap, destruction, and backend errors
+cancel pending retries and clear live readings. Leaving or destroying the view terminates
+and reaps the subprocess and its process-group descendants.
 Older hosts ignore the optional `stream` field, so keep useful state readings and rows as fallback.
 
 The **Plugins** manager handles installation, activation and updates separately. Installed
@@ -247,7 +253,7 @@ supplies artwork, markup or scripts. A complete example state is in
   "layout": {"width": 15.0, "height": 5.0},
   "keys": [
     {"id":"esc","label":"Esc","detail":"","x":0.0,"y":0.0,"w":1.0,"h":1.0,"color":"#FF2200","pressed":null,"remap":"default"},
-    {"id":"enter","label":"Enter","x":12.75,"y":2.0,"w":2.25,"h":1.0,"color":null}
+    {"id":"enter","label":"Enter","x":12.75,"y":2.0,"w":2.25,"h":1.0,"color":null,"remap":"default"}
   ],
   "paint": {"label":"Apply colour to selected keys","action":"set-key-colors","args":{"device":"k65plus-abc"}},
   "remap": {"label":"Assign selected key","action":"remap-key","args":{"device":"k65plus-abc"},
@@ -275,13 +281,20 @@ Schema and limits:
     effect); it is drawn hatched, never as black. Labels use dark or light ink by contrast.
   - `pressed` is Boolean or null (unavailable). It is used only when there is no `stream`.
   - `remap` (optional) is the key's current target and must be one of `remap.options[].value`;
-    a key `remap` without a visualization `remap` is rejected. Null or absent means unknown.
+    a key `remap` without a visualization `remap` is rejected. A non-null assignment explicitly
+    makes the key **eligible** for the shared remap action. Null or absent means **ineligible**,
+    not an unknown but writable assignment; omit it for firmware-only Fn keys or dials that
+    cannot use shared remapping. The host disables the shared choice and Apply for these keys,
+    and rejects submission in the Apply callback too. Use a declared option (for example
+    `"default"`) when a key is intended to be remappable.
   - `control` (optional) is an ordinary native control (schema below), shown when that key alone
-    is selected. Use it for small per-key settings only; large choices belong in `remap`.
+    is selected, independently of shared remap eligibility. An ineligible key may still have
+    its own `control`, such as a dial-mode action. Use it for small per-key settings only;
+    large choices belong in `remap`.
 - `paint` (optional): nonempty `label`, `action` name, and `args`. Omit it unless the backend can
   really colour individual keys.
 - `remap` (optional): nonempty `label`, `action` name, `args`, and 1–1,024 options with unique
-  values and nonempty labels. Options are shared by every key so a long target list is not
+  values and nonempty labels. Options are shared by eligible keys so a long target list is not
   repeated per key (the 1 MiB document limit applies to the whole state).
 - `stream` (optional) uses the same argument rules as the controller stream.
 
@@ -320,7 +333,9 @@ null (or absent) when live key state is unavailable, for example without input p
 declared key that is not listed is **released**, so frames stay small; send the whole current set,
 not deltas. Unknown ids are ignored. While a stream is configured, `pressed` in state is ignored
 and live presses come only from frames. Invalid frames, EOF or failure show a disconnection and
-clear presses to unavailable.
+clear presses to unavailable. The refresh-authorized retry/backoff and cancellation rules above
+also apply to keyboards; an unchanged successful state snapshot can recover a failed stream
+without navigating away.
 
 **Privacy:** a key-press stream is functionally a keylogger feed. The host runs it only while the
 keyboard view is mapped, kills its process group when the view is hidden or destroyed, and never

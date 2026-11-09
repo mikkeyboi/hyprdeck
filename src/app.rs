@@ -254,9 +254,10 @@ impl Shell {
         {
             let app = app.clone();
             window.connect_close_request(move |w| {
-                if tray_ok.get() && prefs::load().close_to_tray {
-                    w.set_visible(false);
-                } else {
+                // Unmap first in both cases: retained pages release leases and
+                // clear samples synchronously, including close-to-tray.
+                w.set_visible(false);
+                if !(tray_ok.get() && prefs::load().close_to_tray) {
                     app.quit();
                 }
                 glib::Propagation::Stop
@@ -446,6 +447,37 @@ pub fn run() -> glib::ExitCode {
         .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
 
+    // Every GApplication quit path (tray, action, last-window close) reaches
+    // shutdown, even if GTK never destroys/unmaps the retained shell itself.
+    app.connect_shutdown(|app| {
+        for window in app.windows() {
+            window.set_visible(false);
+        }
+        hd_plugins::shutdown_streams();
+    });
+    let signals = rt::runtime().block_on(async {
+        use tokio::signal::unix::{SignalKind, signal};
+        (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        )
+    });
+    let signals = match signals {
+        (Ok(mut terminate), Ok(mut interrupt)) => Some(rt::spawn(async move {
+            tokio::select! {
+                _ = terminate.recv() => {},
+                _ = interrupt.recv() => {},
+            }
+            // Termination does not depend on GTK servicing the quit event.
+            hd_plugins::shutdown_streams();
+            events::send(AppEvent::Quit);
+        })),
+        _ => {
+            tracing::error!("could not install application termination handlers");
+            None
+        }
+    };
+
     let shell: Rc<RefCell<Option<Rc<Shell>>>> = Rc::default();
     let tray_ok = Rc::new(Cell::new(false));
     let started = Rc::new(Cell::new(false));
@@ -498,7 +530,13 @@ pub fn run() -> glib::ExitCode {
         glib::ExitCode::SUCCESS
     });
 
-    app.run()
+    let result = app.run();
+    // Also cover failed registration / an event loop returning without startup.
+    hd_plugins::shutdown_streams();
+    if let Some(signals) = signals {
+        signals.abort();
+    }
+    result
 }
 
 fn install_actions(

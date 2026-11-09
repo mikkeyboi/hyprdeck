@@ -321,10 +321,18 @@ pub struct KeyboardKey {
     #[serde(default)]
     pub pressed: Option<bool>,
     /// Current target, one of the visualization's `remap.options` values.
+    /// Some target makes this key eligible for shared remapping; absent/null
+    /// means ineligible. A standalone `control` is independent of this field.
     #[serde(default)]
     pub remap: Option<String>,
     #[serde(default)]
     pub control: Option<Control>,
+}
+
+impl KeyboardKey {
+    pub(crate) fn can_remap(&self) -> bool {
+        self.remap.is_some()
+    }
 }
 
 /// Host-submitted: `args.value = {"keys": [selected ids in layout order], "color": "#RRGGBB"}`.
@@ -337,7 +345,8 @@ pub struct KeyPaint {
 }
 
 /// Host-submitted: `args.value = {"key": "<id>", "target": "<option value>"}`. Options are
-/// shared by every key so large target lists are not repeated per key.
+/// shared by eligible keys (`KeyboardKey.remap` is Some), so large target lists
+/// are not repeated per key. Absence of a per-key assignment forbids submission.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyRemap {
     pub label: String,

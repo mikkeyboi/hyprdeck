@@ -15,6 +15,7 @@ use crate::protocol::{
     Control, KeyPaint, KeyRemap, KeyboardFrame, KeyboardKey, KeyboardLayout, LiveStream,
     OptionItem, Visualization,
 };
+use crate::stream_retry::StreamRetry;
 
 const ACCENT: (f64, f64, f64) = (0.47, 0.72, 1.0);
 /// Pixels kept free around the drawing, matching the controller stage.
@@ -61,7 +62,7 @@ struct Inner {
     stream: RefCell<Option<LiveStream>>,
     stream_lease: RefCell<Option<InputStream>>,
     stream_generation: Cell<u64>,
-    stream_failed: Cell<bool>,
+    stream_retry: StreamRetry,
     mapped: Cell<bool>,
     paused: Cell<bool>,
     name: gtk::Label,
@@ -207,7 +208,7 @@ impl KeyboardView {
             stream: RefCell::new(None),
             stream_lease: RefCell::new(None),
             stream_generation: Cell::new(0),
-            stream_failed: Cell::new(false),
+            stream_retry: StreamRetry::default(),
             mapped: Cell::new(false),
             paused: Cell::new(false),
             name,
@@ -277,12 +278,12 @@ impl KeyboardView {
             inner.stop_stream();
             inner.stream.borrow_mut().clone_from(stream);
             inner.pressed.borrow_mut().fill(None);
-            inner.stream_failed.set(false);
+            inner.stream_retry.reset();
             inner.area.queue_draw();
             inner.refresh_telemetry();
         }
         if inner.paused.replace(false) {
-            inner.stream_failed.set(false);
+            inner.stream_retry.reset();
         }
         let live = stream.is_some();
         if !live {
@@ -434,7 +435,12 @@ impl Inner {
             let Some(index) = inner.selection.borrow().single() else {
                 return;
             };
-            let key = inner.keys.borrow()[index].id.clone();
+            let keys = inner.keys.borrow();
+            let Some(key) = keys.get(index).filter(|key| key.can_remap()) else {
+                return;
+            };
+            let key = key.id.clone();
+            drop(keys);
             let options = inner.remap_row.options.borrow();
             let Some(option) = options.get(inner.remap_row.choice.selected() as usize) else {
                 return;
@@ -544,7 +550,7 @@ impl Inner {
         root.connect_map(move |_| {
             if let Some(inner) = weak.upgrade() {
                 inner.mapped.set(true);
-                inner.stream_failed.set(false);
+                inner.stream_retry.reset();
                 inner.start_stream();
             }
         });
@@ -565,22 +571,28 @@ impl Inner {
     }
 
     fn stop_stream(&self) {
+        self.stream_retry.cancel();
         self.stream_generation
             .set(self.stream_generation.get().wrapping_add(1));
         self.stream_lease.borrow_mut().take();
+        self.set_pressed(None);
     }
 
     fn start_stream(self: &Rc<Self>) {
-        if !self.mapped.get()
-            || self.paused.get()
-            || self.stream_failed.get()
-            || self.stream_lease.borrow().is_some()
-        {
+        if !self.mapped.get() || self.paused.get() || self.stream_lease.borrow().is_some() {
             return;
         }
         let Some(stream) = self.stream.borrow().clone() else {
             return;
         };
+        let weak = Rc::downgrade(self);
+        if !self.stream_retry.ready(move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.start_stream();
+            }
+        }) {
+            return;
+        }
         let generation = self.stream_generation.get();
         let (lease, mut receiver) =
             backend::input_stream::<KeyboardFrame>(self.plugin_id.clone(), stream);
@@ -598,20 +610,30 @@ impl Inner {
                 }
                 match event {
                     Ok(frame) => {
+                        inner.stream_retry.reset();
                         set_text(&inner.status, &frame.status);
                         inner.set_pressed(frame.pressed.as_deref());
                     }
                     Err(error) => {
-                        inner.status.set_text(&error);
-                        inner.status.add_css_class("error");
-                        inner.stream_failed.set(true);
-                        inner.set_pressed(None);
-                        inner.stream_lease.borrow_mut().take();
-                        break;
+                        inner.stream_disconnected(&error);
+                        return;
                     }
                 }
             }
+            if let Some(inner) = weak.upgrade()
+                && inner.stream_generation.get() == generation
+            {
+                inner.stream_disconnected("Live input disconnected: stream closed");
+            }
         });
+    }
+
+    fn stream_disconnected(&self, error: &str) {
+        self.status.set_text(error);
+        self.status.add_css_class("error");
+        self.stream_retry.failed();
+        self.set_pressed(None);
+        self.stream_lease.borrow_mut().take();
     }
 
     /// Returns whether keys changed in a way that affects selection-dependent UI.
@@ -960,7 +982,7 @@ impl Inner {
                 *row.subject.borrow_mut() = subject;
             }
             match single.map(|index| &keys[index]) {
-                Some(key) => {
+                Some(key) if key.can_remap() => {
                     let current = key
                         .remap
                         .as_ref()
@@ -985,6 +1007,15 @@ impl Inner {
                     }
                     row.choice.set_sensitive(true);
                     row.apply.set_sensitive(true);
+                }
+                Some(key) => {
+                    row.row.remove_css_class("hd-pending-edit");
+                    set_subtitle(
+                        &row.row,
+                        &format!("{} · Shared remapping unavailable", key.label),
+                    );
+                    row.choice.set_sensitive(false);
+                    row.apply.set_sensitive(false);
                 }
                 None => {
                     set_subtitle(&row.row, "Select a single key to remap");
@@ -1305,7 +1336,7 @@ fn reading(key: &KeyboardKey, pressed: Option<bool>, remap: Option<&KeyRemap>) -
             key.remap
                 .as_ref()
                 .and_then(|value| remap.options.iter().find(|o| &o.value == value))
-                .map_or("Assignment unknown".to_owned(), |option| {
+                .map_or("Shared remapping unavailable".to_owned(), |option| {
                     format!("→ {}", option.label)
                 }),
         );
@@ -1830,6 +1861,24 @@ mod tests {
     }
 
     #[test]
+    fn shared_remap_requires_a_per_key_assignment_not_a_standalone_control() {
+        let mut key = key("fn", 0.0, 0.0, 1.0, 1.0);
+        assert!(!key.can_remap());
+        key.control = Some(Control::Button {
+            label: "Dial mode".into(),
+            action: "set-dial-mode".into(),
+            args: Map::new(),
+            destructive: false,
+        });
+        assert!(!key.can_remap());
+        assert!(key.control.is_some());
+        for target in ["default", "disabled", "f13"] {
+            key.remap = Some(target.into());
+            assert!(key.can_remap());
+        }
+    }
+
+    #[test]
     fn action_values_carry_layout_order_and_shared_args() {
         let keys = board();
         let mut selection = selection(keys.len());
@@ -1869,11 +1918,252 @@ mod tests {
         esc.color = None;
         assert_eq!(
             reading(&esc, None, Some(&remap)),
-            "Press state unavailable  ·  Colour unknown  ·  Assignment unknown"
+            "Press state unavailable  ·  Colour unknown  ·  Shared remapping unavailable"
         );
         assert_eq!(
             reading(&esc, Some(false), None),
             "Released  ·  Colour unknown"
         );
+    }
+
+    /// Run alone on an isolated Xvfb display with scratch XDG directories and
+    /// HD_NATIVE_STREAM_FIXTURE_DIR set. No HID, input devices, or services.
+    #[test]
+    #[ignore = "requires isolated Xvfb and HD_NATIVE_STREAM_FIXTURE_DIR"]
+    fn native_retry_and_remap_lifecycle() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let fixture = std::path::PathBuf::from(
+            std::env::var_os("HD_NATIVE_STREAM_FIXTURE_DIR").expect("isolated fixture directory"),
+        );
+        assert!(fixture.starts_with(std::env::temp_dir()));
+        assert!(backend::root().starts_with(&fixture));
+        assert!(hyprdeck_core::store::config_dir().starts_with(&fixture));
+        assert!(hyprdeck_core::store::state_dir().starts_with(&fixture));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let id = "native-retry-fixture";
+        let dir = backend::root().join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = crate::protocol::Manifest {
+            api_version: crate::protocol::API_VERSION,
+            id: id.into(),
+            name: "Synthetic retry fixture".into(),
+            description: String::new(),
+            version: "1.0.0".into(),
+            executable: "fixture".into(),
+            update_repo: "test/fixture".into(),
+            asset: format!("fixture-linux-{}", std::env::consts::ARCH),
+        };
+        std::fs::write(
+            dir.join("plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("fixture"), r#"#!/usr/bin/python3 -I
+import json, sys, time
+from pathlib import Path
+mode = sys.argv[1]
+root = Path('.')
+count = root / (mode + '-count')
+count.write_text(str(int(count.read_text()) + 1 if count.exists() else 1))
+if (root / (mode + '-fail')).exists(): sys.exit(1)
+if mode == 'keyboard': frame = {'status': 'Synthetic live', 'pressed': ['q']}
+else: frame = {'status': 'Synthetic live', 'inputs': [{'id': 'a', 'label': 'A', 'detail': '', 'pressed': True}]}
+print(json.dumps(frame), flush=True)
+while True:
+    if (root / (mode + '-fail')).exists(): sys.exit(1)
+    if (root / (mode + '-unavailable')).exists():
+        if mode == 'keyboard': frame = {'status': 'Synthetic unavailable', 'pressed': None}
+        else: frame = {'status': 'Synthetic unavailable', 'inputs': []}
+        print(json.dumps(frame), flush=True)
+        (root / (mode + '-unavailable')).unlink()
+    time.sleep(.005)
+"#).unwrap();
+        std::fs::set_permissions(dir.join("fixture"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        hyprdeck_core::store::save(
+            "plugins",
+            &backend::Settings {
+                enabled: [id.to_owned()].into_iter().collect(),
+            },
+        )
+        .unwrap();
+
+        gtk::init().unwrap();
+        fn wait(mut check: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !check() {
+                assert!(Instant::now() < deadline, "native lifecycle timed out");
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        fn pump(duration: Duration) {
+            let deadline = Instant::now() + duration;
+            while Instant::now() < deadline {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let starts = || {
+            std::fs::read_to_string(dir.join("keyboard-count"))
+                .unwrap()
+                .parse::<u32>()
+                .unwrap()
+        };
+        let mut keys = board();
+        keys[0].remap = Some("default".into());
+        keys[1].control = Some(Control::Button {
+            label: "Standalone mode".into(),
+            action: "set-mode".into(),
+            args: Map::new(),
+            destructive: false,
+        });
+        let mut visualization = Visualization::Keyboard {
+            name: "Fixture".into(),
+            connection: "Synthetic".into(),
+            status: "Snapshot".into(),
+            layout: KeyboardLayout {
+                width: 5.0,
+                height: 2.0,
+            },
+            keys,
+            paint: None,
+            remap: Some(KeyRemap {
+                label: "Assign".into(),
+                action: "remap".into(),
+                args: Map::new(),
+                options: vec![OptionItem {
+                    value: "default".into(),
+                    label: "Default".into(),
+                }],
+            }),
+            stream: Some(LiveStream {
+                args: vec!["keyboard".into()],
+            }),
+        };
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let calls = submitted.clone();
+        let controls = Rc::new(Cell::new(0));
+        let renders = controls.clone();
+        let view = KeyboardView::new(
+            id,
+            &visualization,
+            move |_, _| renders.set(renders.get() + 1),
+            move |_| {
+                let calls = calls.clone();
+                Rc::new(move |action, args| calls.borrow_mut().push((action, args)))
+            },
+        );
+        let window = gtk::Window::new();
+        window.set_child(Some(&view.widget));
+        window.present();
+        wait(|| view.inner.pressed.borrow()[0] == Some(true));
+        assert_eq!(starts(), 1);
+        let generation = view.inner.stream_generation.get();
+        for _ in 0..20 {
+            view.update(&visualization);
+        }
+        pump(Duration::from_millis(1100));
+        assert_eq!(starts(), 1, "idle healthy stream was restarted");
+        assert_eq!(view.inner.stream_generation.get(), generation);
+
+        view.inner.selection.borrow_mut().only(1);
+        view.inner.selection_changed();
+        assert!(!view.inner.remap_row.choice.is_sensitive());
+        assert!(!view.inner.remap_row.apply.is_sensitive());
+        assert_eq!(controls.get(), 1, "standalone control was suppressed");
+        // Bypass sensitivity to prove the handler itself prevents submission.
+        view.inner.remap_row.apply.emit_clicked();
+        assert!(submitted.borrow().is_empty());
+        view.inner.selection.borrow_mut().only(0);
+        view.inner.selection_changed();
+        assert!(view.inner.remap_row.apply.is_sensitive());
+        view.inner.remap_row.apply.emit_clicked();
+        assert_eq!(
+            submitted.borrow()[0].1["value"],
+            json!({"key":"q", "target":"default"})
+        );
+        // Eligibility can disappear while a choice is pending on the same key.
+        view.inner.remap_row.row.add_css_class("hd-pending-edit");
+        if let Visualization::Keyboard { keys, .. } = &mut visualization {
+            keys[0].remap = None;
+        }
+        view.update(&visualization);
+        view.inner.remap_row.apply.emit_clicked();
+        assert_eq!(submitted.borrow().len(), 1);
+        assert!(!view.inner.remap_row.apply.is_sensitive());
+        assert!(!view.inner.remap_row.row.has_css_class("hd-pending-edit"));
+
+        std::fs::write(dir.join("keyboard-fail"), b"").unwrap();
+        wait(|| view.inner.stream_lease.borrow().is_none());
+        assert!(view.inner.pressed.borrow().iter().all(Option::is_none));
+        assert!(
+            !view.inner.stream_retry.pending(),
+            "failure retried without a successful refresh"
+        );
+        view.update(&visualization);
+        assert!(view.inner.stream_retry.pending());
+        for _ in 0..20 {
+            view.update(&visualization);
+        }
+        pump(Duration::from_millis(200));
+        assert_eq!(starts(), 1, "refresh bypassed backoff");
+        // Let one authorized retry fail; there must be no autonomous loop.
+        wait(|| starts() == 2 && view.inner.stream_lease.borrow().is_none());
+        assert!(!view.inner.stream_retry.pending());
+        pump(Duration::from_millis(200));
+        assert_eq!(starts(), 2);
+        std::fs::remove_file(dir.join("keyboard-fail")).unwrap();
+        view.update(&visualization);
+        assert!(view.inner.stream_retry.pending());
+        pump(Duration::from_millis(200));
+        assert_eq!(starts(), 2, "second retry ignored exponential backoff");
+        wait(|| starts() == 3 && view.inner.pressed.borrow()[0] == Some(true));
+        assert!(!view.inner.stream_retry.pending());
+        // A valid unavailable frame is healthy too; never treat silence as failure.
+        std::fs::write(dir.join("keyboard-unavailable"), b"").unwrap();
+        wait(|| view.inner.pressed.borrow().iter().all(Option::is_none));
+        for _ in 0..20 {
+            view.update(&visualization);
+        }
+        assert_eq!(starts(), 3);
+
+        std::fs::write(dir.join("keyboard-fail"), b"").unwrap();
+        wait(|| view.inner.stream_lease.borrow().is_none());
+        view.update(&visualization);
+        assert!(view.inner.stream_retry.pending());
+        window.set_visible(false);
+        wait(|| !view.inner.mapped.get());
+        assert!(!view.inner.stream_retry.pending());
+        view.update(&visualization);
+        pump(Duration::from_millis(1100));
+        assert_eq!(starts(), 3, "hidden view retried");
+        std::fs::remove_file(dir.join("keyboard-fail")).unwrap();
+        window.present();
+        wait(|| starts() == 4 && view.inner.pressed.borrow()[0] == Some(true));
+
+        std::fs::write(dir.join("keyboard-fail"), b"").unwrap();
+        wait(|| view.inner.stream_lease.borrow().is_none());
+        view.update(&visualization);
+        view.disconnect();
+        assert!(!view.inner.stream_retry.pending());
+        view.inner.start_stream();
+        pump(Duration::from_millis(1100));
+        assert_eq!(starts(), 4, "paused backend retried");
+        std::fs::remove_file(dir.join("keyboard-fail")).unwrap();
+        view.update(&visualization);
+        wait(|| starts() == 5 && view.inner.pressed.borrow()[0] == Some(true));
+        std::fs::write(dir.join("keyboard-fail"), b"").unwrap();
+        wait(|| view.inner.stream_lease.borrow().is_none());
+        view.update(&visualization);
+        window.destroy();
+        assert!(!view.inner.stream_retry.pending());
+        assert!(!view.inner.mapped.get());
+        // Destroy the view itself too, covering both signal cleanup and Drop.
+        drop(view);
+        pump(Duration::from_millis(1100));
+        assert_eq!(starts(), 5, "destroyed view retried");
+        crate::controller::native_retry_lifecycle(id, &dir);
     }
 }
