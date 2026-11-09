@@ -12,8 +12,8 @@ use hyprdeck_core::{
 use serde_json::{Map, Value};
 
 use crate::backend::{self, Installed};
-use crate::controller::ControllerView;
-use crate::products::Products;
+use crate::keyboard::ActionSubmit;
+use crate::products::{Products, ViewHost, VisualView};
 use crate::protocol::{Control, State};
 use crate::releases;
 
@@ -65,7 +65,7 @@ struct Rendered {
     title: gtk::Label,
     description: gtk::Label,
     groups: Vec<(adw::PreferencesGroup, Vec<adw::ActionRow>)>,
-    controllers: Vec<Option<ControllerView>>,
+    visuals: Vec<Option<VisualView>>,
 }
 
 #[derive(Clone)]
@@ -140,7 +140,7 @@ fn number_value(value: f64) -> Value {
         Value::from(value)
     }
 }
-fn color_hex(color: &gtk::gdk::RGBA) -> String {
+pub(crate) fn color_hex(color: &gtk::gdk::RGBA) -> String {
     format!(
         "#{:02X}{:02X}{:02X}",
         (color.red() * 255.0).round() as u8,
@@ -148,7 +148,7 @@ fn color_hex(color: &gtk::gdk::RGBA) -> String {
         (color.blue() * 255.0).round() as u8
     )
 }
-fn color_picker(value: &str) -> gtk::ColorDialogButton {
+pub(crate) fn color_picker(value: &str) -> gtk::ColorDialogButton {
     let dialog = gtk::ColorDialog::builder()
         .title("Choose lighting color")
         .with_alpha(false)
@@ -730,8 +730,8 @@ impl Page {
             self.manager.set_visible(true);
             view.state.set_sensitive(false);
             if let Some(rendered) = view.rendered.borrow().as_ref() {
-                for controller in rendered.controllers.iter().flatten() {
-                    controller.disconnect();
+                for visual in rendered.visuals.iter().flatten() {
+                    visual.disconnect();
                 }
             }
             if let Some(products) = view.products.borrow().as_ref() {
@@ -762,8 +762,8 @@ impl Page {
                 self.manager.set_visible(true);
                 view.state.set_sensitive(false);
                 if let Some(rendered) = view.rendered.borrow().as_ref() {
-                    for controller in rendered.controllers.iter().flatten() {
-                        controller.disconnect();
+                    for visual in rendered.visuals.iter().flatten() {
+                        visual.disconnect();
                     }
                 }
                 if let Some(products) = view.products.borrow().as_ref() {
@@ -834,6 +834,41 @@ impl Page {
             if let Some(products) = view.products.borrow().as_ref() { products.set_sensitive(true); }
         });
     }
+    /// Host services for native visualizations, routed through this page.
+    fn view_host(self: &PageRef, view: &Rc<PluginView>) -> ViewHost {
+        let page = Rc::downgrade(self);
+        let target = Rc::downgrade(view);
+        let render_control = Rc::new(move |row: &adw::ActionRow, control| {
+            if let (Some(page), Some(view)) = (page.upgrade(), target.upgrade()) {
+                page.control(&view, row, control);
+            }
+        });
+        let page = Rc::downgrade(self);
+        let target = Rc::downgrade(view);
+        let bind_action = Rc::new(move |row: &adw::ActionRow| -> ActionSubmit {
+            // Feedback is attached once per row; each submission reuses it.
+            let feedback = ActionFeedback::new(row);
+            let page = page.clone();
+            let target = target.clone();
+            let submitted = row.downgrade();
+            Rc::new(move |action, args| {
+                if let (Some(page), Some(view)) = (page.upgrade(), target.upgrade()) {
+                    page.run_action(
+                        &view,
+                        action,
+                        args,
+                        false,
+                        submitted.upgrade(),
+                        feedback.clone(),
+                    );
+                }
+            })
+        });
+        ViewHost {
+            render_control,
+            bind_action,
+        }
+    }
     fn render(self: &PageRef, view: &Rc<PluginView>, state: State) {
         self.refresh_interval_ms.set(
             self.refresh_interval_ms
@@ -846,13 +881,7 @@ impl Page {
                     view.state.remove(&child);
                 }
                 view.rendered.borrow_mut().take();
-                let page = Rc::downgrade(self);
-                let target = Rc::downgrade(view);
-                let products = Products::new(&view.id, &self.navigation, move |row, control| {
-                    if let (Some(page), Some(view)) = (page.upgrade(), target.upgrade()) {
-                        page.control(&view, row, control);
-                    }
-                });
+                let products = Products::new(&view.id, &self.navigation, self.view_host(view));
                 view.state.append(&products.widget);
                 *view.products.borrow_mut() = Some(products);
             }
@@ -880,30 +909,33 @@ impl Page {
             let rendered = view.rendered.borrow();
             if let Some(old) = rendered.as_ref() {
                 if old.state == state {
-                    for (controller, group) in old.controllers.iter().zip(&state.groups) {
-                        if let (Some(controller), Some(visualization)) =
-                            (controller, &group.visualization)
+                    for (visual, group) in old.visuals.iter().zip(&state.groups) {
+                        if let (Some(visual), Some(visualization)) = (visual, &group.visualization)
                         {
-                            controller.update(visualization);
+                            visual.update(visualization);
                         }
                     }
                     return;
                 }
+                // A visualization changing kind (controller → keyboard) rebuilds.
+                let kind = |group: &crate::protocol::Group| {
+                    group.visualization.as_ref().map(std::mem::discriminant)
+                };
                 let same_shape = old.state.groups.len() == state.groups.len()
                     && old.state.groups.iter().zip(&state.groups).all(|(a, b)| {
                         a.id == b.id
                             && a.collapsed == b.collapsed
-                            && a.visualization.is_some() == b.visualization.is_some()
+                            && kind(a) == kind(b)
                             && a.rows.len() == b.rows.len()
                             && a.rows.iter().zip(&b.rows).all(|(a, b)| a.id == b.id)
                     });
                 if same_shape {
                     old.title.set_text(&state.title);
-                    for (controller, section) in old.controllers.iter().zip(&state.groups) {
-                        if let (Some(controller), Some(visualization)) =
-                            (controller, &section.visualization)
+                    for (visual, section) in old.visuals.iter().zip(&state.groups) {
+                        if let (Some(visual), Some(visualization)) =
+                            (visual, &section.visualization)
                         {
-                            controller.update(visualization);
+                            visual.update(visualization);
                         }
                     }
                     old.description.set_text(&state.description);
@@ -952,6 +984,21 @@ impl Page {
                 }
             }
         }
+        // Visualizations keep their selection and live stream across a rebuild
+        // of the surrounding rows when their group and kind are unchanged.
+        let mut reusable: std::collections::HashMap<String, VisualView> = view
+            .rendered
+            .borrow_mut()
+            .take()
+            .map(|old| {
+                old.state
+                    .groups
+                    .into_iter()
+                    .zip(old.visuals)
+                    .filter_map(|(group, visual)| Some((group.id, visual?)))
+                    .collect()
+            })
+            .unwrap_or_default();
         while let Some(child) = view.state.first_child() {
             view.state.remove(&child);
         }
@@ -967,21 +1014,26 @@ impl Page {
         view.state.append(&title);
         view.state.append(&description);
         let mut groups = Vec::new();
-        let mut controllers = Vec::new();
+        let mut visuals = Vec::new();
+        let host = has_visualization.then(|| self.view_host(view));
         for section in &state.groups {
-            let controller = section.visualization.as_ref().map(|visualization| {
-                let page = Rc::downgrade(self);
-                let target = Rc::downgrade(view);
-                let controller =
-                    ControllerView::new(&view.id, visualization, move |row, control| {
-                        if let (Some(page), Some(view)) = (page.upgrade(), target.upgrade()) {
-                            page.control(&view, row, control);
-                        }
+            let visual =
+                section
+                    .visualization
+                    .as_ref()
+                    .zip(host.as_ref())
+                    .map(|(visualization, host)| {
+                        let visual = match reusable.remove(&section.id) {
+                            Some(visual) if visual.accepts(visualization) => {
+                                visual.update(visualization);
+                                visual
+                            }
+                            _ => VisualView::new(&view.id, visualization, host),
+                        };
+                        view.state.append(visual.widget());
+                        visual
                     });
-                view.state.append(&controller.widget);
-                controller
-            });
-            controllers.push(controller);
+            visuals.push(visual);
             let group = group(&section.title, &section.description);
             let mut rows = Vec::new();
             for item in &section.rows {
@@ -1008,7 +1060,7 @@ impl Page {
             title,
             description,
             groups,
-            controllers,
+            visuals,
         });
     }
     fn control(self: &PageRef, view: &Rc<PluginView>, row: &adw::ActionRow, control: Control) {

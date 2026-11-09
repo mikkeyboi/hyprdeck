@@ -3,11 +3,13 @@ mod backend;
 mod controller;
 mod dpi;
 mod illustration;
+mod keyboard;
 mod page;
 mod process;
 mod products;
 mod protocol;
 mod releases;
+mod stream_retry;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -62,6 +64,13 @@ pub fn start_background() {
 }
 
 const USAGE: &str = "usage: hyprdeck plugins list\n       hyprdeck plugins install <folder-or-owner/repo>\n       hyprdeck plugins enable <id>\n       hyprdeck plugins disable <id>\n       hyprdeck plugins state <id>\n       hyprdeck plugins action <id> <action> [JSON args]\n       hyprdeck plugins check [id]\n       hyprdeck plugins update <id>\n\nInstalling does not execute or enable a plugin. `enable` explicitly trusts unsandboxed code and runs its state handshake. Updates preserve activation and verify SHA256; enabled plugin updates run the new version's handshake. State/action require enable. JSON args must be an object. curl and sha256sum are required for GitHub releases.";
+
+/// Synchronously terminate visualization process groups before application exit.
+/// Safe to call repeatedly; subsequent stream startup is rejected. Reaping is
+/// owned by independent supervisors, never by the GTK loop.
+pub fn shutdown_streams() {
+    backend::shutdown_streams();
+}
 
 /// Existing feature dispatch convention: `None` unless the first token is plugins.
 pub fn cli(args: &[String]) -> Option<Result<()>> {

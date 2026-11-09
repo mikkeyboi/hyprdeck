@@ -89,19 +89,25 @@ Names/descriptions and state texts are capped at 16,384 UTF-8 bytes and cannot c
 
 ## Subprocess transport: API version 1
 
-The host starts `<installed-executable> --request` directly, with the plugin directory as its current directory. It writes one JSON request to stdin and closes stdin; a newline is not required. The executable must read until EOF, emit exactly one JSON response on stdout and exit. Diagnostics belong on stderr. No banners, progress output or logging on stdout. Requests inherit the user's environment; do not depend on GTK or a graphical session for ordinary state/actions. Controller input streaming is a separate optional subprocess interface described below, not an exception to the single-response request contract.
+The host starts `<installed-executable> --request` directly, with the plugin directory as its current directory. It writes one JSON request to stdin and closes stdin; a newline is not required. The executable must read until EOF, emit exactly one JSON response on stdout and exit. Diagnostics belong on stderr. No banners, progress output or logging on stdout. Requests inherit the user's environment; do not depend on GTK or a graphical session for ordinary state/actions. Live input streaming for controller and keyboard visualizations is a separate optional subprocess interface described below, not an exception to the single-response request contract.
 
 State request:
 
 ```json
-{"api_version":1,"method":"state","action":null,"args":{}}
+{"api_version":1,"method":"state","action":null,"args":{},"host_features":["keyboard_visualization"]}
 ```
 
 Action request:
 
 ```json
-{"api_version":1,"method":"action","action":"set","args":{"device":"stable-id","setting":"lighting","value":true}}
+{"api_version":1,"method":"action","action":"set","args":{"device":"stable-id","setting":"lighting","value":true},"host_features":["keyboard_visualization"]}
 ```
+
+`host_features` lists optional renderer features this host understands. It is sent with every
+request, state and action alike. Current features: `keyboard_visualization` (the `keyboard`
+visualization kind below). Plugins must ignore unknown entries, and must treat a missing field
+(older hosts) as an empty list: emit only what such a host validates, for example rows instead of a
+keyboard visualization. The list never grants permissions and is not a version number.
 
 Successful response, including after an action:
 
@@ -214,14 +220,133 @@ The stream runs only while its controller view is mapped; it is not subject to t
 ordinary-request deadline and does not hold the request/action lock for its lifetime. State and
 actions still use `--request`, including capability/control metadata. Frames update the native
 view without polling state for each sample. EOF, invalid frames or backend failure clear live
-readings and show an explicit disconnection; remapping the view retries the stream. Leaving or
-destroying the view terminates and reaps the subprocess and its process-group descendants.
+readings and show an explicit disconnection. A successful state refresh authorizes one retry
+while mapped, with exponential backoff of 1, 2, 4, 8, 16, then at most 30 seconds. Repeated
+refreshes do not shorten that delay; a failed retry needs another successful refresh. A valid
+frame resets backoff. Healthy streams, including idle streams and unavailable-input frames,
+are never restarted by refreshes. Remapping the view starts a fresh attempt; a backend state
+error pauses streaming until a successful refresh. Unmap, destruction, and backend errors
+cancel pending retries and clear live readings. Leaving or destroying the view terminates
+and reaps the subprocess and its process-group descendants.
 Older hosts ignore the optional `stream` field, so keep useful state readings and rows as fallback.
 
 The **Plugins** manager handles installation, activation and updates separately. Installed
 integrations have nested sidebar entries leading to their product cards and device pages.
 The controller rear layout remains illustrative; readings and mapping availability come from
 the backend rather than a claim that the host can configure every physical control.
+
+### Keyboard visualization
+
+Requires host feature `keyboard_visualization`; only emit it when the request lists that feature
+(see compatibility below). A keyboard visualization is a set of plugin-described key rectangles
+that the host draws natively: per-key colours, live key presses, multi-key selection, a paint
+action and a single-key remap action. Geometry and plain-text labels are data; the plugin never
+supplies artwork, markup or scripts. A complete example state is in
+[`docs/examples/keyboard-visualization.json`](examples/keyboard-visualization.json).
+
+```json
+"visualization": {
+  "kind": "keyboard",
+  "name": "K65 PLUS Wireless",
+  "connection": "SLIPSTREAM 2.4 GHz receiver",
+  "status": "Onboard effect: Rain (slow)",
+  "layout": {"width": 15.0, "height": 5.0},
+  "keys": [
+    {"id":"esc","label":"Esc","detail":"","x":0.0,"y":0.0,"w":1.0,"h":1.0,"color":"#FF2200","pressed":null,"remap":"default"},
+    {"id":"enter","label":"Enter","x":12.75,"y":2.0,"w":2.25,"h":1.0,"color":null,"remap":"default"}
+  ],
+  "paint": {"label":"Apply colour to selected keys","action":"set-key-colors","args":{"device":"k65plus-abc"}},
+  "remap": {"label":"Assign selected key","action":"remap-key","args":{"device":"k65plus-abc"},
+            "options":[{"value":"default","label":"Default"},{"value":"f13","label":"F13"}]},
+  "stream": {"args":["--input-stream","k65plus-abc"]}
+}
+```
+
+Schema and limits:
+
+- `name` is nonempty; `connection` and `status` are plain text (may be empty). When `name` equals
+  the product name, the card hides its duplicate header.
+- `layout.width` and `layout.height` are finite key units ("u", 1u = one standard key), each
+  1–64. Fractions are allowed.
+- `keys`: 1–512 entries, drawn in order (later keys are on top and win clicks where rectangles
+  overlap, for example ISO Enter). Keep the order stable; it is the "layout order" used below.
+  - `id` uses the safe-id rules and is unique within the visualization. Keep ids stable across
+    refreshes: selection, focus and pending edits follow ids.
+  - `label` is nonempty, at most 32 bytes, with no control characters. It is drawn as plain text,
+    shrunk and then ellipsized to fit. `detail` (optional) is plain text shown in the inspector and
+    tooltip.
+  - `x`, `y`, `w`, `h` are finite, `x, y ≥ 0`, `w, h > 0`, and the rectangle lies inside the
+    layout (`x + w ≤ width`, `y + h ≤ height`, with a 1e-6 tolerance for decimal sums).
+  - `color` is `#RRGGBB` or null. Null means **unknown** (no readback, an animated or onboard
+    effect); it is drawn hatched, never as black. Labels use dark or light ink by contrast.
+  - `pressed` is Boolean or null (unavailable). It is used only when there is no `stream`.
+  - `remap` (optional) is the key's current target and must be one of `remap.options[].value`;
+    a key `remap` without a visualization `remap` is rejected. A non-null assignment explicitly
+    makes the key **eligible** for the shared remap action. Null or absent means **ineligible**,
+    not an unknown but writable assignment; omit it for firmware-only Fn keys or dials that
+    cannot use shared remapping. The host disables the shared choice and Apply for these keys,
+    and rejects submission in the Apply callback too. Use a declared option (for example
+    `"default"`) when a key is intended to be remappable.
+  - `control` (optional) is an ordinary native control (schema below), shown when that key alone
+    is selected, independently of shared remap eligibility. An ineligible key may still have
+    its own `control`, such as a dial-mode action. Use it for small per-key settings only;
+    large choices belong in `remap`.
+- `paint` (optional): nonempty `label`, `action` name, and `args`. Omit it unless the backend can
+  really colour individual keys.
+- `remap` (optional): nonempty `label`, `action` name, `args`, and 1–1,024 options with unique
+  values and nonempty labels. Options are shared by eligible keys so a long target list is not
+  repeated per key (the 1 MiB document limit applies to the whole state).
+- `stream` (optional) uses the same argument rules as the controller stream.
+
+Submitted values. The host copies `args` and sets `args.value`, replacing any `value` in `args`:
+
+- Paint: `{"keys":["esc","f1","f2"],"color":"#RRGGBB"}`, every selected key id in layout order
+  (at least one) and the colour chosen in the row's colour button.
+- Remap: `{"key":"esc","target":"f13"}`, sent only while exactly one key is selected. `target` is
+  an option value.
+
+Both run like any other action: never retried, with Pending/Running/Completed/Failed feedback on
+the row, and the response's full state replaces the view's data. The view is updated in place, not
+rebuilt, so selection, focus, the pending paint colour and an unsaved remap choice survive refreshes
+and actions. A visualization whose kind changes (for example controller to keyboard) is rebuilt.
+
+Interaction (all host-owned): click selects one key, Ctrl+click toggles, Shift+click selects the
+rectangle between the anchor and the clicked key, and dragging selects every key the band touches
+(Ctrl/Shift add to the selection). Clicking empty space clears. The canvas is keyboard-focusable:
+arrow keys move focus, Space toggles, Shift+Arrow extends, Ctrl+A selects all, Escape clears (and,
+with nothing selected, leaves the device page as usual) and Enter selects the focused key and moves
+to its actions. A searchable key selector lists every key (repeated labels show their id), with an
+"Add to selection" toggle, Select all and Clear selection; the current selection is always written
+out as text and as the canvas's accessible description.
+
+#### Keyboard input stream
+
+A keyboard `stream` subprocess follows the controller stream's process, lifetime, line-size and
+stderr rules, but each NDJSON line is a keyboard frame:
+
+```json
+{"status":"Live keys · USB","pressed":["a","l-shift"]}
+```
+
+`status` is plain text (may be empty). `pressed` is an array of at most 512 unique safe ids, or
+null (or absent) when live key state is unavailable, for example without input permission. Every
+declared key that is not listed is **released**, so frames stay small; send the whole current set,
+not deltas. Unknown ids are ignored. While a stream is configured, `pressed` in state is ignored
+and live presses come only from frames. Invalid frames, EOF or failure show a disconnection and
+clear presses to unavailable. The refresh-authorized retry/backoff and cancellation rules above
+also apply to keyboards; an unchanged successful state snapshot can recover a failed stream
+without navigating away.
+
+**Privacy:** a key-press stream is functionally a keylogger feed. The host runs it only while the
+keyboard view is mapped, kills its process group when the view is hidden or destroyed, and never
+logs frames. Plugins should read input devices read-only and non-exclusively for this purpose,
+never write key events to stderr or files, and say in their documentation what the stream can see.
+Prefer emitting `pressed: null` with an explanatory `status` over asking users to widen permissions.
+
+**Compatibility:** hosts before this feature reject `"kind":"keyboard"` (and the whole state) as an
+unknown visualization kind, so an enable or update handshake fails and an update rolls back. Those
+hosts also send no `host_features`. Emit a keyboard visualization only when the request's
+`host_features` contains `keyboard_visualization`, and otherwise keep the same information as rows.
 
 
 ### Product cards and device pages
@@ -249,7 +374,8 @@ Legacy plugins without products keep their original group view.
 
 Product ids use the same safe-id rules as plugin ids, and must be unique. `kind` is `mouse`,
 `controller`, `dock`, `keyboard`, `keypad`, `headset`, `mousemat`, `accessory` or `peripheral`,
-selecting native artwork—not a plugin-supplied executable or remote image. Names and displayed strings are plain text. At most 64 products and 12 sections per
+selecting native artwork—not a plugin-supplied executable or remote image. An Overview section
+whose groups include a visualization shows that visualization first instead of the generic artwork. Names and displayed strings are plain text. At most 64 products and 12 sections per
 product; section ids are unique and every group reference must resolve to an existing group.
 Battery can be null; its percentage can be null or finite 0–100, charging can be null or Boolean,
 and source identifies the actual provider. Unknown values are not estimates.
@@ -520,8 +646,9 @@ never installs udev rules, system dependencies or companion software.
 Publish and install the compatible host **before** publishing a plugin that uses new controls or
 expanded validation limits. In particular, Razer 0.6.0 can advertise form choices beyond the 256-option
 limit of Hyprdeck 0.1.2. API version 1 does not negotiate host feature levels or a minimum host
-version; additive fields such as `stream` are ignored by older hosts, but unknown controls or
-unsupported limits fail the state handshake. An enabled update then rolls back; a disabled
+version; additive fields such as `stream` are ignored by older hosts, but unknown controls,
+visualization kinds or unsupported limits fail the state handshake. Gate new kinds on the request's
+`host_features` (for example `keyboard_visualization`), which older hosts do not send. An enabled update then rolls back; a disabled
 installation defers its handshake until explicit enable. A host release alone does not upgrade
 the running process: restart into it before updating/enabling the new plugin.
 
