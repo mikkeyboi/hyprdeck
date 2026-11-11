@@ -104,7 +104,8 @@ Action request:
 ```
 
 `host_features` lists optional renderer features this host understands. It is sent with every
-request, state and action alike. Current features: `keyboard_visualization` (the `keyboard`
+request, state and action alike. Current features: `keyboard_animation` (the keyboard
+visualization's `animation` field) and `keyboard_visualization` (the `keyboard`
 visualization kind below). Plugins must ignore unknown entries, and must treat a missing field
 (older hosts) as an empty list: emit only what such a host validates, for example rows instead of a
 keyboard visualization. The list never grants permissions and is not a version number.
@@ -297,6 +298,20 @@ Schema and limits:
   values and nonempty labels. Options are shared by eligible keys so a long target list is not
   repeated per key (the 1 MiB document limit applies to the whole state).
 - `stream` (optional) uses the same argument rules as the controller stream.
+- `animation` (optional, host feature `keyboard_animation`) names a lighting effect for the host
+  to preview on every key whose `color` is null, in place of the hatching:
+  `{"kind":"rain","speed":"slow","colors":["#00AAFF"]}`.
+  - `kind` is one of `rainbow_wave`, `wave`, `spiral`, `rain`, `watercolor`, `shift` (the whole
+    board changes colour together), `pulse` (breathing), `reactive` (a key lights when pressed) or
+    `ripple` (rings spread from pressed keys). A kind the host does not know is not an error; those
+    keys stay hatched.
+  - `speed` is `slow`, `medium` (default) or `fast`.
+  - `colors` is 0–8 `#RRGGBB` values. Empty means the effect's own colours (a rainbow).
+  - The preview is the host's approximation of the named effect, never a readback, and the legend
+    says so. `reactive` and `ripple` follow live presses and so need a `stream`. The host animates
+    only while the view is visible and draws one still frame when the desktop disables animations.
+  - Hosts without the feature ignore the field and keep hatching, so it is safe to send whenever
+    the request lists `keyboard_animation`.
 
 Submitted values. The host copies `args` and sets `args.value`, replacing any `value` in `args`:
 

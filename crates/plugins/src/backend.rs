@@ -1012,7 +1012,7 @@ mod tests {
             "#!/bin/sh\n",
             "IFS= read -r request || [ -n \"$request\" ] || exit 8\n",
             "case \"$request\" in\n",
-            "  *'\"host_features\":[\"keyboard_visualization\"]'*)\n",
+            "  *'\"host_features\":[\"keyboard_visualization\",\"keyboard_animation\"]'*)\n",
             "    printf '%s' '{\"api_version\":1,\"state\":{\"title\":\"Features\",\"groups\":[]}}' ;;\n",
             "  *) exit 9 ;;\n",
             "esac\n"

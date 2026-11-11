@@ -4,6 +4,7 @@ mod controller;
 mod dpi;
 mod illustration;
 mod keyboard;
+mod keyboard_fx;
 mod page;
 mod process;
 mod products;

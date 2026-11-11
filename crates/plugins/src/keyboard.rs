@@ -11,9 +11,10 @@ use serde_json::{Map, Value, json};
 
 use crate::backend::{self, InputStream};
 use crate::controller::{GREEN, ensure_css, rounded_rect, set_text, text};
+use crate::keyboard_fx::{self, Press, Spot};
 use crate::protocol::{
-    Control, KeyPaint, KeyRemap, KeyboardFrame, KeyboardKey, KeyboardLayout, LiveStream,
-    OptionItem, Visualization,
+    Control, KeyAnimation, KeyAnimationKind, KeyPaint, KeyRemap, KeyboardFrame, KeyboardKey,
+    KeyboardLayout, LiveStream, OptionItem, Visualization,
 };
 use crate::stream_retry::StreamRetry;
 
@@ -30,6 +31,12 @@ const DRAG_THRESHOLD: f64 = 4.0;
 const SUMMARY_LABELS: usize = 8;
 const MIN_HEIGHT: i32 = 140;
 const MAX_HEIGHT: i32 = 560;
+/// Effect previews redraw at most this often (microseconds): smooth enough, light on the CPU.
+const FRAME_INTERVAL: i64 = 48_000;
+/// The frame shown when the desktop asks for no animations.
+const STILL_FRAME: f64 = 1.3;
+const LEGEND_UNKNOWN: &str = "▨ Colour unknown";
+const LEGEND_PREVIEW: &str = "◐ Effect preview";
 
 type ControlCallback = dyn Fn(&adw::ActionRow, Control);
 /// Submits `(action, args)` through the host's native action path for one row.
@@ -96,6 +103,16 @@ struct Inner {
     /// Set while the view changes its own widgets, so notify handlers ignore it.
     syncing: Cell<bool>,
     on_control: Box<ControlCallback>,
+    legend_color: gtk::Label,
+    animation: RefCell<Option<Box<KeyAnimation>>>,
+    /// Monotonic time (µs) the view was created; effect previews count from here.
+    epoch: i64,
+    /// Recent presses for typing effects: key centre and monotonic press time (µs).
+    presses: RefCell<Vec<(f64, f64, i64)>>,
+    tick: RefCell<Option<gtk::TickCallbackId>>,
+    /// Set once in `connect`, so `&self` methods can hand the frame clock a weak handle.
+    this: RefCell<std::rc::Weak<Inner>>,
+    last_frame: Cell<i64>,
 }
 
 impl KeyboardView {
@@ -123,7 +140,8 @@ impl KeyboardView {
         pressed.add_css_class("hd-controller-active");
         legend.append(&pressed);
         legend.append(&text("▢ Selected", "hd-controller-legend"));
-        legend.append(&text("▨ Colour unknown", "hd-controller-legend"));
+        let legend_color = text(LEGEND_UNKNOWN, "hd-controller-legend");
+        legend.append(&legend_color);
         toolbar.append(&legend);
         let status = text("", "hd-controller-status");
         status.set_hexpand(true);
@@ -244,6 +262,13 @@ impl KeyboardView {
             band: Cell::new(None),
             syncing: Cell::new(false),
             on_control: Box::new(on_control),
+            legend_color,
+            animation: RefCell::new(None),
+            epoch: glib::monotonic_time(),
+            presses: RefCell::new(Vec::new()),
+            tick: RefCell::new(None),
+            this: RefCell::new(std::rc::Weak::new()),
+            last_frame: Cell::new(0),
         });
         inner.connect(&root, paint_submit, remap_submit);
         let view = Self {
@@ -267,11 +292,25 @@ impl KeyboardView {
             paint,
             remap,
             stream,
+            animation,
         } = visualization
         else {
             return;
         };
         let inner = &self.inner;
+        if *inner.animation.borrow() != *animation {
+            inner.animation.borrow_mut().clone_from(animation);
+            inner.presses.borrow_mut().clear();
+            set_text(
+                &inner.legend_color,
+                if inner.previewing() {
+                    LEGEND_PREVIEW
+                } else {
+                    LEGEND_UNKNOWN
+                },
+            );
+            inner.area.queue_draw();
+        }
         set_text(&inner.name, name);
         set_text(&inner.connection, connection);
         if *inner.stream.borrow() != *stream {
@@ -302,6 +341,7 @@ impl KeyboardView {
             inner.selection_changed();
         }
         inner.start_stream();
+        inner.sync_tick();
     }
 
     pub(crate) fn show_header(&self, visible: bool) {
@@ -371,6 +411,7 @@ impl RemapRow {
 
 impl Inner {
     fn connect(self: &Rc<Self>, root: &gtk::Box, paint: ActionSubmit, remap: ActionSubmit) {
+        *self.this.borrow_mut() = Rc::downgrade(self);
         let weak = Rc::downgrade(self);
         self.area.set_draw_func(move |_, cr, width, height| {
             if let Some(inner) = weak.upgrade() {
@@ -552,6 +593,7 @@ impl Inner {
                 inner.mapped.set(true);
                 inner.stream_retry.reset();
                 inner.start_stream();
+                inner.sync_tick();
             }
         });
         let weak = Rc::downgrade(self);
@@ -559,6 +601,7 @@ impl Inner {
             if let Some(inner) = weak.upgrade() {
                 inner.mapped.set(false);
                 inner.stop_stream();
+                inner.sync_tick();
             }
         });
         let weak = Rc::downgrade(self);
@@ -566,8 +609,72 @@ impl Inner {
             if let Some(inner) = weak.upgrade() {
                 inner.mapped.set(false);
                 inner.stop_stream();
+                inner.sync_tick();
             }
         });
+    }
+
+    /// An effect preview is configured and this host knows how to draw it.
+    fn previewing(&self) -> bool {
+        self.animation
+            .borrow()
+            .as_ref()
+            .is_some_and(|animation| animation.kind != KeyAnimationKind::Unknown)
+    }
+
+    fn animations_enabled(&self) -> bool {
+        self.area.settings().is_gtk_enable_animations()
+    }
+
+    /// Forget presses too old to light anything; returns how many remain.
+    fn prune_presses(&self, now: i64) -> usize {
+        let mut presses = self.presses.borrow_mut();
+        presses.retain(|(_, _, at)| (now - at) as f64 / 1e6 < keyboard_fx::PRESS_LIFE);
+        presses.len()
+    }
+
+    /// Redraw on the frame clock only while a mapped preview is actually moving.
+    fn should_tick(&self) -> bool {
+        let presses = self.prune_presses(glib::monotonic_time());
+        self.mapped.get()
+            && self.animations_enabled()
+            && self
+                .animation
+                .borrow()
+                .as_ref()
+                .is_some_and(|animation| keyboard_fx::moving(animation, presses))
+    }
+
+    fn sync_tick(&self) {
+        let wanted = self.should_tick();
+        if !wanted {
+            if let Some(tick) = self.tick.borrow_mut().take() {
+                tick.remove();
+                self.area.queue_draw();
+            }
+            return;
+        }
+        if self.tick.borrow().is_some() {
+            return;
+        }
+        let weak = self.this.borrow().clone();
+        let tick = self.area.add_tick_callback(move |area, clock| {
+            let Some(inner) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !inner.should_tick() {
+                inner.tick.borrow_mut().take();
+                area.queue_draw();
+                return glib::ControlFlow::Break;
+            }
+            let now = clock.frame_time();
+            if now - inner.last_frame.get() >= FRAME_INTERVAL {
+                inner.last_frame.set(now);
+                area.queue_draw();
+            }
+            glib::ControlFlow::Continue
+        });
+        *self.tick.borrow_mut() = Some(tick);
     }
 
     fn stop_stream(&self) {
@@ -709,8 +816,30 @@ impl Inner {
         if *self.pressed.borrow() == next {
             return;
         }
+        if self
+            .animation
+            .borrow()
+            .as_ref()
+            .is_some_and(|animation| keyboard_fx::reactive(animation.kind))
+        {
+            let now = glib::monotonic_time();
+            let keys = self.keys.borrow();
+            let old = self.pressed.borrow();
+            let mut presses = self.presses.borrow_mut();
+            for (index, key) in keys.iter().enumerate() {
+                let was = old.get(index).copied().flatten() == Some(true);
+                if next.get(index).copied().flatten() == Some(true) && !was {
+                    let (x, y) = center(key);
+                    presses.push((x, y, now));
+                }
+            }
+            // Bounded even if a stream reports presses faster than they fade.
+            let excess = presses.len().saturating_sub(64);
+            presses.drain(..excess);
+        }
         *self.pressed.borrow_mut() = next;
         self.area.queue_draw();
+        self.sync_tick();
         self.refresh_telemetry();
         if self.selection.borrow().single().is_some() {
             self.refresh_inspector();
@@ -1104,10 +1233,58 @@ impl Inner {
         let pressed = self.pressed.borrow();
         let selection = self.selection.borrow();
         let focus = selection.focus.filter(|_| self.area.has_focus());
+        let animation = self.animation.borrow();
+        let preview = animation
+            .as_ref()
+            .filter(|animation| animation.kind != KeyAnimationKind::Unknown);
+        let now = glib::monotonic_time();
+        let time = if self.animations_enabled() {
+            (now - self.epoch) as f64 / 1e6
+        } else {
+            STILL_FRAME
+        };
+        let presses: Vec<Press> = self
+            .presses
+            .borrow()
+            .iter()
+            .map(|(x, y, at)| Press {
+                x: *x,
+                y: *y,
+                age: (now - at) as f64 / 1e6,
+            })
+            .collect();
+        let fills: Vec<Option<(f64, f64, f64)>> = keys
+            .iter()
+            .map(|key| {
+                key.color.as_deref().and_then(parse_color).or_else(|| {
+                    let (x, y) = center(key);
+                    preview.map(|animation| {
+                        keyboard_fx::color(
+                            animation,
+                            time,
+                            Spot {
+                                x,
+                                y,
+                                width: layout.width,
+                                height: layout.height,
+                            },
+                            &presses,
+                        )
+                    })
+                })
+            })
+            .collect();
+        // Light spilling onto the chassis, under every key cap.
+        for (key, fill) in keys.iter().zip(&fills) {
+            if let Some(fill) = fill {
+                draw_glow(cr, key, *fill);
+            }
+        }
         for (index, key) in keys.iter().enumerate() {
             draw_key(
                 cr,
                 key,
+                fills[index],
                 KeyState {
                     pressed: pressed.get(index).copied().flatten() == Some(true),
                     selected: selection.selected.get(index).copied().unwrap_or(false),
@@ -1177,7 +1354,34 @@ struct KeyState {
     focused: bool,
 }
 
-fn draw_key(cr: &cairo::Context, key: &KeyboardKey, state: KeyState, px: f64) {
+/// A halo in the key's colour, scaled by how bright that colour is. Two flat fills rather than
+/// a gradient: this runs for every key on every animation frame.
+fn draw_glow(cr: &cairo::Context, key: &KeyboardKey, fill: (f64, f64, f64)) {
+    let strength = fill.0.max(fill.1).max(fill.2);
+    if strength < 0.2 {
+        return;
+    }
+    for (spread, alpha) in [(0.16, 0.10), (0.07, 0.16)] {
+        rounded_rect(
+            cr,
+            key.x - spread,
+            key.y - spread,
+            key.w + spread * 2.0,
+            key.h + spread * 2.0,
+            0.12 + spread,
+        );
+        cr.set_source_rgba(fill.0, fill.1, fill.2, alpha * strength);
+        let _ = cr.fill();
+    }
+}
+
+fn draw_key(
+    cr: &cairo::Context,
+    key: &KeyboardKey,
+    fill: Option<(f64, f64, f64)>,
+    state: KeyState,
+    px: f64,
+) {
     let gap = GAP.min(key.w * 0.2).min(key.h * 0.2);
     let (x, y, w, h) = (
         key.x + gap,
@@ -1186,7 +1390,6 @@ fn draw_key(cr: &cairo::Context, key: &KeyboardKey, state: KeyState, px: f64) {
         key.h - gap * 2.0,
     );
     let radius = 0.12_f64.min(w * 0.25).min(h * 0.25);
-    let fill = key.color.as_deref().and_then(parse_color);
     let base = fill.unwrap_or((0.17, 0.21, 0.23));
     rounded_rect(cr, x, y, w, h, radius);
     cr.set_source_rgb(base.0, base.1, base.2);
@@ -1283,6 +1486,27 @@ fn draw_key(cr: &cairo::Context, key: &KeyboardKey, state: KeyState, px: f64) {
 
 /// Plain cairo text, shrunk to fit and then ellipsized; never Pango markup.
 fn draw_label(cr: &cairo::Context, label: &str, x: f64, y: f64, w: f64, h: f64) {
+    // Arrow keys are drawn as shapes: the toy text API has no font fallback for arrow glyphs.
+    let turn = match label {
+        "↑" => Some(0.0),
+        "→" => Some(1.0),
+        "↓" => Some(2.0),
+        "←" => Some(3.0),
+        _ => None,
+    };
+    if let Some(turn) = turn {
+        let size = (w.min(h) * 0.2).min(0.18);
+        let _ = cr.save();
+        cr.translate(x + w / 2.0, y + h / 2.0);
+        cr.rotate(turn * std::f64::consts::FRAC_PI_2);
+        cr.move_to(0.0, -size);
+        cr.line_to(size, size * 0.7);
+        cr.line_to(-size, size * 0.7);
+        cr.close_path();
+        let _ = cr.fill();
+        let _ = cr.restore();
+        return;
+    }
     let room = (w - 0.16).max(w * 0.5);
     let mut size = (h * 0.34).min(0.3);
     cr.set_font_size(size);
@@ -2041,6 +2265,7 @@ while True:
             stream: Some(LiveStream {
                 args: vec!["keyboard".into()],
             }),
+            animation: None,
         };
         let submitted = Rc::new(RefCell::new(Vec::new()));
         let calls = submitted.clone();

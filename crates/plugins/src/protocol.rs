@@ -10,7 +10,7 @@ pub const API_VERSION: u32 = 1;
 pub const MAX_DOCUMENT: usize = 1024 * 1024;
 /// Optional renderer features this host supports, advertised in every request.
 /// Plugins may use them to omit fallback-only output; older hosts send none.
-pub const HOST_FEATURES: &[&str] = &["keyboard_visualization"];
+pub const HOST_FEATURES: &[&str] = &["keyboard_visualization", "keyboard_animation"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -290,7 +290,50 @@ pub enum Visualization {
         remap: Option<KeyRemap>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stream: Option<LiveStream>,
+        /// Preview of a lighting effect, drawn on keys whose `color` is null.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        animation: Option<Box<KeyAnimation>>,
     },
+}
+
+/// A named lighting effect the host previews on keys without a known colour. The preview is an
+/// approximation drawn by the host, not a readback of the keyboard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyAnimation {
+    pub kind: KeyAnimationKind,
+    #[serde(default)]
+    pub speed: AnimationSpeed,
+    /// `#RRGGBB` colours the effect uses; empty means the effect's own (rainbow) colours.
+    #[serde(default)]
+    pub colors: Vec<String>,
+}
+
+pub(crate) const MAX_ANIMATION_COLORS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyAnimationKind {
+    RainbowWave,
+    Wave,
+    Spiral,
+    Rain,
+    Watercolor,
+    Shift,
+    Pulse,
+    Reactive,
+    Ripple,
+    /// A kind this host does not know; drawn as an unknown colour, never rejected.
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimationSpeed {
+    Slow,
+    #[default]
+    Medium,
+    Fast,
 }
 
 pub(crate) const MAX_KEYS: usize = 512;
@@ -467,7 +510,15 @@ impl Visualization {
                 paint,
                 remap,
                 stream,
+                animation,
             } => {
+                if let Some(animation) = animation {
+                    ensure!(
+                        animation.colors.len() <= MAX_ANIMATION_COLORS
+                            && animation.colors.iter().all(|color| color_value(color)),
+                        "keyboard animation colors must be at most {MAX_ANIMATION_COLORS} #RRGGBB values"
+                    );
+                }
                 text(name, "keyboard name", true)?;
                 text(connection, "keyboard connection", false)?;
                 text(status, "keyboard status", false)?;
@@ -1162,6 +1213,41 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_animation_is_optional_tolerant_and_colour_checked() {
+        let mut animated = keyboard();
+        animated["animation"] =
+            serde_json::json!({"kind": "rain", "speed": "slow", "colors": ["#00AAFF"]});
+        let parsed: Visualization = serde_json::from_value(animated.clone()).unwrap();
+        assert!(parsed.validate().is_ok());
+        let Visualization::Keyboard { animation, .. } = &parsed else {
+            panic!("expected keyboard");
+        };
+        let animation = animation.as_deref().unwrap();
+        assert_eq!(
+            (animation.kind, animation.speed),
+            (KeyAnimationKind::Rain, AnimationSpeed::Slow)
+        );
+        // Speed and colours are optional.
+        animated["animation"] = serde_json::json!({"kind": "rainbow_wave"});
+        assert!(keyboard_result(animated.clone()).is_ok());
+        // A kind from a newer plugin is drawn as unknown rather than failing the whole state.
+        animated["animation"] = serde_json::json!({"kind": "aurora_from_the_future"});
+        let parsed: Visualization = serde_json::from_value(animated.clone()).unwrap();
+        assert!(parsed.validate().is_ok());
+        let Visualization::Keyboard { animation, .. } = &parsed else {
+            panic!("expected keyboard");
+        };
+        assert_eq!(
+            animation.as_deref().unwrap().kind,
+            KeyAnimationKind::Unknown
+        );
+        animated["animation"] = serde_json::json!({"kind": "wave", "colors": ["red"]});
+        assert!(keyboard_result(animated.clone()).is_err());
+        animated["animation"] = serde_json::json!({"kind": "wave", "colors": vec!["#FF0000"; 9]});
+        assert!(keyboard_result(animated).is_err());
+    }
+
+    #[test]
     fn keyboard_visualization_rejects_invalid_identity_geometry_and_values() {
         type Mutation = (&'static str, fn(&mut Value));
         let mutations: Vec<Mutation> = vec![
@@ -1273,7 +1359,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&request).unwrap(),
             serde_json::json!({"api_version": 1, "method": "state", "action": null,
-                "args": {}, "host_features": ["keyboard_visualization"]})
+                "args": {}, "host_features": ["keyboard_visualization", "keyboard_animation"]})
         );
     }
 
