@@ -32,7 +32,7 @@ const SUMMARY_LABELS: usize = 8;
 const MIN_HEIGHT: i32 = 140;
 const MAX_HEIGHT: i32 = 560;
 /// Effect previews redraw at most this often (microseconds): smooth enough, light on the CPU.
-const FRAME_INTERVAL: i64 = 33_000;
+const FRAME_INTERVAL: i64 = 48_000;
 /// The frame shown when the desktop asks for no animations.
 const STILL_FRAME: f64 = 1.3;
 const LEGEND_UNKNOWN: &str = "▨ Colour unknown";
@@ -1354,19 +1354,23 @@ struct KeyState {
     focused: bool,
 }
 
-/// A soft halo in the key's colour, scaled by how bright that colour is.
+/// A halo in the key's colour, scaled by how bright that colour is. Two flat fills rather than
+/// a gradient: this runs for every key on every animation frame.
 fn draw_glow(cr: &cairo::Context, key: &KeyboardKey, fill: (f64, f64, f64)) {
     let strength = fill.0.max(fill.1).max(fill.2);
     if strength < 0.2 {
         return;
     }
-    let (cx, cy) = center(key);
-    let reach = key.w.max(key.h) * 0.85;
-    let glow = cairo::RadialGradient::new(cx, cy, 0.0, cx, cy, reach);
-    glow.add_color_stop_rgba(0.0, fill.0, fill.1, fill.2, 0.34 * strength);
-    glow.add_color_stop_rgba(1.0, fill.0, fill.1, fill.2, 0.0);
-    if cr.set_source(&glow).is_ok() {
-        cr.rectangle(cx - reach, cy - reach, reach * 2.0, reach * 2.0);
+    for (spread, alpha) in [(0.16, 0.10), (0.07, 0.16)] {
+        rounded_rect(
+            cr,
+            key.x - spread,
+            key.y - spread,
+            key.w + spread * 2.0,
+            key.h + spread * 2.0,
+            0.12 + spread,
+        );
+        cr.set_source_rgba(fill.0, fill.1, fill.2, alpha * strength);
         let _ = cr.fill();
     }
 }
@@ -1482,6 +1486,27 @@ fn draw_key(
 
 /// Plain cairo text, shrunk to fit and then ellipsized; never Pango markup.
 fn draw_label(cr: &cairo::Context, label: &str, x: f64, y: f64, w: f64, h: f64) {
+    // Arrow keys are drawn as shapes: the toy text API has no font fallback for arrow glyphs.
+    let turn = match label {
+        "↑" => Some(0.0),
+        "→" => Some(1.0),
+        "↓" => Some(2.0),
+        "←" => Some(3.0),
+        _ => None,
+    };
+    if let Some(turn) = turn {
+        let size = (w.min(h) * 0.2).min(0.18);
+        let _ = cr.save();
+        cr.translate(x + w / 2.0, y + h / 2.0);
+        cr.rotate(turn * std::f64::consts::FRAC_PI_2);
+        cr.move_to(0.0, -size);
+        cr.line_to(size, size * 0.7);
+        cr.line_to(-size, size * 0.7);
+        cr.close_path();
+        let _ = cr.fill();
+        let _ = cr.restore();
+        return;
+    }
     let room = (w - 0.16).max(w * 0.5);
     let mut size = (h * 0.34).min(0.3);
     cr.set_font_size(size);
