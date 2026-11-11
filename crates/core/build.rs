@@ -5,7 +5,7 @@
 //!   `v*` tag (`git describe`), else the crate version.
 //! - `HYPRDECK_DISTANCE`: commits since that tag (0 for a tagged release build).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn git(root: &Path, args: &[&str]) -> Option<String> {
@@ -24,10 +24,18 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     println!("cargo:rerun-if-env-changed=HYPRDECK_VERSION");
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let git_dir = root.join(".git");
-    if git_dir.is_dir() {
-        for p in ["HEAD", "refs/heads", "refs/tags", "packed-refs"] {
-            println!("cargo:rerun-if-changed={}", git_dir.join(p).display());
+    // Ask git where its files are: in a linked worktree `.git` is a file, HEAD lives in the
+    // worktree's own git dir and the refs in the common one. Watching only `<root>/.git/…`
+    // left the stamped commit stale there, so a source update rebuilt nothing and was offered
+    // again forever.
+    let resolve =
+        |flag: &str| git(&root, &["rev-parse", "--path-format=absolute", flag]).map(PathBuf::from);
+    if let Some(git_dir) = resolve("--git-dir") {
+        println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
+    }
+    if let Some(common) = resolve("--git-common-dir") {
+        for p in ["refs/heads", "refs/tags", "packed-refs"] {
+            println!("cargo:rerun-if-changed={}", common.join(p).display());
         }
     }
 
